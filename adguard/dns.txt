@@ -1,0 +1,55 @@
+# AdGuard Home DNS Splitting Rules
+# Domestic domains use domestic DNS for better CDN and speed
+# Foreign domains use foreign DNS to avoid pollution
+
+# ==================== Domestic Domains (China) ====================
+[/cn/]https://doh.pub/dns-query
+[/com.cn/]https://doh.pub/dns-query
+[/net.cn/]https://doh.pub/dns-query
+[/org.cn/]https://doh.pub/dns-query
+[/gov.cn/]https://doh.pub/dns-query
+[/baidu.com/]https://doh.pub/dns-query
+[/qq.com/]https://doh.pub/dns-query
+[/taobao.com/]https://doh.pub/dns-query
+[/tmall.com/]https://doh.pub/dns-query
+[/jd.com/]https://doh.pub/dns-query
+[/alibaba.com/]https://doh.pub/dns-query
+[/tencent.com/]https://doh.pub/dns-query
+[/bilibili.com/]https://doh.pub/dns-query
+[/weibo.com/]https://doh.pub/dns-query
+[/163.com/]https://doh.pub/dns-query
+[/sina.com/]https://doh.pub/dns-query
+[/meituan.com/]https://doh.pub/dns-query
+[/dianping.com/]https://doh.pub/dns-query
+[/ctrip.com/]https://doh.pub/dns-query
+[/mi.com/]https://doh.pub/dns-query
+[/xiaomi.com/]https://doh.pub/dns-query
+[/huawei.com/]https://doh.pub/dns-query
+[/iqiyi.com/]https://doh.pub/dns-query
+[/youku.com/]https://doh.pub/dns-query
+[/douyin.com/]https://doh.pub/dns-query
+[/toutiao.com/]https://doh.pub/dns-query
+[/zhihu.com/]https://doh.pub/dns-query
+[/jianshu.com/]https://doh.pub/dns-query
+[/csdn.net/]https://doh.pub/dns-query
+
+# ==================== Foreign Domains ====================
+[/google.com/]https://dns.google/dns-query
+[/youtube.com/]https://dns.google/dns-query
+[/facebook.com/]https://dns.google/dns-query
+[/twitter.com/]https://dns.google/dns-query
+[/instagram.com/]https://dns.google/dns-query
+[/github.com/]https://dns.google/dns-query
+[/cloudflare.com/]https://dns.cloudflare.com/dns-query
+[/microsoft.com/]https://dns.google/dns-query
+[/amazon.com/]https://dns.google/dns-query
+[/netflix.com/]https://dns.google/dns-query
+[/discord.com/]https://dns.google/dns-query
+[/telegram.org/]https://dns.google/dns-query
+
+# ==================== Default Upstreams ====================
+# These are used for any domains not matched above
+https://doh.pub/dns-query
+https://dns.google/dns-query
+223.5.5.5
+8.8.8.8
