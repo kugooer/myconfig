@@ -80,6 +80,8 @@ var PurgeBadLearnedEndpoints = true;
 var EnableCloudSign = false;
 // 捕获到云盘 Authorization 时是否单独弹一次云盘签到结果（默认关）
 var AutoCloudSignOnAuth = false;
+// 是否允许从任意文本裸扫 11 位号（极易把 CDN 图链数字当手机号，默认关）
+var AllowBarePhoneFallback = false;
 // 是否自动领取 domark 返回的 taskAwardChance
 var AutoClaimTaskAward = true;
 // 签到领奖活动页（抓包：qwhdmark/1021122301）
@@ -102,13 +104,15 @@ function ReadCookie() {
   if (DeleteCookie) {
     $nobyda.write("", "CookiesCMCC");
     $nobyda.write("", "CookieCMCC");
-    $nobyda.notify("中国移动", "", "已清空 CookiesCMCC");
+    $nobyda.write("", "CMCC_SignEndpoints");
+    $nobyda.notify("中国移动", "", "已清空 CookiesCMCC / CookieCMCC / CMCC_SignEndpoints");
     return $nobyda.done();
   }
 
   if ($nobyda.isRequest) {
     // rewrite/mitm 捕获路径：可能同步触发登录后签到
     // QX response 脚本必须透传 body，否则 Content-Length 与 body 不一致报错
+    // 注意：response 脚本有硬超时，登录后自动签到尽量轻量
     GetCookie().then(() => finishRequest()).catch(e => {
       console.log("GetCookie error: " + e);
       finishRequest();
@@ -117,15 +121,18 @@ function ReadCookie() {
   }
 
   if (PurgeBadLearnedEndpoints) purgeBadLearnedEndpoints();
+  // 每次 cron 自洁幽灵号（CDN 图链截出来的 11 位）
+  purgeGhostAccounts();
 
-  // cron / 手动运行
-  const list = loadAccounts();
+  // cron / 手动运行：仅跑「可签」账号，避免 165/133 等幽灵号刷屏
+  const list = loadAccounts().filter(isRunnableAccount);
   if (!list.length) {
-    $nobyda.notify("中国移动", "", "无账号。请先登录 App 触发会话捕获。");
+    $nobyda.notify("中国移动", "", "无可用账号（需 JSESSIONID/UID 会话）。请先登录 App。");
     return $nobyda.done();
   }
 
   (async () => {
+    console.log("cron runnable accounts =>", list.length, list.map(a => maskPhone(a.phone || a.uid || "?")).join(", "));
     for (let i = 0; i < list.length; i++) {
       await all(list[i], { reason: "cron" });
       if (i < list.length - 1) await wait(AccountGapMs);
@@ -222,8 +229,10 @@ async function GetCookie() {
     );
 
     if (AutoSignAfterLogin) {
-      // 稍等，便于同号 H5/云盘请求落库后合并
-      if (SignDelayMs > 0) await wait(SignDelayMs);
+      // 关键：必须在 finishRequest/$done 之前尽量跑完，但 rewrite-response 有硬超时。
+      // 策略：短延迟 + 主路径优先；超时会被 QX 杀掉（见日志 Exception timeout）。
+      const delay = Math.min(SignDelayMs || 0, 900);
+      if (delay > 0) await wait(delay);
       const latest = reloadAccount(saved) || saved;
       await all(latest, { reason: "login-trigger" });
     }
@@ -647,7 +656,7 @@ function LiveQwhdSign(s) {
           if (/PRIZE_NO_CONFIG|未配置对应奖品/i.test(text)) {
             merge.QwhdSign.notify += "（当日奖品未配置，任务进度已记）";
           }
-          const prize = extractPrizeName(text) || extractReward(text);
+          const prize = extractPrizeName(text);
           if (prize) merge.QwhdSign.bean = prize;
 
           // 4) 自动领 taskAwardChance
@@ -1595,8 +1604,11 @@ function isBizSuccess(text, status) {
 }
 
 function extractReward(text) {
-  const m = String(text).match(/(?:奖励|积分|金币|云朵|流量|bean|prize)[^\d]{0,10}(\d+(?:\.\d+)?)/i);
-  return m ? m[1] : "";
+  const s = String(text || "");
+  // 避免 prizeType:1 / prizeLevel:1 被当成奖励数量
+  if (/"prizeName"\s*:\s*"([^"]+)"/.test(s)) return "";
+  const m = s.match(/(?:奖励|积分|金币|云朵|流量)[^\d]{0,8}(\d+(?:\.\d+)?)\s*(?:MB|GB|元|分|个)?/i);
+  return m ? (m[1] + (m[0].match(/MB|GB|元|分|个/i) ? m[0].match(/MB|GB|元|分|个/i)[0] : "")) : "";
 }
 
 function normalizeHeaders(h) {
@@ -1631,16 +1643,20 @@ function extractPhoneLoose() {
   return extractPhoneStrict.apply(null, arguments);
 }
 
-// 严格提取手机号：优先字段语义，过滤时间戳伪号
+// 严格提取手机号：优先字段语义，过滤时间戳伪号 / CDN 图链伪号
 function extractPhoneStrict() {
   const parts = Array.prototype.slice.call(arguments).map(x => {
     try { return typeof x === "string" ? x : JSON.stringify(x); } catch (e) { return String(x); }
   });
-  const blob = parts.join("\n");
+  // 先抹掉 URL / 图片文件名中的长数字，避免 m_upload_4941363282224798429.png → 13632822247
+  let blob = parts.join("\n")
+    .replace(/https?:\/\/[^\s"'<>]+/gi, " ")
+    .replace(/m_upload_\d+/gi, " ")
+    .replace(/\/[\w.-]*\d{10,}[\w.-]*\.(?:png|jpg|jpeg|gif|webp|css|js)/gi, " ");
 
-  // 1) 字段语义优先
+  // 1) 字段语义优先（不要扫 advertisingImg/statusImg 等）
   const named = [
-    /(?:phone|mobile|msisdn|tel|app_number|appNumber)["'=\s:]*?(1[3-9]\d{9})/ig,
+    /(?:phone|mobile|msisdn|tel|app_number|appNumber|mobilePhone)["'=\s:]*?(1[3-9]\d{9})/ig,
     /mobile:(1[3-9]\d{9})/ig
   ];
   for (let i = 0; i < named.length; i++) {
@@ -1659,19 +1675,24 @@ function extractPhoneStrict() {
     if (p) return p;
   }
 
-  // 3) taskAward uuid: AvnWN13873381269...
+  // 3) taskAward uuid: AvnWN13873381269...（明确业务字段，可用）
   const uuidPhone = matchOne(blob, /AvnWN(1[3-9]\d{9})/i);
   if (uuidPhone && isValidPhone(uuidPhone)) return uuidPhone;
 
-  // 4) 裸 11 位兜底，但必须通过有效号段校验，且不能落在 URL 时间戳附近
+  // 4) 裸 11 位兜底：进一步排除 CDN / 文件名 / 时间戳
+  // 注意：默认关闭“从任意 JSON 扫号”，幽灵号大多来自这里
+  if (!AllowBarePhoneFallback) return "";
   const all = blob.match(/1[3-9]\d{9}/g) || [];
   for (let i = 0; i < all.length; i++) {
     const p = all[i];
     if (!isValidPhone(p)) continue;
-    // 排除 query currentTime=17865... 这类拼接
     const idx = blob.indexOf(p);
-    const around = blob.slice(Math.max(0, idx - 24), idx + 20).toLowerCase();
-    if (/time|timestamp|currenttime|nonce|token|_t=|date|expires|expire/.test(around)) continue;
+    const around = blob.slice(Math.max(0, idx - 28), idx + 24).toLowerCase();
+    if (/time|timestamp|currenttime|nonce|token|_t=|date|expires|expire|upload|m_upload|\.png|\.jpg|cdn|img|src|advertis|statusimg|prize/.test(around)) continue;
+    // 前后若仍是数字，说明嵌在更长数字串中（CDN id 切片）
+    const prev = idx > 0 ? blob[idx - 1] : "";
+    const next = blob[idx + 11] || "";
+    if (/\d/.test(prev) || /\d/.test(next)) continue;
     return p;
   }
   return "";
@@ -1689,7 +1710,37 @@ function isValidPhone(v) {
   // 日志假号：17864/17865... 来自 Date.now() 前 11 位
   if (/^1786[0-9]\d{6}$/.test(p)) return false;
   if (/^(\d)\1{10}$/.test(p)) return false;
+  // 虚拟/特殊号段在本脚本场景几乎都是 CDN 截取误报（165/167/170 等）
+  if (/^16[5-7]/.test(p)) return false;
   return true;
+}
+
+// 可执行签到的账号：至少有 App 会话（JSESSIONID 或完整 cookie）
+function isRunnableAccount(a) {
+  if (!a) return false;
+  if (a.phone && !isValidPhone(a.phone) && !a.uid && !a.jsessionid) return false;
+  if (a.jsessionid || (a.cookie && /JSESSIONID=/i.test(a.cookie))) return true;
+  // 仅有 phone + 过期云盘凭证：不可跑主路径
+  return false;
+}
+
+function purgeGhostAccounts() {
+  try {
+    const list = loadAccounts();
+    const kept = list.filter(a => {
+      if (!a) return false;
+      // 只有伪手机号、无任何会话
+      if (a.phone && !isValidPhone(a.phone) && !a.uid && !a.jsessionid && !a.cookie) return false;
+      if (!a.uid && !a.jsessionid && !a.cookie && !a.qwhdSession && !a.cloudAuthorization) return false;
+      // 只有手机号、无会话 → 幽灵
+      if (a.phone && !a.uid && !a.jsessionid && !a.cookie && !a.qwhdSession) return false;
+      return true;
+    });
+    if (kept.length !== list.length) {
+      saveAccounts(kept);
+      console.log("purgeGhostAccounts => removed", list.length - kept.length, "kept", kept.length);
+    }
+  } catch (e) {}
 }
 
 function decodeURIComponentSafe(s) {
