@@ -782,37 +782,35 @@ function LiveCloudSign(s, opts) {
         let jwtToken = (ACCOUNT.cloudJwt && ACCOUNT.cloudJwt.length > 20) ? ACCOUNT.cloudJwt : "";
         let ssoToken = (ACCOUNT.cloudSsoToken && /^YZsidssolg/i.test(ACCOUNT.cloudSsoToken)) ? ACCOUNT.cloudSsoToken : "";
 
-        // A) 无 jwt：优先 Basic 现换 SSO（打开自签路径）；缓存 SSO 仅作兜底
+        // A) 无 jwt：Basic 现换 SSO → tyrz（打开路径最多 2 轮新票，避免 rewrite 超时）
         if (!jwtToken) {
-          if (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization)) {
-            ssoToken = await fetchCloudSsoToken(ua, { once: openOnce });
-          } else if (!ssoToken) {
-            ssoToken = await fetchCloudSsoToken(ua, { once: openOnce });
-          }
-          if (!ssoToken) {
-            merge.CloudSign.notify = "跳过云盘：未拿到 YZsid SSO（打开云盘后重试）";
-            console.log("cloud sso empty");
-            return resolve();
-          }
-          jwtToken = await fetchCloudJwtFromTyrz(ssoToken, ua, deviceId);
-          if (!jwtToken) {
-            clearCloudSso(ACCOUNT.phone);
-            ACCOUNT.cloudSsoToken = "";
-            if (!openOnce && ACCOUNT.cloudAuthorization) {
-              const fresh = await fetchCloudSsoToken(ua);
-              if (fresh && fresh !== ssoToken) {
-                ssoToken = fresh;
-                jwtToken = await fetchCloudJwtFromTyrz(ssoToken, ua, deviceId);
-              }
+          // 打开自签不用缓存 SSO（可能已被 App/上次失败污染）
+          if (openOnce || (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization))) {
+            const got = await fetchCloudJwtWithFreshSso(ua, deviceId, openOnce);
+            jwtToken = got.jwt || "";
+            ssoToken = got.sso || "";
+          } else if (ssoToken) {
+            jwtToken = await fetchCloudJwtFromTyrz(ssoToken, ua, deviceId);
+            if (!jwtToken) {
+              clearCloudSso(ACCOUNT.phone);
+              ACCOUNT.cloudSsoToken = "";
+              const got = await fetchCloudJwtWithFreshSso(ua, deviceId, false);
+              jwtToken = got.jwt || "";
+              ssoToken = got.sso || "";
             }
           } else {
+            const got = await fetchCloudJwtWithFreshSso(ua, deviceId, false);
+            jwtToken = got.jwt || "";
+            ssoToken = got.sso || "";
+          }
+          if (jwtToken) {
             clearCloudSso(ACCOUNT.phone);
             ACCOUNT.cloudSsoToken = "";
           }
         }
 
         if (!jwtToken) {
-          merge.CloudSign.notify = "跳过云盘：tyrzLogin 未换到 jwt（稍后重新打开云盘即可）";
+          merge.CloudSign.notify = "跳过云盘：tyrzLogin 未换到 jwt（请进一次签到页或查看日志 tyrzLogin fail 原文）";
           console.log("cloud jwt empty after tyrz");
           return resolve();
         }
@@ -1063,12 +1061,16 @@ async function fetchCloudSsoToken(ua, opts) {
   if (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization)) {
     const headers = {
       "User-Agent": ua,
-      Accept: "*/*",
-      "Content-Type": "application/json",
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "application/json;charset=UTF-8",
       Authorization: ACCOUNT.cloudAuthorization,
       "x-MM-Source": "001",
-      Origin: "mcloudlocal://yun.139.com"
+      Origin: "mcloudlocal://yun.139.com",
+      // 与 getUser 对齐的可选字段（抓包常有）
+      APP_NUMBER: ACCOUNT.appNumber || ACCOUNT.phone || "",
+      NOTE_TOKEN: ACCOUNT.noteToken || ""
     };
+    if (ACCOUNT.cloudDeviceId) headers.deviceId = ACCOUNT.cloudDeviceId;
     const hosts = once
       ? ["https://user-njs.yun.139.com/user/querySpecTokenV2"]
       : [
@@ -1116,6 +1118,56 @@ async function fetchCloudSsoToken(ua, opts) {
   return "";
 }
 
+/**
+ * 从 tyrzLogin 响应中抠 jwt（抓包多为 result.token=eyJ...；也有 result 直接是 jwt）
+ */
+function extractJwtFromTyrz(j) {
+  if (!j || typeof j !== "object") return "";
+  const cands = [];
+  const push = v => {
+    if (v == null) return;
+    if (typeof v === "string" && v.length > 20) cands.push(v);
+    else if (typeof v === "object") {
+      if (v.token) cands.push(String(v.token));
+      if (v.jwtToken) cands.push(String(v.jwtToken));
+      if (v.jwt) cands.push(String(v.jwt));
+      if (v.accessToken) cands.push(String(v.accessToken));
+    }
+  };
+  push(j.result);
+  push(j.data);
+  push(j.token);
+  push(j.jwtToken);
+  if (j.result && typeof j.result === "object") push(j.result.data);
+  for (let i = 0; i < cands.length; i++) {
+    const t = String(cands[i] || "").trim();
+    // 标准 jwt 或足够长的会话串
+    if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+/.test(t)) return t;
+    if (t.length > 40 && !/^YZsid/i.test(t) && !/\s/.test(t)) return t;
+  }
+  // 裸扫
+  try {
+    const m = JSON.stringify(j).match(/"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+)"/);
+    if (m) return m[1];
+  } catch (e) {}
+  return "";
+}
+
+function buildTyrzBodies(ssoToken) {
+  const tok = ssoToken;
+  const mid = CloudMarketName || "sign_in_3";
+  // 抓包主形态在前；后续为兼容
+  return [
+    { token: tok, openAccount: 0, marketName: mid, sourceId: String(CloudSourceId || "1002") },
+    { token: tok, openAccount: 0, marketName: mid, sourceId: Number(CloudSourceId || 1002) },
+    { token: tok, openAccount: "0", marketName: mid, sourceId: String(CloudSourceId || "1002") },
+    { token: tok, openAccount: 0, marketName: mid, sourceId: String(CloudSourceId || "1002"), client: "app" },
+    { token: tok, openAccount: 0, marketName: mid, sourceId: String(CloudTargetSourceId || "001005") },
+    { token: tok, openAccount: 0, marketName: mid },
+    { token: tok, marketName: mid, sourceId: String(CloudSourceId || "1002") }
+  ];
+}
+
 async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
   if (!ssoToken) return "";
   const headers = buildCloudSignHeaders("pending", ua, deviceId, ssoToken);
@@ -1124,31 +1176,82 @@ async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
   delete headers.Cookie;
   headers["Content-Type"] = "application/json;charset=UTF-8";
   headers.Accept = "application/json, text/plain, */*";
-  // 抓包还有 showLoading:true，可无；deviceId 若是 B 前缀短串可带
-  try {
-    const j = await httpJson("POST",
-      "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
-      headers,
-      {
-        token: ssoToken,
-        openAccount: 0,
-        marketName: CloudMarketName || "sign_in_3",
-        sourceId: String(CloudSourceId || "1002")
-      }
-    );
-    if (j && Number(j.code) === 0 && j.result && j.result.token) {
-      console.log("tyrzLogin ok");
-      return j.result.token;
-    }
-    // 始终打日志，便于「打开未签」定位（勿仅 LogDetails）
-    if (j && (j.msg || j.code != null)) console.log("tyrzLogin fail =>", j.code, String(j.msg || "").slice(0, 120));
-    else if (j && j.raw) console.log("tyrzLogin non-json =>", String(j.raw).slice(0, 120));
-    else console.log("tyrzLogin fail => empty");
-    return "";
-  } catch (e) {
-    console.log("tyrzLogin error =>", e);
-    return "";
+  headers["Accept-Language"] = "zh-CN,zh-Hans;q=0.9";
+  headers["X-Requested-With"] = "XMLHttpRequest";
+  // 部分 H5 还会带 mcloud 宿主 UA；若 Basic 场景拿到的是原生 UA，换成 MCloud 网页 UA 更像签到页
+  if (headers["User-Agent"] && /ChinaMobile\//i.test(headers["User-Agent"]) && !/MCloudApp/i.test(headers["User-Agent"])) {
+    headers["User-Agent"] =
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MCloudApp/13.0.0";
   }
+  if (deviceId) headers.deviceId = deviceId;
+
+  // 同一 SSO 只打 1 枪主 body（YZsid 多为一次性；多 body 连试会浪费票）
+  // 第二枪仅在「明确非票据错误且未消费」时用 sourceId 数字形态
+  const bodies = buildTyrzBodies(ssoToken).slice(0, 1);
+  let lastDiag = "";
+  for (let i = 0; i < bodies.length; i++) {
+    try {
+      const j = await httpJson("POST",
+        "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
+        headers,
+        bodies[i]
+      );
+      const jwt = extractJwtFromTyrz(j);
+      if (jwt) {
+        console.log("tyrzLogin ok", "try=" + i, "len=" + jwt.length);
+        return jwt;
+      }
+      const keys = j && typeof j === "object" ? Object.keys(j).slice(0, 10).join(",") : "";
+      let resultType = "";
+      try {
+        resultType = typeof (j && j.result);
+        if (j && j.result && typeof j.result === "object") {
+          resultType += "{" + Object.keys(j.result).slice(0, 8).join(",") + "}";
+        } else if (j && j.result != null) {
+          resultType += ":" + String(j.result).slice(0, 48);
+        }
+      } catch (e) {}
+      const snip = j && j.raw
+        ? String(j.raw).slice(0, 220)
+        : (() => { try { return JSON.stringify(j).slice(0, 220); } catch (e) { return String(j); } })();
+      lastDiag = "try=" + i + " http=" + (j && j.status) + " code=" + (j && j.code) +
+        " msg=" + String((j && j.msg) || "") + " keys=" + keys + " result=" + resultType + " body=" + snip;
+      console.log("tyrzLogin fail =>", lastDiag);
+    } catch (e) {
+      lastDiag = "error " + e;
+      console.log("tyrzLogin error =>", e);
+    }
+  }
+  if (lastDiag) console.log("tyrzLogin last =>", lastDiag);
+  return "";
+}
+
+/**
+ * 打开自签：SSO 可能一次换 jwt 失败 → 最多再换 1 张新 SSO 重试（仍限时）
+ */
+async function fetchCloudJwtWithFreshSso(ua, deviceId, openOnce) {
+  let lastSso = "";
+  const rounds = openOnce ? 2 : 3;
+  for (let r = 0; r < rounds; r++) {
+    const sso = await fetchCloudSsoToken(ua, { once: openOnce && r === 0 });
+    if (!sso) {
+      console.log("cloud sso empty round", r);
+      break;
+    }
+    if (sso === lastSso) {
+      console.log("cloud sso same as last, stop");
+      break;
+    }
+    lastSso = sso;
+    console.log("cloud tyrz try round", r, "ssoTail", String(sso).slice(-12));
+    const jwt = await fetchCloudJwtFromTyrz(sso, ua, deviceId);
+    if (jwt) return { jwt: jwt, sso: sso };
+    // 票已废，清缓存再申请
+    clearCloudSso(ACCOUNT.phone);
+    ACCOUNT.cloudSsoToken = "";
+    if (r + 1 < rounds) await wait(200);
+  }
+  return { jwt: "", sso: lastSso };
 }
 
 async function callCloudStartSignIn(headers) {
@@ -2198,8 +2301,14 @@ function httpJson(method, url, headers, data) {
     // 统一去掉代理/chunk 包装，再 parse
     if (r && typeof r.body === "string") r.body = stripChunkPrefix(r.body);
     if (r.error) throw new Error(r.error);
-    if (!r.body) return {};
-    try { return JSON.parse(r.body); } catch (e) { return { raw: r.body, status: r.status }; }
+    if (!r.body) return { status: r.status, empty: true, headers: r.headers || {} };
+    try {
+      const j = JSON.parse(r.body);
+      if (j && typeof j === "object" && j.status == null) j.status = r.status;
+      return j;
+    } catch (e) {
+      return { raw: r.body, status: r.status, headers: r.headers || {} };
+    }
   });
 }
 
