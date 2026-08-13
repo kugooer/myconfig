@@ -70,10 +70,12 @@ var SignEndpoints = [
   // }
 ];
 
-// 自动学习到的端点是否在下次签到时启用
+// 自动学习到的端点是否在下次签到时启用（仅「动作类」接口）
 var AutoUseLearnedEndpoints = true;
-// 学习到端点后是否立刻用「本次会话」触发一次动态签到
-var AutoSignAfterLearn = true;
+// 学到新接口后立刻再跑一轮：默认关闭，避免页面加载一堆查询接口时连环串号签到
+var AutoSignAfterLearn = false;
+// 是否清理历史误学习的查询类接口（推荐 true）
+var PurgeBadLearnedEndpoints = true;
 
 /********************* 运行时 *********************/
 var merge = {};
@@ -92,12 +94,15 @@ function ReadCookie() {
 
   if ($nobyda.isRequest) {
     // rewrite/mitm 捕获路径：可能同步触发登录后签到
-    GetCookie().then(() => $nobyda.done()).catch(e => {
+    // QX response 脚本必须透传 body，否则 Content-Length 与 body 不一致报错
+    GetCookie().then(() => finishRequest()).catch(e => {
       console.log("GetCookie error: " + e);
-      $nobyda.done();
+      finishRequest();
     });
     return;
   }
+
+  if (PurgeBadLearnedEndpoints) purgeBadLearnedEndpoints();
 
   // cron / 手动运行
   const list = loadAccounts();
@@ -129,10 +134,26 @@ async function all(account, opts) {
   // 每次都现场签到，不读取历史 tasks body
   await Promise.all([
     LiveCloudSign(0),
+    LiveQwhdSign(0),
     LiveEndpointSign(0)
   ]);
 
   await notify(tag);
+}
+
+function finishRequest() {
+  try {
+    if (typeof $response !== "undefined" && $response) {
+      // 透传原始响应，避免 QX body length not match
+      const out = {};
+      if ($response.body != null) out.body = $response.body;
+      if ($response.headers) out.headers = $response.headers;
+      if ($response.status) out.status = $response.status;
+      if ($response.statusCode) out.status = $response.status || $response.statusCode;
+      return $nobyda.done(out);
+    }
+  } catch (e) {}
+  return $nobyda.done({});
 }
 
 /********************* 捕获：登录后立刻签到 *********************/
@@ -153,7 +174,7 @@ async function GetCookie() {
     }
 
     const acc = {
-      phone: extractPhoneLoose(body, respBody, headers, setCookie),
+      phone: extractPhoneStrict(body, respBody, headers, setCookie),
       cookie: cookie,
       jsessionid: matchOne(cookie, /JSESSIONID=([^;]+)/i),
       uid: matchOne(cookie, /UID=([^;]+)/i),
@@ -179,14 +200,38 @@ async function GetCookie() {
     const cookie = pickSessionCookie(getHeader(headers, "Cookie"));
     if (cookie && /JSESSIONID=/i.test(cookie)) {
       upsertAccount({
-        phone: extractPhoneLoose(body, respBody, headers),
+        phone: extractPhoneStrict(body, respBody, headers),
         cookie: cookie,
         jsessionid: matchOne(cookie, /JSESSIONID=([^;]+)/i),
         uid: matchOne(cookie, /UID=([^;]+)/i),
         xtoken: getHeader(headers, "x-token") || getHeader(headers, "X-Token") || "",
         userAgent: getHeader(headers, "User-Agent") || "",
+        h5Cookie: mergeCookieString(getHeader(headers, "Cookie"), getHeader(respHeaders, "Set-Cookie")),
         updatedAt: Date.now(),
         source: "session-refresh"
+      }, true);
+    }
+  }
+
+  // 2.5) 签到 H5 会话（qwhdhub）—— 单独保存 cookie/token，不伪造原生密文
+  if (/wx\.10086\.cn\/qwhdhub\//i.test(url)) {
+    const setCookie = getHeader(respHeaders, "Set-Cookie") || "";
+    const reqCookie = getHeader(headers, "Cookie") || "";
+    const h5Cookie = mergeCookieString(reqCookie, setCookie);
+    const phone = extractPhoneStrict(body, respBody, headers, reqCookie, setCookie, url);
+    const h5Token =
+      matchOne(url, /[?&](?:token|accessToken|jt)=([^&]+)/i) ||
+      matchOne(reqCookie, /(?:token|accessToken|jt)=([^;]+)/i) ||
+      matchOne(String(body || ""), /"(?:token|accessToken|jt)"\s*:\s*"([^"]+)"/i) ||
+      "";
+    if (h5Cookie || phone || h5Token) {
+      upsertAccount({
+        phone: phone,
+        h5Cookie: h5Cookie,
+        h5Token: decodeURIComponentSafe(h5Token),
+        userAgent: getHeader(headers, "User-Agent") || "",
+        updatedAt: Date.now(),
+        source: "qwhdhub-session"
       }, true);
     }
   }
@@ -195,7 +240,7 @@ async function GetCookie() {
   if (/caiyun\.feixin\.10086\.cn|yun\.139\.com|mcloud\.139\.com|vsbo\.caiyun/i.test(url)) {
     const auth = getHeader(headers, "Authorization") || getHeader(headers, "APP_AUTH") || "";
     if (/Basic\s+/i.test(auth)) {
-      const phone = decodeBasicPhone(auth) || extractPhoneLoose(body, respBody, headers);
+      const phone = decodeBasicPhone(auth) || extractPhoneStrict(body, respBody, headers);
       const noteToken = getHeader(headers, "NOTE_TOKEN") || "";
       const appNumber = getHeader(headers, "APP_NUMBER") || "";
       const saved = upsertAccount({
@@ -208,53 +253,51 @@ async function GetCookie() {
         source: "cloud-auth"
       });
 
-      // 如果是登录后不久的云盘鉴权刷新，直接用新凭证签一次
-      if (AutoSignAfterLogin && saved.cloudAuthorization) {
+      // 云盘凭证到来时：仅签「这个手机号」对应账号，绝不回落到其他号
+      if (AutoSignAfterLogin && saved.cloudAuthorization && isValidPhone(saved.phone)) {
         ACCOUNT = normalizeAccount(saved);
         merge = {};
         await LiveCloudSign(0);
-        await notify(maskPhone(ACCOUNT.phone || "云盘账号") + "·云盘即时签到");
-      } else {
-        $nobyda.notify("中国移动", "云盘凭证已更新", maskPhone(phone || "账号"));
+        await notify(maskPhone(ACCOUNT.phone) + "·云盘即时签到");
+      } else if (isValidPhone(phone)) {
+        $nobyda.notify("中国移动", "云盘凭证已更新", maskPhone(phone));
       }
     }
   }
 
-  // 4) 自动学习 H5 / 明文疑似签到接口（只存模板，不固化 body）
-  //    触发条件：URL/响应包含 sign/checkIn/签到 等关键字，且 body 看起来是明文 JSON/form
+  // 4) 自动学习「动作类」明文签到接口（只存模板，不固化 body）
+  //    严格排除查询/登录/配置类（taskList/markstatus/sdkAuth/login 等）
   if (looksLikeSignEndpoint(url, body, respBody, headers)) {
-    // 仅在响应阶段确认业务语义更可靠；请求阶段也可先入库模板
     const learned = learnSignEndpoint({
       url: url,
       method: ($request.method || "POST").toUpperCase(),
       headers: headers,
       body: body,
-      respBody: respBody
+      respBody: respBody,
+      respHeaders: respHeaders
     });
     if (learned && learned.added) {
-      $nobyda.notify("中国移动", "已学习签到接口(动态模板)", learned.point.name + "\n" + shortUrl(learned.point.url));
-      if (AutoSignAfterLearn) {
-        // 同步刷新会话字段，并优先用「当前请求所属账号」触发，避免误签到第一个账号
-        const cookie = pickSessionCookie(getHeader(headers, "Cookie"));
-        const phone = extractPhoneLoose(body, respBody, headers);
-        let acc = null;
-        if (cookie || phone) {
-          acc = upsertAccount({
-            phone: phone,
-            cookie: cookie,
-            jsessionid: matchOne(cookie, /JSESSIONID=([^;]+)/i),
-            uid: matchOne(cookie, /UID=([^;]+)/i),
-            xtoken: getHeader(headers, "x-token") || getHeader(headers, "X-Token") || "",
-            userAgent: getHeader(headers, "User-Agent") || "",
-            updatedAt: Date.now(),
-            source: "sign-learn"
-          }, true);
-        } else {
-          const list = loadAccounts();
-          acc = list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0] || {};
+      // 同步保存 H5 cookie/token 到「当前真实号码」
+      const phone = extractPhoneStrict(body, respBody, headers, url);
+      const h5Cookie = mergeCookieString(getHeader(headers, "Cookie"), getHeader(respHeaders, "Set-Cookie"));
+      if (phone || h5Cookie) {
+        upsertAccount({
+          phone: phone,
+          h5Cookie: h5Cookie,
+          h5Token: matchOne(url, /[?&](?:token|accessToken)=([^&]+)/i) || "",
+          cookie: pickSessionCookie(getHeader(headers, "Cookie")),
+          userAgent: getHeader(headers, "User-Agent") || "",
+          updatedAt: Date.now(),
+          source: "sign-learn"
+        }, true);
+      }
+      $nobyda.notify("中国移动", "已学习签到动作接口", learned.point.name + "\n" + shortUrl(learned.point.url));
+      if (AutoSignAfterLearn && isValidPhone(phone)) {
+        const acc = findAccountByPhone(phone) || loadAccounts().find(a => a.phone === phone);
+        if (acc) {
+          if (SignDelayMs > 0) await wait(SignDelayMs);
+          await all(acc, { reason: "learn-trigger" });
         }
-        if (SignDelayMs > 0) await wait(SignDelayMs);
-        await all(acc, { reason: "learn-trigger" });
       }
     }
   }
@@ -409,15 +452,126 @@ async function tryCloudLegacySign(headers, ts) {
   }
 }
 
+/********************* 动态签到：qwhdhub 签到领奖（优先） *********************/
+function LiveQwhdSign(s) {
+  merge.QwhdSign = {};
+  return new Promise(resolve => {
+    setTimeout(async () => {
+      try {
+        // 需要 H5 会话。若没有 h5Cookie，尝试用 app cookie 兜底
+        const cookie = ACCOUNT.h5Cookie || ACCOUNT.cookie || "";
+        if (!cookie && !ACCOUNT.h5Token) {
+          merge.QwhdSign.notify = "跳过签到领奖：尚无 qwhdhub H5 会话（请先打开签到页）";
+          return resolve();
+        }
+        const ts = Date.now();
+        const headers = {
+          Accept: "application/json, text/plain, */*",
+          "User-Agent": ACCOUNT.userAgent || "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 ChinaMobile",
+          "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+          Origin: "https://wx.10086.cn",
+          Referer: "https://wx.10086.cn/qwhdhub/",
+          Cookie: cookie,
+          "Content-Type": "application/json;charset=UTF-8"
+        };
+        if (ACCOUNT.h5Token) {
+          headers.token = ACCOUNT.h5Token;
+          headers.accessToken = ACCOUNT.h5Token;
+        }
+
+        // 1) 查状态
+        const statusUrls = [
+          "https://wx.10086.cn/qwhdhub/api/mark/mark31/markstatus",
+          "https://wx.10086.cn/qwhdhub/api/mark/info/commonInfo"
+        ];
+        let already = false;
+        let statusText = "";
+        for (let i = 0; i < statusUrls.length; i++) {
+          const r = await httpRaw("POST", statusUrls[i] + (statusUrls[i].indexOf("?") >= 0 ? "&" : "?") + "_t=" + ts, headers, "{}").catch(e => ({ error: String(e) }));
+          if (r.error) continue;
+          statusText = String(r.body || "");
+          if (/已签|今日已签|signed|signStatus"?\s*:\s*1|"isSign"\s*:\s*true|"todaySign"\s*:\s*true/i.test(statusText)) {
+            already = true;
+            break;
+          }
+        }
+        if (already) {
+          merge.QwhdSign.success = 1;
+          merge.QwhdSign.notify = "签到领奖: 今日已签到";
+          return resolve();
+        }
+
+        // 2) 尝试动作接口族（仅动作，不打查询）
+        const actionUrls = [
+          "https://wx.10086.cn/qwhdhub/api/mark/mark31/doMark",
+          "https://wx.10086.cn/qwhdhub/api/mark/mark31/mark",
+          "https://wx.10086.cn/qwhdhub/api/mark/doMark",
+          "https://wx.10086.cn/qwhdhub/api/mark/mark",
+          "https://wx.10086.cn/qwhdhub/api/mark/sign/doSign",
+          "https://wx.10086.cn/qwhdhub/api/mark/task/receive"
+        ];
+        // 合并「已学习且判定为动作」的端点
+        resolveSignEndpoints().forEach(p => {
+          if (p && p.url && isActionSignUrl(p.url) && actionUrls.indexOf(p.url.split("?")[0]) < 0) {
+            actionUrls.push(p.url.split("?")[0]);
+          }
+        });
+
+        let ok = false;
+        let msg = "";
+        let reward = "";
+        for (let i = 0; i < actionUrls.length; i++) {
+          const u = actionUrls[i];
+          const bodies = [
+            JSON.stringify({ client: "app", timestamp: ts, phone: ACCOUNT.phone || "", mobile: ACCOUNT.phone || "" }),
+            JSON.stringify({}),
+            `timestamp=${ts}&client=app`
+          ];
+          for (let bi = 0; bi < bodies.length; bi++) {
+            const h = Object.assign({}, headers);
+            if (bodies[bi][0] !== "{") h["Content-Type"] = "application/x-www-form-urlencoded";
+            else h["Content-Type"] = "application/json;charset=UTF-8";
+            const r = await httpRaw("POST", u + (u.indexOf("?") >= 0 ? "&" : "?") + "_t=" + ts, h, bodies[bi]).catch(e => ({ error: String(e), body: "", status: 0 }));
+            const text = String((r && r.body) || "");
+            if (LogDetails) console.log("qwhd try", u, (r && r.status), text.slice(0, 200));
+            if (r && !r.error && (isBizSuccess(text, r.status) || /已签|重复|signed/i.test(text))) {
+              ok = true;
+              msg = /已签|重复|signed/i.test(text) ? "今日已签" : "签到成功";
+              reward = extractReward(text);
+              break;
+            }
+            if (text) msg = text.slice(0, 80);
+          }
+          if (ok) break;
+        }
+
+        if (ok) {
+          merge.QwhdSign.success = 1;
+          merge.QwhdSign.notify = "签到领奖: " + msg;
+          if (reward) merge.QwhdSign.bean = reward;
+        } else {
+          merge.QwhdSign.error = 1;
+          merge.QwhdSign.notify = "签到领奖: 未成功" + (msg ? " · " + msg : "（需在签到页完成 H5 登录态）");
+        }
+      } catch (e) {
+        merge.QwhdSign.error = 1;
+        merge.QwhdSign.notify = "签到领奖异常: " + e;
+      } finally {
+        resolve();
+      }
+    }, s);
+  });
+}
+
 /********************* 动态签到：可配置 H5/App 端点 *********************/
 function LiveEndpointSign(s) {
   merge.AppSign = {};
   return new Promise(resolve => {
     setTimeout(async () => {
       try {
-        const points = resolveSignEndpoints().filter(x => x && x.enabled !== false);
+        const points = resolveSignEndpoints().filter(x => x && x.enabled !== false && isActionSignUrl(x.url));
         if (!points.length) {
-          merge.AppSign.notify = "未配置/未学习到明文签到端点。App 原生密文签到无法动态伪造；请点一次「立即签到」让脚本学习，或继续用云盘动态签到。";
+          merge.AppSign.notify = "无可执行明文动作端点（已过滤查询类学习结果）";
           return resolve();
         }
         if (!ACCOUNT.cookie && !ACCOUNT.xtoken && !ACCOUNT.phone) {
@@ -465,11 +619,12 @@ function LiveEndpointSign(s) {
 
 function resolveSignEndpoints() {
   const staticPoints = Array.isArray(SignEndpoints) ? SignEndpoints.slice() : [];
-  if (!AutoUseLearnedEndpoints) return staticPoints;
-  const learned = loadLearnedEndpoints();
+  if (!AutoUseLearnedEndpoints) return staticPoints.filter(p => isActionSignUrl(p && p.url));
+  if (PurgeBadLearnedEndpoints) purgeBadLearnedEndpoints();
+  const learned = loadLearnedEndpoints().filter(p => isActionSignUrl(p && p.url));
   const map = {};
   staticPoints.concat(learned).forEach(p => {
-    if (!p || !p.url) return;
+    if (!p || !p.url || !isActionSignUrl(p.url)) return;
     const key = (p.method || p.type || "POST") + " " + stripDynamicQuery(p.url);
     map[key] = p;
   });
@@ -491,23 +646,52 @@ function saveLearnedEndpoints(list) {
   $nobyda.write(JSON.stringify(list || []), "CMCC_SignEndpoints");
 }
 
+function purgeBadLearnedEndpoints() {
+  try {
+    const list = loadLearnedEndpoints();
+    const kept = list.filter(p => p && p.url && isActionSignUrl(p.url));
+    if (kept.length !== list.length) {
+      saveLearnedEndpoints(kept);
+      console.log("purgeBadLearnedEndpoints =>", list.length - kept.length, "removed,", kept.length, "kept");
+    }
+  } catch (e) {}
+}
+
+// 仅动作类签到 URL 可学习/可执行；查询、登录、配置一律排除
+function isActionSignUrl(url) {
+  const u = String(url || "").toLowerCase();
+  if (!u) return false;
+  // 明确黑名单：本次日志里误学到的全部在这
+  if (/deployenvi|sdauth|sdkauth|domain\/login|tasklist|commoninfo|markstatus|mytaskinfo|checkexclusive|appcenterfloorrule|appcentercontactinfo|getconfiguration|refreshsession|bytoken\/multi|logreport/i.test(u)) return false;
+  if (/\/login|\/auth|\/token|\/config|\/status|\/info|\/list|\/query|\/detail|\/router/i.test(u) && !/do[a-z]*sign|dosign|signin|domark|receivemark|checkin/i.test(u)) return false;
+  // 动作白名单
+  if (/\/(doSign|signin|signIn|sign_in|checkIn|checkin|doMark|mark\/mark(?:31)?\/(?:do)?mark|receive|clockIn|dailySign)(?:\/|$|\?)/i.test(u)) return true;
+  if (/qwhdhub\/api\/mark\/.*(?:doMark|doSign|sign|receive)/i.test(u)) return true;
+  // 带 sign 字样但必须像动作路径，而不是 status/info
+  if (/(doSign|signin|sign_in|checkIn|qiandao)/i.test(u) && !/(status|info|list|query|config|login)/i.test(u)) return true;
+  return false;
+}
+
 function looksLikeSignEndpoint(url, reqBody, respBody, headers) {
   const u = String(url || "");
   if (!u) return false;
+  // 只学动作接口；查询/登录一律拒绝
+  if (!isActionSignUrl(u)) return false;
   // 排除纯静态/日志/监控
   if (/\.(js|css|png|jpg|jpeg|gif|webp|svg|ico|woff2?)(\?|$)/i.test(u)) return false;
   if (/dnlog\.|logReport|collect|beacon|sensors|umeng|tingyun|hubble/i.test(u)) return false;
-  // 原生密文接口即使路径像 sign 也学不到可复用 body
-  if (/x-sign|x-qen/i.test(JSON.stringify(headers || {})) && isLikelyCipherBody(reqBody)) {
-    // 若响应本身明文且含签到语义，仍可学习 URL 模板
-    if (!looksLikePlainSignResponse(respBody)) return false;
+  // 原生密文接口（x-sign + 密文 body）不可复用
+  if (/client\.app\.coc\.10086\.cn|clientaccess\.10086\.cn/i.test(u) && /x-sign|x-qen/i.test(JSON.stringify(headers || {}))) {
+    return false;
   }
+  if (isLikelyCipherBody(reqBody) && !looksLikePlainSignResponse(respBody)) return false;
 
-  const urlHit = /sign|signin|sign_in|doSign|checkIn|checkin|qiandao|clockIn|dailySign|签到/i.test(u);
-  const bodyHit = /签到|已签|signin|signIn|doSign|checkIn|todaySign|sign_in|签到成功|领取成功/i.test(String(reqBody || "") + "\n" + String(respBody || ""));
-  const ct = String(getHeader(headers, "Content-Type") || "");
-  const plainish = /json|x-www-form-urlencoded|text\/plain|text\/html/i.test(ct) || looksLikePlainBody(reqBody) || looksLikePlainSignResponse(respBody);
-  return (urlHit || bodyHit) && plainish;
+  // 动作 URL 白名单已通过；优先在响应阶段学习（有 $response 时更可信）
+  if (typeof $response === "undefined" || !$response) {
+    // 请求阶段也允许学习 doMark/doSign，避免漏接口
+    return /doMark|doSign|signin|checkIn|receive/i.test(u);
+  }
+  return true;
 }
 
 function looksLikePlainBody(body) {
@@ -769,10 +953,17 @@ function checkFormat(list) {
   (list || []).forEach(item => {
     if (!item || typeof item !== "object") return;
     const n = normalizeAccount(item);
-    const key = n.phone || n.uid || n.jsessionid;
+    // 丢掉纯伪号幽灵账号
+    if (n.phone && !isValidPhone(n.phone)) n.phone = "";
+    if (!n.phone && !n.uid && !n.jsessionid && !n.cloudAuthorization && !n.h5Cookie) return;
+    const key = n.phone || n.uid || n.jsessionid || ("cloud:" + (n.cloudAuthorization || "").slice(-12));
     if (!key || seen.has(key)) {
       if (key && seen.has(key)) {
-        const idx = out.findIndex(x => (x.phone && x.phone === n.phone) || (x.uid && x.uid === n.uid) || (x.jsessionid && x.jsessionid === n.jsessionid));
+        const idx = out.findIndex(x =>
+          (n.phone && x.phone === n.phone) ||
+          (n.uid && x.uid === n.uid) ||
+          (n.jsessionid && x.jsessionid === n.jsessionid)
+        );
         if (idx >= 0) out[idx] = mergeAccount(out[idx], n);
       }
       return;
@@ -785,11 +976,13 @@ function checkFormat(list) {
 
 function normalizeAccount(item) {
   const o = Object.assign({}, item || {});
-  o.phone = String(o.phone || "").replace(/\D/g, "");
+  o.phone = sanitizePhone(o.phone);
   o.jsessionid = o.jsessionid || matchOne(o.cookie || "", /JSESSIONID=([^;]+)/i);
   o.uid = o.uid || matchOne(o.cookie || "", /UID=([^;]+)/i);
   // 明确丢弃旧版固化 tasks，避免被误用
   if (o.tasks) delete o.tasks;
+  // 非法伪号码清空，防止 140****6052 这类时间戳残骸
+  if (o.phone && !isValidPhone(o.phone)) o.phone = "";
   return o;
 }
 
@@ -797,29 +990,48 @@ function mergeAccount(oldItem, neo) {
   const o = Object.assign({}, oldItem);
   [
     "phone", "cookie", "jsessionid", "uid", "xtoken", "userAgent",
-    "cloudAuthorization", "noteToken", "appNumber", "cloudUA", "source"
+    "cloudAuthorization", "noteToken", "appNumber", "cloudUA",
+    "h5Cookie", "h5Token", "source"
   ].forEach(k => { if (neo[k]) o[k] = neo[k]; });
+  // 只有合法手机号才覆盖，避免错误号把正确号冲掉
+  if (neo.phone && isValidPhone(neo.phone)) o.phone = neo.phone;
   o.updatedAt = neo.updatedAt || Date.now();
   if (o.tasks) delete o.tasks;
+  if (o.phone && !isValidPhone(o.phone)) o.phone = oldItem.phone || "";
   return o;
 }
 
 function upsertAccount(item, silent) {
-  const list = loadAccounts();
+  const list = loadAccounts().filter(a => {
+    // 启动时顺带清洗伪号码账号
+    if (a && a.phone && !isValidPhone(a.phone) && !a.uid && !a.jsessionid) return false;
+    return true;
+  });
   const n = normalizeAccount(item);
-  let idx = list.findIndex(x =>
-    (n.phone && x.phone === n.phone) ||
-    (n.uid && x.uid === n.uid) ||
-    (n.jsessionid && x.jsessionid === n.jsessionid)
-  );
+  // 完全没有身份字段则不入库，避免制造幽灵账号
+  if (!n.phone && !n.uid && !n.jsessionid && !n.cloudAuthorization && !n.h5Cookie) {
+    return n;
+  }
+  let idx = -1;
+  if (n.phone) idx = list.findIndex(x => x.phone && x.phone === n.phone);
+  if (idx < 0 && n.uid) idx = list.findIndex(x => x.uid && x.uid === n.uid);
+  if (idx < 0 && n.jsessionid) idx = list.findIndex(x => x.jsessionid && x.jsessionid === n.jsessionid);
   if (idx >= 0) list[idx] = mergeAccount(list[idx], n);
   else {
+    // 无合法 phone 时，不要新建“假号”账号（除非有 session）
+    if (!n.phone && !n.uid && !n.jsessionid) return n;
     list.push(n);
     idx = list.length - 1;
   }
   saveAccounts(list);
   if (!silent) console.log("account upsert =>", maskPhone(list[idx].phone || list[idx].uid || ""));
   return list[idx];
+}
+
+function findAccountByPhone(phone) {
+  const p = sanitizePhone(phone);
+  if (!isValidPhone(p)) return null;
+  return loadAccounts().find(a => a.phone === p) || null;
 }
 
 /********************* HTTP 封装 *********************/
@@ -894,14 +1106,98 @@ function pickSessionCookie(raw) {
 }
 
 function extractPhoneLoose() {
-  const blob = Array.prototype.slice.call(arguments).map(x => {
+  // 兼容旧调用；内部改走严格规则
+  return extractPhoneStrict.apply(null, arguments);
+}
+
+// 严格提取手机号：优先字段语义，过滤时间戳伪号
+function extractPhoneStrict() {
+  const parts = Array.prototype.slice.call(arguments).map(x => {
     try { return typeof x === "string" ? x : JSON.stringify(x); } catch (e) { return String(x); }
-  }).join("\n");
-  const m = blob.match(/mobile:?([1][3-9]\d{9})/i) || blob.match(/(1[3-9]\d{9})/);
-  if (!m) return "";
-  const p = m[1];
-  if (/^1786491/.test(p) || /^1403535/.test(p) || /^1411431/.test(p)) return "";
-  return p;
+  });
+  const blob = parts.join("\n");
+
+  // 1) 字段语义优先
+  const named = [
+    /(?:phone|mobile|msisdn|tel|app_number|appNumber)["'=\s:]*?(1[3-9]\d{9})/ig,
+    /mobile:(1[3-9]\d{9})/ig
+  ];
+  for (let i = 0; i < named.length; i++) {
+    let m;
+    const re = named[i];
+    while ((m = re.exec(blob))) {
+      const p = sanitizePhone(m[1]);
+      if (isValidPhone(p)) return p;
+    }
+  }
+
+  // 2) Basic 解码
+  const basic = blob.match(/Basic\s+([A-Za-z0-9+/=]+)/i);
+  if (basic) {
+    const p = decodeBasicPhone("Basic " + basic[1]);
+    if (p) return p;
+  }
+
+  // 3) 裸 11 位兜底，但必须通过有效号段校验，且不能落在 URL 时间戳附近
+  const all = blob.match(/1[3-9]\d{9}/g) || [];
+  for (let i = 0; i < all.length; i++) {
+    const p = all[i];
+    if (!isValidPhone(p)) continue;
+    // 排除 query currentTime=17865... 这类拼接
+    const idx = blob.indexOf(p);
+    const around = blob.slice(Math.max(0, idx - 24), idx + 20).toLowerCase();
+    if (/time|timestamp|currenttime|nonce|token|_t=|date|expires|expire/.test(around)) continue;
+    return p;
+  }
+  return "";
+}
+
+function sanitizePhone(v) {
+  return String(v || "").replace(/\D/g, "");
+}
+
+function isValidPhone(v) {
+  const p = sanitizePhone(v);
+  if (!/^1[3-9]\d{9}$/.test(p)) return false;
+  // 拒绝 140-144 等非号段（时间戳/内部 ID 常见）
+  if (/^14[0-4]/.test(p)) return false;
+  // 日志假号：17864/17865... 来自 Date.now() 前 11 位
+  if (/^1786[0-9]\d{6}$/.test(p)) return false;
+  if (/^(\d)\1{10}$/.test(p)) return false;
+  return true;
+}
+
+function decodeURIComponentSafe(s) {
+  try { return decodeURIComponent(String(s || "")); } catch (e) { return String(s || ""); }
+}
+
+function mergeCookieString(a, b) {
+  const map = {};
+  const push = (raw) => {
+    String(raw || "").split(/,(?=[^;]+?=)|;/).forEach(part => {
+      const s = String(part || "").trim();
+      if (!s || /=/.test(s) === false) return;
+      // 跳过 Set-Cookie 属性
+      if (/^(path|domain|expires|max-age|secure|httponly|samesite)=/i.test(s)) return;
+      if (/^(secure|httponly|samesite)$/i.test(s)) return;
+      const i = s.indexOf("=");
+      if (i <= 0) return;
+      const k = s.slice(0, i).trim();
+      const v = s.slice(i + 1).trim();
+      if (!k) return;
+      map[k] = v;
+    });
+  };
+  // Set-Cookie 可能多段，用宽松切分
+  const norm = (raw) => {
+    if (!raw) return "";
+    if (Array.isArray(raw)) return raw.join(";");
+    // 多个 Set-Cookie 用逗号拼接时，尽量保留 name=value
+    return String(raw).replace(/Expires=[^;,]*,/gi, "Expires=,").replace(/expires=[^;,]*,/gi, "expires=,");
+  };
+  push(norm(a));
+  push(norm(b));
+  return Object.keys(map).map(k => k + "=" + map[k]).join("; ");
 }
 
 function decodeBasicPhone(auth) {
@@ -909,8 +1205,11 @@ function decodeBasicPhone(auth) {
     const m = String(auth).match(/Basic\s+([A-Za-z0-9+/=]+)/i);
     if (!m) return "";
     const dec = base64Decode(m[1]);
+    // Basic 常见 mobile:138....:token
+    const named = dec.match(/mobile[:|=](1[3-9]\d{9})/i);
+    if (named && isValidPhone(named[1])) return named[1];
     const p = dec.match(/1[3-9]\d{9}/);
-    return p ? p[0] : "";
+    return p && isValidPhone(p[0]) ? p[0] : "";
   } catch (e) { return ""; }
 }
 
