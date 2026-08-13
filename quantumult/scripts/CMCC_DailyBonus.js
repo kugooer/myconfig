@@ -4,25 +4,25 @@
   语法风格参考 NobyDa/JD_DailyBonus.js
   适用：Quantumult X / Surge / Loon / Node.js
 
-  设计原则（按你的要求）：
+  设计原则：
   - 不固化、不回放历史签到报文
   - 每次登录成功后，用「本次」会话/凭证，现场动态拼装参数并发起签到
-  - 定时任务也会对已保存会话做「现场签到」（参数按当前时间重新生成）
+  - 定时任务也会对已保存会话做「现场签到」
 
-  当前能力：
-  1) 捕获 fingerprintLogin 成功会话（JSESSIONID/UID/x-token/UA）
-  2) 捕获云盘 Authorization / APP_AUTH（Basic 解码手机号）
-  3) 登录成功后立即触发：
-     - 云盘签到（明文/可动态签名链路）
-     - App 侧可配置 H5 签到点（使用本次会话动态 Header，不复用旧 Body）
-  4) 多账号持久化 CookiesCMCC
+  主路径（2026-08-13 抓包证实）：
+  1) fingerprintLogin → JSESSIONID/UID
+  2) GET qwhdmark/{activityId} → 302 qwhdsso/login?sid=QWHDSSO...
+  3) POST qwhdsso/appTokenLogin?sid=...
+       body.token = "JSESSIONID=...; UID=...; ... ticketID=..."
+  4) GET 返回 data.url（带 token=QWHDSSO...）→ Set-Cookie: QWHD_SESSION_TOKEN=...
+  5) POST /qwhdhub/api/mark/mark31/markstatus  Cookie=QWHD_SESSION_TOKEN + login-check:1
+  6) POST /qwhdhub/api/mark/mark31/domark  body={"date":"yyyyMMdd"}
+  7) 可选：POST /mark31/taskAward/{id} 领取累计任务奖
 
-  限制（事实，不是偷懒）：
-  - 中国移动 App 原生 biz-orange 业务体是 x-sign + 密文 body。
-    在没有签名算法前，无法伪造原生「签到领奖」密文。
-  - 因此「即时动态签到」优先走：
-    a) 登录后实时拿到的云盘凭证 → 动态签到
-    b) 你可配置的 H5 明文签到入口（URL 可改，body 用本次 token/时间生成）
+  限制：
+  - 原生 biz-orange 业务是 x-sign + 密文 body，无法伪造
+  - 无 QWHD_SESSION_TOKEN 时直接打 mark API 会 302 → /qwhdhub/notice/404
+  - 云盘 market/signin 部分环境 404，仅作辅路径
 
 *************************/
 
@@ -76,6 +76,18 @@ var AutoUseLearnedEndpoints = true;
 var AutoSignAfterLearn = false;
 // 是否清理历史误学习的查询类接口（推荐 true）
 var PurgeBadLearnedEndpoints = true;
+// 是否尝试云盘签到（辅路径，市场接口可能 404）
+var EnableCloudSign = true;
+// 是否自动领取 domark 返回的 taskAwardChance
+var AutoClaimTaskAward = true;
+// 签到领奖活动页（抓包：qwhdmark/1021122301）
+var QwhdActivityId = "1021122301";
+var QwhdChannelId = "P00000057578";
+var QwhdYx = "9000303382";
+// 默认省/市码（若账号未捕获，用此兜底；湖南移动常见 731/2731）
+var DefaultProvinceCode = "731";
+var DefaultCityCode = "2731";
+var DefaultCarrierOperator = "002";
 
 /********************* 运行时 *********************/
 var merge = {};
@@ -131,10 +143,11 @@ async function all(account, opts) {
   const tag = maskPhone(ACCOUNT.phone || ACCOUNT.uid || "未知");
   console.log(`\n==== 账号 ${tag} / 原因 ${opts && opts.reason || "manual"} ====`);
 
-  // 每次都现场签到，不读取历史 tasks body
+  // 主路径：签到领奖(qwhdhub)；辅路径：云盘 / 已学习动作端点
+  // 必须串行优先 Qwhd：避免未换 H5 会话前盲打 mark API 造成 302/404 噪音
+  await LiveQwhdSign(0);
   await Promise.all([
-    LiveCloudSign(0),
-    LiveQwhdSign(0),
+    EnableCloudSign ? LiveCloudSign(0) : Promise.resolve(),
     LiveEndpointSign(0)
   ]);
 
@@ -178,8 +191,10 @@ async function GetCookie() {
       cookie: cookie,
       jsessionid: matchOne(cookie, /JSESSIONID=([^;]+)/i),
       uid: matchOne(cookie, /UID=([^;]+)/i),
+      ticketId: matchOne(setCookie + ";" + cookie, /ticketID=([^;,\s]+)/i) || "",
       xtoken: getHeader(headers, "x-token") || getHeader(headers, "X-Token") || "",
       userAgent: getHeader(headers, "User-Agent") || "ChinaMobile/12.0.2 (iPhone; iOS 26.4.1; Scale/3.00)",
+      appVersion: matchOne(getHeader(headers, "User-Agent") || "", /ChinaMobile\/([\d.]+)/i) || "12.0.2",
       updatedAt: Date.now(),
       source: "fingerprintLogin"
     };
@@ -213,27 +228,81 @@ async function GetCookie() {
     }
   }
 
-  // 2.5) 签到 H5 会话（qwhdhub）—— 单独保存 cookie/token，不伪造原生密文
-  if (/wx\.10086\.cn\/qwhdhub\//i.test(url)) {
+  // 2.5) 签到 H5 会话（qwhdhub / qwhdsso）—— 保存 QWHD_SESSION_TOKEN / token / SSO jwt
+  if (/wx\.10086\.cn\/(?:qwhdhub|qwhdsso)\//i.test(url)) {
     const setCookie = getHeader(respHeaders, "Set-Cookie") || "";
     const reqCookie = getHeader(headers, "Cookie") || "";
     const h5Cookie = mergeCookieString(reqCookie, setCookie);
+    const qwhdSession =
+      matchOne(h5Cookie, /QWHD_SESSION_TOKEN=([^;]+)/i) ||
+      matchOne(setCookie, /QWHD_SESSION_TOKEN=([^;]+)/i) ||
+      "";
     const phone = extractPhoneStrict(body, respBody, headers, reqCookie, setCookie, url);
     const h5Token =
       matchOne(url, /[?&](?:token|accessToken|jt)=([^&]+)/i) ||
-      matchOne(reqCookie, /(?:token|accessToken|jt)=([^;]+)/i) ||
       matchOne(String(body || ""), /"(?:token|accessToken|jt)"\s*:\s*"([^"]+)"/i) ||
+      matchOne(String(respBody || ""), /"loginUid"\s*:\s*"(QWHDSSO[^"]+)"/i) ||
       "";
-    if (h5Cookie || phone || h5Token) {
+    const ssoJwt =
+      matchOne(String(respBody || ""), /"jwt"\s*:\s*"([^"]+)"/i) || "";
+    const nickPhone = matchOne(String(respBody || ""), /"nickName"\s*:\s*"(1\d{2})\*{4}(\d{4})"/i);
+    // appTokenLogin / 页面 Referer 里可能有省市区
+    let provinceCode = matchOne(String(body || ""), /"provinceCode"\s*:\s*"?(\d+)"?/i);
+    let cityCode = matchOne(String(body || ""), /"cityCode"\s*:\s*"?(\d+)"?/i);
+    let activityId =
+      matchOne(url, /qwhdmark\/(\d+)/i) ||
+      matchOne(url, /activityId=(\d+)/i) ||
+      matchOne(String(respBody || ""), /"activityId"\s*:\s*"(\d+)"/i) ||
+      "";
+
+    // appTokenLogin 请求体会带 JSESSIONID；可反绑手机对应账号
+    const jsidInBody = matchOne(String(body || ""), /JSESSIONID=([^;"\s]+)/i);
+    const patch = {
+      phone: phone,
+      h5Cookie: h5Cookie,
+      h5Token: decodeURIComponentSafe(h5Token),
+      qwhdSession: qwhdSession,
+      ssoJwt: ssoJwt,
+      provinceCode: provinceCode,
+      cityCode: cityCode,
+      activityId: activityId,
+      userAgent: getHeader(headers, "User-Agent") || "",
+      updatedAt: Date.now(),
+      source: /appTokenLogin/i.test(url) ? "qwhdsso-login" : "qwhdhub-session"
+    };
+    // 从 nickName 138****1269 无法直接得全号；但 UUID 里有真实号时可用
+    const phoneInUuid = matchOne(String(respBody || ""), /AvnWN(1[3-9]\d{9})/i);
+    if (!patch.phone && phoneInUuid && isValidPhone(phoneInUuid)) patch.phone = phoneInUuid;
+    if (jsidInBody) patch.jsessionid = jsidInBody;
+    if (h5Cookie || phone || h5Token || qwhdSession || jsidInBody) {
+      upsertAccount(patch, true);
+    }
+  }
+
+  // 2.6) 专门捕获 appTokenLogin 响应里的跳转 token / jwt
+  if (/wx\.10086\.cn\/qwhdsso\/appTokenLogin/i.test(url) && $response) {
+    try {
+      const j = JSON.parse(respBody || "{}");
+      const data = (j && j.data) || {};
+      const jump = data.url || "";
+      const token = matchOne(jump, /[?&]token=([^&]+)/i) || "";
+      const jsid = matchOne(String(body || ""), /JSESSIONID=([^;"\s]+)/i);
+      const uid = matchOne(String(body || ""), /UID=([^;"\s]+)/i);
+      const phone = extractPhoneStrict(body, respBody);
       upsertAccount({
         phone: phone,
-        h5Cookie: h5Cookie,
-        h5Token: decodeURIComponentSafe(h5Token),
-        userAgent: getHeader(headers, "User-Agent") || "",
+        jsessionid: jsid,
+        uid: uid,
+        h5Token: decodeURIComponentSafe(token),
+        ssoJwt: data.jwt || "",
+        provinceCode: matchOne(String(body || ""), /"provinceCode"\s*:\s*"?(\d+)"?/i),
+        cityCode: matchOne(String(body || ""), /"cityCode"\s*:\s*"?(\d+)"?/i),
+        activityId: matchOne(jump, /qwhdmark\/(\d+)/i) || QwhdActivityId,
+        cookie: jsid ? (`JSESSIONID=${jsid}` + (uid ? `; UID=${uid}` : "")) : "",
         updatedAt: Date.now(),
-        source: "qwhdhub-session"
+        source: "appTokenLogin"
       }, true);
-    }
+    } catch (e) {}
   }
 
   // 3) 云盘/笔记 Authorization —— 每次登录后的新凭证，现场入库，并可立刻签到
@@ -452,106 +521,119 @@ async function tryCloudLegacySign(headers, ts) {
   }
 }
 
-/********************* 动态签到：qwhdhub 签到领奖（优先） *********************/
+/********************* 动态签到：qwhdhub 签到领奖（主路径） *********************/
+/**
+ * 真实链路（禁止在无 QWHD_SESSION_TOKEN 时盲探 mark API）：
+ * open hub → qwhdsso/login(sid) → appTokenLogin(JSESSIONID token) →
+ * page token → QWHD_SESSION_TOKEN → markstatus → domark {"date":yyyyMMdd}
+ */
 function LiveQwhdSign(s) {
   merge.QwhdSign = {};
   return new Promise(resolve => {
     setTimeout(async () => {
       try {
-        // 需要 H5 会话。若没有 h5Cookie，尝试用 app cookie 兜底
-        const cookie = ACCOUNT.h5Cookie || ACCOUNT.cookie || "";
-        if (!cookie && !ACCOUNT.h5Token) {
-          merge.QwhdSign.notify = "跳过签到领奖：尚无 qwhdhub H5 会话（请先打开签到页）";
+        if (!ACCOUNT.cookie && !ACCOUNT.jsessionid) {
+          merge.QwhdSign.notify = "跳过签到领奖：尚无 App 登录会话(JSESSIONID)";
           return resolve();
         }
-        const ts = Date.now();
-        const headers = {
-          Accept: "application/json, text/plain, */*",
-          "User-Agent": ACCOUNT.userAgent || "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 ChinaMobile",
-          "Accept-Language": "zh-CN,zh-Hans;q=0.9",
-          Origin: "https://wx.10086.cn",
-          Referer: "https://wx.10086.cn/qwhdhub/",
-          Cookie: cookie,
-          "Content-Type": "application/json;charset=UTF-8"
-        };
-        if (ACCOUNT.h5Token) {
-          headers.token = ACCOUNT.h5Token;
-          headers.accessToken = ACCOUNT.h5Token;
+
+        // 1) 换取/刷新 H5 会话（QWHD_SESSION_TOKEN）
+        const sess = await ensureQwhdSession();
+        if (!sess.ok) {
+          merge.QwhdSign.error = 1;
+          merge.QwhdSign.notify = "签到领奖: H5 SSO 失败 · " + (sess.msg || "未知");
+          return resolve();
         }
 
-        // 1) 查状态
-        const statusUrls = [
-          "https://wx.10086.cn/qwhdhub/api/mark/mark31/markstatus",
-          "https://wx.10086.cn/qwhdhub/api/mark/info/commonInfo"
-        ];
-        let already = false;
-        let statusText = "";
-        for (let i = 0; i < statusUrls.length; i++) {
-          const r = await httpRaw("POST", statusUrls[i] + (statusUrls[i].indexOf("?") >= 0 ? "&" : "?") + "_t=" + ts, headers, "{}").catch(e => ({ error: String(e) }));
-          if (r.error) continue;
-          statusText = String(r.body || "");
-          if (/已签|今日已签|signed|signStatus"?\s*:\s*1|"isSign"\s*:\s*true|"todaySign"\s*:\s*true/i.test(statusText)) {
-            already = true;
-            break;
+        const day = yyyymmdd();
+        const actId = ACCOUNT.activityId || QwhdActivityId;
+        const channelId = ACCOUNT.channelId || QwhdChannelId;
+        const yx = ACCOUNT.yx || QwhdYx;
+        const pageUrl =
+          `https://wx.10086.cn/qwhdhub/qwhdmark/${actId}?channelId=${encodeURIComponent(channelId)}` +
+          `&yx=${encodeURIComponent(yx)}` +
+          (ACCOUNT.h5Token ? `&token=${encodeURIComponent(ACCOUNT.h5Token)}` : "");
+
+        const headers = buildQwhdApiHeaders(pageUrl);
+
+        // 2) markstatus：看今日是否已签（data.markstatus[].date/status）
+        const statusUrl = "https://wx.10086.cn/qwhdhub/api/mark/mark31/markstatus";
+        const st = await httpRaw("POST", statusUrl, headers, "{}").catch(e => ({ error: String(e), status: 0, body: "" }));
+        if (st.error || isQwhdAuthFail(st)) {
+          // 会话失效则强制重登一次
+          const again = await ensureQwhdSession(true);
+          if (!again.ok) {
+            merge.QwhdSign.error = 1;
+            merge.QwhdSign.notify = "签到领奖: markstatus 无有效会话 · " + (st.error || shortBody(st.body) || ("HTTP " + st.status));
+            return resolve();
           }
+          Object.assign(headers, buildQwhdApiHeaders(pageUrl));
         }
+
+        let st2 = st;
+        if (isQwhdAuthFail(st) || st.error) {
+          st2 = await httpRaw("POST", statusUrl, headers, "{}").catch(e => ({ error: String(e), status: 0, body: "" }));
+        }
+
+        const already = isTodayMarked(st2 && st2.body, day);
         if (already) {
           merge.QwhdSign.success = 1;
           merge.QwhdSign.notify = "签到领奖: 今日已签到";
+          // 仍可尝试领取可领任务奖
+          if (AutoClaimTaskAward) {
+            const award = await claimTaskAwardsFromStatus(st2 && st2.body, headers);
+            if (award) merge.QwhdSign.bean = award;
+          }
           return resolve();
         }
 
-        // 2) 尝试动作接口族（仅动作，不打查询）
-        const actionUrls = [
-          "https://wx.10086.cn/qwhdhub/api/mark/mark31/doMark",
-          "https://wx.10086.cn/qwhdhub/api/mark/mark31/mark",
-          "https://wx.10086.cn/qwhdhub/api/mark/doMark",
-          "https://wx.10086.cn/qwhdhub/api/mark/mark",
-          "https://wx.10086.cn/qwhdhub/api/mark/sign/doSign",
-          "https://wx.10086.cn/qwhdhub/api/mark/task/receive"
-        ];
-        // 合并「已学习且判定为动作」的端点
-        resolveSignEndpoints().forEach(p => {
-          if (p && p.url && isActionSignUrl(p.url) && actionUrls.indexOf(p.url.split("?")[0]) < 0) {
-            actionUrls.push(p.url.split("?")[0]);
-          }
-        });
+        // 3) 唯一动作：POST /mark31/domark  body={"date":"yyyyMMdd"}（大小写必须 domark）
+        const markUrl = "https://wx.10086.cn/qwhdhub/api/mark/mark31/domark";
+        const markBody = JSON.stringify({ date: day });
+        const mr = await httpRaw("POST", markUrl, headers, markBody).catch(e => ({ error: String(e), status: 0, body: "" }));
+        const text = String((mr && mr.body) || "");
+        if (LogDetails) console.log("domark", mr && mr.status, text.slice(0, 300));
 
-        let ok = false;
-        let msg = "";
-        let reward = "";
-        for (let i = 0; i < actionUrls.length; i++) {
-          const u = actionUrls[i];
-          const bodies = [
-            JSON.stringify({ client: "app", timestamp: ts, phone: ACCOUNT.phone || "", mobile: ACCOUNT.phone || "" }),
-            JSON.stringify({}),
-            `timestamp=${ts}&client=app`
-          ];
-          for (let bi = 0; bi < bodies.length; bi++) {
-            const h = Object.assign({}, headers);
-            if (bodies[bi][0] !== "{") h["Content-Type"] = "application/x-www-form-urlencoded";
-            else h["Content-Type"] = "application/json;charset=UTF-8";
-            const r = await httpRaw("POST", u + (u.indexOf("?") >= 0 ? "&" : "?") + "_t=" + ts, h, bodies[bi]).catch(e => ({ error: String(e), body: "", status: 0 }));
-            const text = String((r && r.body) || "");
-            if (LogDetails) console.log("qwhd try", u, (r && r.status), text.slice(0, 200));
-            if (r && !r.error && (isBizSuccess(text, r.status) || /已签|重复|signed/i.test(text))) {
-              ok = true;
-              msg = /已签|重复|signed/i.test(text) ? "今日已签" : "签到成功";
-              reward = extractReward(text);
-              break;
-            }
-            if (text) msg = text.slice(0, 80);
+        // 成功判定：code=SUCCESS / success=true；msg 可能是「未配置对应奖品」但仍算签到成功
+        if (mr && !mr.error && !isQwhdAuthFail(mr) && isDomarkSuccess(text, mr.status)) {
+          merge.QwhdSign.success = 1;
+          const alreadyMsg = /已签|重复|ALREADY|SIGNED/i.test(text);
+          merge.QwhdSign.notify = alreadyMsg ? "签到领奖: 今日已签" : "签到领奖: 签到成功";
+          // 抓包成功样例: status=PRIZE_NO_CONFIG, msg=未配置对应奖品, success=true
+          if (/PRIZE_NO_CONFIG|未配置对应奖品/i.test(text)) {
+            merge.QwhdSign.notify += "（当日奖品未配置，任务进度已记）";
           }
-          if (ok) break;
+          const prize = extractPrizeName(text) || extractReward(text);
+          if (prize) merge.QwhdSign.bean = prize;
+
+          // 4) 自动领 taskAwardChance
+          if (AutoClaimTaskAward) {
+            const chances = extractTaskAwardIds(text);
+            if (chances.length) {
+              const got = await claimTaskAwardIds(chances, headers);
+              if (got) merge.QwhdSign.bean = (merge.QwhdSign.bean ? merge.QwhdSign.bean + " / " : "") + got;
+            } else {
+              // 再拉一次 status 看 chance
+              const st3 = await httpRaw("POST", statusUrl, headers, "{}").catch(() => null);
+              const got = await claimTaskAwardsFromStatus(st3 && st3.body, headers);
+              if (got) merge.QwhdSign.bean = (merge.QwhdSign.bean ? merge.QwhdSign.bean + " / " : "") + got;
+            }
+          }
+          // 把最新 H5 会话写回账号
+          persistAccountSessionFields();
+          return resolve();
         }
 
-        if (ok) {
+        // 失败分支
+        if (isQwhdAuthFail(mr)) {
+          merge.QwhdSign.error = 1;
+          merge.QwhdSign.notify = "签到领奖: 会话无效(302/404)，请重新登录 App";
+        } else if (/已签|重复/i.test(text)) {
           merge.QwhdSign.success = 1;
-          merge.QwhdSign.notify = "签到领奖: " + msg;
-          if (reward) merge.QwhdSign.bean = reward;
+          merge.QwhdSign.notify = "签到领奖: 今日已签";
         } else {
           merge.QwhdSign.error = 1;
-          merge.QwhdSign.notify = "签到领奖: 未成功" + (msg ? " · " + msg : "（需在签到页完成 H5 登录态）");
+          merge.QwhdSign.notify = "签到领奖: 未成功 · " + (mr && mr.error ? mr.error : shortBody(text) || ("HTTP " + (mr && mr.status)));
         }
       } catch (e) {
         merge.QwhdSign.error = 1;
@@ -563,15 +645,360 @@ function LiveQwhdSign(s) {
   });
 }
 
+function buildQwhdApiHeaders(referer) {
+  const token = ACCOUNT.qwhdSession || "";
+  const yx = ACCOUNT.yx || QwhdYx;
+  let cookie = "";
+  if (token) cookie = `QWHD_SESSION_TOKEN=${token}`;
+  if (yx) cookie += (cookie ? "; " : "") + `yx=${yx}`;
+  // 合并已有 h5Cookie 里其他非关键字段也可，但核心必须有 QWHD_SESSION_TOKEN
+  if (ACCOUNT.h5Cookie) cookie = mergeCookieString(ACCOUNT.h5Cookie, cookie);
+  // 确保 QWHD_SESSION_TOKEN 不被旧值覆盖错
+  if (token) {
+    cookie = cookie.replace(/QWHD_SESSION_TOKEN=[^;]*/i, "QWHD_SESSION_TOKEN=" + token);
+    if (!/QWHD_SESSION_TOKEN=/i.test(cookie)) cookie = `QWHD_SESSION_TOKEN=${token}; ` + cookie;
+  }
+  return {
+    Accept: "*/*",
+    "Content-Type": "application/json;charset=UTF-8",
+    Origin: "https://wx.10086.cn",
+    Referer: referer || `https://wx.10086.cn/qwhdhub/qwhdmark/${ACCOUNT.activityId || QwhdActivityId}`,
+    "User-Agent": ACCOUNT.h5UA ||
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148/wkwebview leadeon/12.0.2/CMCCIT",
+    "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+    "x-requested-with": "XMLHttpRequest",
+    "login-check": "1",
+    Cookie: cookie
+  };
+}
+
+/**
+ * 打开活动 → SSO 登录 → 种下 QWHD_SESSION_TOKEN
+ * force=true 时忽略缓存强制重登
+ */
+async function ensureQwhdSession(force) {
+  // 有效缓存：有 session 且 25 分钟内刷新过
+  if (!force && ACCOUNT.qwhdSession && ACCOUNT.qwhdSessionAt && (Date.now() - ACCOUNT.qwhdSessionAt < 25 * 60 * 1000)) {
+    return { ok: true, cached: true };
+  }
+  // 有 session 但无时间戳：仍先用，失败再 force
+  if (!force && ACCOUNT.qwhdSession && !ACCOUNT.cookie && !ACCOUNT.jsessionid) {
+    return { ok: true, cached: true };
+  }
+
+  if (!ACCOUNT.cookie && !ACCOUNT.jsessionid) {
+    return { ok: false, msg: "缺少 JSESSIONID" };
+  }
+
+  const actId = ACCOUNT.activityId || QwhdActivityId;
+  const channelId = ACCOUNT.channelId || QwhdChannelId;
+  const yx = ACCOUNT.yx || QwhdYx;
+  const actUrl =
+    `https://wx.10086.cn/qwhdhub/qwhdmark/${actId}?channelId=${encodeURIComponent(channelId)}` +
+    `&redCode=rec_feedHotZoneApp_${encodeURIComponent(channelId)}&yx=${encodeURIComponent(yx)}`;
+  const h5UA =
+    ACCOUNT.h5UA ||
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148/wkwebview leadeon/12.0.2/CMCCIT";
+
+  // A. 打开活动页，跟随/解析 302 Location → qwhdsso/login?sid=...
+  let sid = ACCOUNT.h5Token && /^QWHDSSO/i.test(ACCOUNT.h5Token) ? ACCOUNT.h5Token : "";
+  let loginUrl = "";
+  if (!sid) {
+    const open = await httpRaw("GET", actUrl, {
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "User-Agent": h5UA,
+      "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+      Cookie: `yx=${yx}`
+    }, null).catch(e => ({ error: String(e), headers: {}, body: "", status: 0 }));
+
+    const loc = getHeader(open.headers || {}, "Location") || getHeader(open.headers || {}, "location") || "";
+    loginUrl = loc || "";
+    // 某些客户端自动跟跳，body/最终 URL 里也可能含 sid
+    sid =
+      matchOne(loginUrl, /[?&]sid=([^&]+)/i) ||
+      matchOne(String(open.body || ""), /appTokenLogin\?sid=([^"'&]+)/i) ||
+      matchOne(String(open.url || open.finalUrl || ""), /[?&](?:sid|token)=(QWHDSSO[^&]+)/i) ||
+      "";
+    // 若直接 200 且已带 session（罕见）
+    const sc = getHeader(open.headers || {}, "Set-Cookie") || "";
+    const exist = matchOne(sc, /QWHD_SESSION_TOKEN=([^;]+)/i);
+    if (exist) {
+      ACCOUNT.qwhdSession = exist;
+      ACCOUNT.qwhdSessionAt = Date.now();
+      ACCOUNT.h5Cookie = mergeCookieString(ACCOUNT.h5Cookie || "", sc);
+      return { ok: true, sid: "cached-from-open" };
+    }
+  }
+
+  if (!loginUrl && sid) {
+    loginUrl = `https://wx.10086.cn/qwhdsso/login?dlwmh=true&actUrl=${encodeURIComponent(actUrl)}`;
+  }
+
+  // B. 访问 SSO 登录页，从 HTML 解析 sid（若上一步没拿到）
+  if (!sid) {
+    const ssoPageUrl = loginUrl || `https://wx.10086.cn/qwhdsso/login?dlwmh=true&actUrl=${encodeURIComponent(actUrl)}`;
+    const page = await httpRaw("GET", ssoPageUrl, {
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "User-Agent": h5UA,
+      "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+      Cookie: `yx=${yx}`,
+      Referer: actUrl
+    }, null).catch(e => ({ error: String(e), body: "", headers: {} }));
+    const html = String(page.body || "");
+    sid =
+      matchOne(html, /appTokenLogin\?sid=([^"'&\s]+)/i) ||
+      matchOne(html, /sid=(QWHDSSO[A-Za-z0-9]+)/i) ||
+      matchOne(getHeader(page.headers || {}, "Location") || "", /[?&]sid=([^&]+)/i) ||
+      "";
+    if (!sid) {
+      return { ok: false, msg: "未解析到 QWHDSSO sid（SSO 页异常）" };
+    }
+  }
+
+  // C. appTokenLogin —— 关键：token 字段 = App 的 session cookie 串
+  const appToken = buildAppTokenString();
+  if (!appToken) return { ok: false, msg: "无法构造 appToken(JSESSIONID)" };
+
+  const provinceCode = ACCOUNT.provinceCode || DefaultProvinceCode;
+  const cityCode = ACCOUNT.cityCode || DefaultCityCode;
+  const phone = ACCOUNT.phone || "";
+  const userCheckId = phone ? phoneToUserCheckId(phone) : (ACCOUNT.userCheckId || "");
+  const version = ACCOUNT.appVersion || "12.0.2";
+  const loginBody = {
+    jwtToken: ACCOUNT.ssoJwt || null,
+    token: appToken,
+    provinceCode: String(provinceCode),
+    cityCode: String(cityCode),
+    userCheckId: userCheckId || String(Math.random()).slice(2, 11),
+    carrierOperator: ACCOUNT.carrierOperator || DefaultCarrierOperator,
+    appVersionCode: version,
+    took: 80
+  };
+
+  const ssoHeaders = {
+    Accept: "*/*",
+    "Content-Type": "application/json;charset=UTF-8",
+    Origin: "https://wx.10086.cn",
+    Referer: loginUrl || `https://wx.10086.cn/qwhdsso/login?dlwmh=true&actUrl=${encodeURIComponent(actUrl)}`,
+    "User-Agent": h5UA,
+    "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+    Cookie: `yx=${yx}`
+  };
+
+  const loginApi = `https://wx.10086.cn/qwhdsso/appTokenLogin?sid=${encodeURIComponent(sid)}`;
+  const lr = await httpRaw("POST", loginApi, ssoHeaders, JSON.stringify(loginBody)).catch(e => ({ error: String(e), body: "", status: 0 }));
+  if (lr.error) return { ok: false, msg: "appTokenLogin 网络错误: " + lr.error };
+
+  let data = null;
+  try { data = JSON.parse(lr.body || "{}"); } catch (e) {}
+  if (!data || !(data.success === true || data.code === "SUCCESS") || !data.data) {
+    return { ok: false, msg: "appTokenLogin 失败 · " + shortBody(lr.body) };
+  }
+
+  const jumpUrl = data.data.url || "";
+  const h5Token = matchOne(jumpUrl, /[?&]token=([^&]+)/i) || sid;
+  const jwt = data.data.jwt || "";
+  ACCOUNT.h5Token = decodeURIComponentSafe(h5Token);
+  ACCOUNT.ssoJwt = jwt || ACCOUNT.ssoJwt || "";
+  ACCOUNT.activityId = matchOne(jumpUrl, /qwhdmark\/(\d+)/i) || actId;
+
+  // D. 打开 jumpUrl，收 Set-Cookie: QWHD_SESSION_TOKEN
+  const pr = await httpRaw("GET", jumpUrl || actUrl + `&token=${encodeURIComponent(ACCOUNT.h5Token)}`, {
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": h5UA,
+    "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+    Referer: ssoHeaders.Referer,
+    Cookie: `yx=${yx}`
+  }, null).catch(e => ({ error: String(e), headers: {}, body: "" }));
+
+  const setCookie = getHeader(pr.headers || {}, "Set-Cookie") || getHeader(pr.headers || {}, "set-cookie") || "";
+  let qwhd =
+    matchOne(setCookie, /QWHD_SESSION_TOKEN=([^;]+)/i) ||
+    matchOne(String(pr.body || ""), /QWHD_SESSION_TOKEN=([^;,"'\s]+)/i) ||
+    "";
+
+  // 某些运行时 http 客户端不回传 Set-Cookie；再打一次 user/info 用 Cookie 空试？不行。
+  // 兜底：用 token 访问页面时服务端应下发；若仍无，记下 token，后续 API 可能仍 302
+  if (!qwhd && ACCOUNT.qwhdSession && !force) qwhd = ACCOUNT.qwhdSession;
+
+  if (qwhd) {
+    ACCOUNT.qwhdSession = qwhd;
+    ACCOUNT.qwhdSessionAt = Date.now();
+    ACCOUNT.h5Cookie = mergeCookieString(`yx=${yx}`, setCookie);
+    ACCOUNT.h5Cookie = mergeCookieString(ACCOUNT.h5Cookie, `QWHD_SESSION_TOKEN=${qwhd}`);
+    persistAccountSessionFields();
+    return { ok: true, sid: sid };
+  }
+
+  // 没有 Set-Cookie 时：仍返回 ok=false，避免盲打 404
+  // 但若环境把 cookie 藏进完整 cookie jar 无法读取，用户打开一次签到页即可被 MITM 捕获
+  if (ACCOUNT.qwhdSession) {
+    return { ok: true, sid: sid, msg: "沿用已有 QWHD_SESSION_TOKEN" };
+  }
+  return { ok: false, msg: "SSO 成功但未拿到 QWHD_SESSION_TOKEN（请在 App 点开一次签到页）" };
+}
+
+function buildAppTokenString() {
+  // 抓包 #528: token 字段是完整 cookie 串
+  // JSESSIONID=...; UID=...; Comment=SessionServer-unity; Path=/;HTTPOnly; ticketID=ShanDong; Secure
+  if (ACCOUNT.cookie && /JSESSIONID=/i.test(ACCOUNT.cookie)) {
+    let c = ACCOUNT.cookie;
+    // 若只有 JSESSIONID/UID，补全官方 appTokenLogin 形态
+    if (!/ticketID=/i.test(c)) {
+      const tid = ACCOUNT.ticketId || "ShanDong";
+      c = c.replace(/;?\s*$/, "") + `; Comment=SessionServer-unity; Path=/;HTTPOnly; ticketID=${tid}; Secure`;
+    }
+    return c;
+  }
+  if (ACCOUNT.jsessionid) {
+    let c = `JSESSIONID=${ACCOUNT.jsessionid}`;
+    if (ACCOUNT.uid) c += `; UID=${ACCOUNT.uid}`;
+    c += `; Comment=SessionServer-unity; Path=/;HTTPOnly; ticketID=${ACCOUNT.ticketId || "ShanDong"}; Secure`;
+    return c;
+  }
+  return "";
+}
+
+function phoneToUserCheckId(phone) {
+  // SSO 页: parseFloat(phoneNumber).toString(16)
+  try {
+    const n = parseFloat(String(phone));
+    if (!isFinite(n)) return "";
+    return n.toString(16);
+  } catch (e) {
+    return "";
+  }
+}
+
+function yyyymmdd(d) {
+  const dt = d || new Date();
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const day = String(dt.getDate()).padStart(2, "0");
+  return `${y}${m}${day}`;
+}
+
+function isQwhdAuthFail(r) {
+  if (!r) return true;
+  if (r.status === 302 || r.status === 401 || r.status === 403) return true;
+  const b = String(r.body || "");
+  const loc = getHeader(r.headers || {}, "Location") || "";
+  if (/notice\/404|qwhdsso\/login/i.test(loc + b)) return true;
+  if (r.status >= 300 && r.status < 400 && !b) return true;
+  return false;
+}
+
+function isTodayMarked(body, day) {
+  const text = String(body || "");
+  if (!text) return false;
+  try {
+    const j = JSON.parse(text);
+    const list = j && j.data && j.data.markstatus;
+    if (Array.isArray(list)) {
+      const hit = list.find(x => String(x.date) === String(day));
+      if (hit && (String(hit.status) === "1" || hit.status === 1 || hit.status === true)) return true;
+    }
+  } catch (e) {}
+  // 兜底正则
+  const re = new RegExp(`"date"\\s*:\\s*"?${day}"?[\\s\\S]{0,40}"status"\\s*:\\s*"?1"?'`, "i");
+  return re.test(text);
+}
+
+function isDomarkSuccess(text, status) {
+  if (isBizSuccess(text, status)) return true;
+  // 签到记成功但奖品未配置
+  if (/"code"\s*:\s*"SUCCESS"/i.test(text) && /PRIZE_NO_CONFIG|未配置对应奖品|taskAwardChance/i.test(text)) return true;
+  if (/"success"\s*:\s*true/i.test(text) && /markPrize|taskAwardChance/i.test(text)) return true;
+  return false;
+}
+
+function extractTaskAwardIds(text) {
+  const ids = [];
+  try {
+    const j = JSON.parse(text || "{}");
+    const arr = (j && j.data && j.data.taskAwardChance) || [];
+    arr.forEach(x => { if (x && x.id) ids.push(String(x.id)); });
+  } catch (e) {
+    const re = /"id"\s*:\s*"(\d+)"/g;
+    let m;
+    while ((m = re.exec(String(text || "")))) ids.push(m[1]);
+  }
+  // 去重
+  return Array.from(new Set(ids)).slice(0, 5);
+}
+
+function extractPrizeName(text) {
+  const m = String(text || "").match(/"prizeName"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : "";
+}
+
+async function claimTaskAwardIds(ids, headers) {
+  const names = [];
+  for (let i = 0; i < ids.length; i++) {
+    const u = `https://wx.10086.cn/qwhdhub/api/mark/mark31/taskAward/${ids[i]}`;
+    const r = await httpRaw("POST", u, headers, "{}").catch(() => null);
+    const t = (r && r.body) || "";
+    if (r && isBizSuccess(t, r.status)) {
+      names.push(extractPrizeName(t) || ("任务奖" + ids[i]));
+    }
+    await wait(200);
+  }
+  return names.join(", ");
+}
+
+async function claimTaskAwardsFromStatus(body, headers) {
+  try {
+    const j = JSON.parse(body || "{}");
+    const chances = (j && j.data && j.data.taskAwardChance) || [];
+    const ids = chances.map(x => x && x.id).filter(Boolean).map(String);
+    if (!ids.length) return "";
+    return claimTaskAwardIds(ids, headers);
+  } catch (e) {
+    return "";
+  }
+}
+
+function persistAccountSessionFields() {
+  try {
+    upsertAccount({
+      phone: ACCOUNT.phone,
+      jsessionid: ACCOUNT.jsessionid,
+      uid: ACCOUNT.uid,
+      cookie: ACCOUNT.cookie,
+      h5Cookie: ACCOUNT.h5Cookie,
+      h5Token: ACCOUNT.h5Token,
+      qwhdSession: ACCOUNT.qwhdSession,
+      qwhdSessionAt: ACCOUNT.qwhdSessionAt || Date.now(),
+      ssoJwt: ACCOUNT.ssoJwt,
+      activityId: ACCOUNT.activityId,
+      provinceCode: ACCOUNT.provinceCode,
+      cityCode: ACCOUNT.cityCode,
+      ticketId: ACCOUNT.ticketId,
+      updatedAt: Date.now(),
+      source: "qwhd-session-persist"
+    }, true);
+  } catch (e) {}
+}
+
+function shortBody(t) {
+  const s = String(t || "").replace(/\s+/g, " ").trim();
+  return s.length > 100 ? s.slice(0, 97) + "..." : s;
+}
+
 /********************* 动态签到：可配置 H5/App 端点 *********************/
 function LiveEndpointSign(s) {
   merge.AppSign = {};
   return new Promise(resolve => {
     setTimeout(async () => {
       try {
-        const points = resolveSignEndpoints().filter(x => x && x.enabled !== false && isActionSignUrl(x.url));
+        // 主路径 LiveQwhdSign 已覆盖 mark31/domark，避免学习端点二次盲打
+        const points = resolveSignEndpoints().filter(x => {
+          if (!x || x.enabled === false || !isActionSignUrl(x.url)) return false;
+          if (/wx\.10086\.cn\/qwhdhub\/api\/mark\/mark31\/domark/i.test(x.url)) return false;
+          return true;
+        });
         if (!points.length) {
-          merge.AppSign.notify = "无可执行明文动作端点（已过滤查询类学习结果）";
+          merge.AppSign.notify = "无可执行附加明文动作端点（主路径已由签到领奖处理）";
           return resolve();
         }
         if (!ACCOUNT.cookie && !ACCOUNT.xtoken && !ACCOUNT.phone) {
@@ -661,14 +1088,14 @@ function purgeBadLearnedEndpoints() {
 function isActionSignUrl(url) {
   const u = String(url || "").toLowerCase();
   if (!u) return false;
-  // 明确黑名单：本次日志里误学到的全部在这
-  if (/deployenvi|sdauth|sdkauth|domain\/login|tasklist|commoninfo|markstatus|mytaskinfo|checkexclusive|appcenterfloorrule|appcentercontactinfo|getconfiguration|refreshsession|bytoken\/multi|logreport/i.test(u)) return false;
-  if (/\/login|\/auth|\/token|\/config|\/status|\/info|\/list|\/query|\/detail|\/router/i.test(u) && !/do[a-z]*sign|dosign|signin|domark|receivemark|checkin/i.test(u)) return false;
-  // 动作白名单
-  if (/\/(doSign|signin|signIn|sign_in|checkIn|checkin|doMark|mark\/mark(?:31)?\/(?:do)?mark|receive|clockIn|dailySign)(?:\/|$|\?)/i.test(u)) return true;
-  if (/qwhdhub\/api\/mark\/.*(?:doMark|doSign|sign|receive)/i.test(u)) return true;
-  // 带 sign 字样但必须像动作路径，而不是 status/info
-  if (/(doSign|signin|sign_in|checkIn|qiandao)/i.test(u) && !/(status|info|list|query|config|login)/i.test(u)) return true;
+  // 明确黑名单：查询 / 状态 / 登录 / 配置
+  if (/deployenvi|sdauth|sdkauth|domain\/login|tasklist|commoninfo|markstatus|mytaskinfo|checkexclusive|appcenterfloorrule|appcentercontactinfo|getconfiguration|refreshsession|bytoken\/multi|logreport|user\/info|monthinfo/i.test(u)) return false;
+  if (/\/login|\/auth|\/token|\/config|\/status|\/info|\/list|\/query|\/detail|\/router/i.test(u) && !/do[a-z]*sign|dosign|signin|domark|receivemark|checkin|taskaward/i.test(u)) return false;
+  // 动作白名单：真实动作为 mark31/domark（全小写）
+  if (/\/mark\/mark31\/domark(?:\/|$|\?)/i.test(u)) return true;
+  if (/\/(doSign|signin|signIn|sign_in|checkIn|checkin|doMark|domark|mark\/mark(?:31)?\/(?:do)?mark|receive|clockIn|dailySign|taskAward)(?:\/|$|\?)/i.test(u)) return true;
+  if (/qwhdhub\/api\/mark\/.*(?:domark|doMark|doSign|sign|receive|taskAward)/i.test(u)) return true;
+  if (/(doSign|signin|sign_in|checkIn|qiandao|domark)/i.test(u) && !/(status|info|list|query|config|login)/i.test(u)) return true;
   return false;
 }
 
@@ -869,12 +1296,18 @@ function buildLiveRequest(point, account) {
       point.learnedKeys.forEach(k => {
         const lk = String(k).toLowerCase();
         if (/phone|mobile|msisdn|tel/.test(lk)) obj[k] = phone;
-        else if (/time|timestamp|_t|ts|date/.test(lk)) obj[k] = ts;
+        else if (lk === "date") obj[k] = yyyymmdd(); // domark 用 yyyyMMdd，不是时间戳
+        else if (/time|timestamp|_t|ts/.test(lk)) obj[k] = ts;
         else if (/nonce|random/.test(lk)) obj[k] = nonce;
-        else if (/token|jsession|uid/.test(lk)) obj[k] = account.xtoken || account.jsessionid || account.uid || "";
+        else if (/token|jsession|uid/.test(lk)) obj[k] = account.qwhdSession || account.h5Token || account.xtoken || account.jsessionid || account.uid || "";
         else if (/client|channel|source|from/.test(lk)) obj[k] = /channel|source|from/.test(lk) ? "cmcc-app" : "app";
         else obj[k] = ""; // 未知字段置空，避免回放旧值
       });
+      // qwhdhub 动作接口优先使用 H5 会话头
+      if (/wx\.10086\.cn\/qwhdhub/i.test(url)) {
+        const qh = buildQwhdApiHeaders(url);
+        headers = Object.assign(headers, qh);
+      }
       body = JSON.stringify(obj);
     } else if (point.bodyBuilder === "phoneTimeJson" || !point.bodyBuilder) {
       headers["Content-Type"] = "application/json;charset=UTF-8";
@@ -989,10 +1422,13 @@ function normalizeAccount(item) {
 function mergeAccount(oldItem, neo) {
   const o = Object.assign({}, oldItem);
   [
-    "phone", "cookie", "jsessionid", "uid", "xtoken", "userAgent",
+    "phone", "cookie", "jsessionid", "uid", "xtoken", "userAgent", "appVersion",
     "cloudAuthorization", "noteToken", "appNumber", "cloudUA",
-    "h5Cookie", "h5Token", "source"
+    "h5Cookie", "h5Token", "h5UA", "qwhdSession", "ssoJwt",
+    "ticketId", "provinceCode", "cityCode", "carrierOperator",
+    "activityId", "channelId", "yx", "userCheckId", "source"
   ].forEach(k => { if (neo[k]) o[k] = neo[k]; });
+  if (neo.qwhdSessionAt) o.qwhdSessionAt = neo.qwhdSessionAt;
   // 只有合法手机号才覆盖，避免错误号把正确号冲掉
   if (neo.phone && isValidPhone(neo.phone)) o.phone = neo.phone;
   o.updatedAt = neo.updatedAt || Date.now();
@@ -1046,18 +1482,26 @@ function httpJson(method, url, headers, data) {
 function httpRaw(method, url, headers, body) {
   return new Promise(resolve => {
     const m = (method || "GET").toUpperCase();
-    const opts = { url: url, headers: headers || {} };
+    // 对 SSO/活动页禁用自动跳转，才能读到 302 Location 与 Set-Cookie
+    // QX: opts.redirection = false；Surge/Loon: auto-redirect = false
+    const opts = {
+      url: url,
+      headers: headers || {},
+      "auto-redirect": false,
+      opts: { redirection: false }
+    };
     if (m !== "GET" && body != null) opts.body = body;
 
     let finished = false;
     const finish = (v) => { if (!finished) { finished = true; resolve(v); } };
-    const timer = setTimeout(() => finish({ error: "timeout", status: 0, body: "" }), out);
+    const timer = setTimeout(() => finish({ error: "timeout", status: 0, body: "", headers: {} }), out);
 
     const cb = (error, response, data) => {
       clearTimeout(timer);
-      if (error) return finish({ error: String(error), status: 0, body: "" });
+      if (error) return finish({ error: String(error), status: 0, body: "", headers: {} });
       const status = response ? (response.status || response.statusCode || 0) : 0;
-      finish({ status: status, body: data || "", error: null });
+      const respHeaders = (response && (response.headers || response.header)) || {};
+      finish({ status: status, body: data || "", error: null, headers: respHeaders, url: url });
     };
 
     if (m === "GET") $nobyda.get(opts, cb);
@@ -1098,10 +1542,12 @@ function pickSessionCookie(raw) {
   const text = Array.isArray(raw) ? raw.join(";") : String(raw);
   const jsid = matchOne(text, /JSESSIONID=([^;,\s]+)/i);
   const uid = matchOne(text, /UID=([^;,\s]+)/i);
+  const ticket = matchOne(text, /ticketID=([^;,\s]+)/i);
   if (!jsid) return "";
   let c = `JSESSIONID=${jsid}`;
   if (uid) c += `; UID=${uid}`;
-  if (/ticketID=POD9/i.test(text)) c += `; Comment=SessionServer-unity; Path=/;HTTPOnly; ticketID=POD9; Secure`;
+  // appTokenLogin 需要完整形态（ticketID 因省而异，如 ShanDong）
+  if (ticket) c += `; Comment=SessionServer-unity; Path=/;HTTPOnly; ticketID=${ticket}; Secure`;
   return c;
 }
 
@@ -1138,7 +1584,11 @@ function extractPhoneStrict() {
     if (p) return p;
   }
 
-  // 3) 裸 11 位兜底，但必须通过有效号段校验，且不能落在 URL 时间戳附近
+  // 3) taskAward uuid: AvnWN13873381269...
+  const uuidPhone = matchOne(blob, /AvnWN(1[3-9]\d{9})/i);
+  if (uuidPhone && isValidPhone(uuidPhone)) return uuidPhone;
+
+  // 4) 裸 11 位兜底，但必须通过有效号段校验，且不能落在 URL 时间戳附近
   const all = blob.match(/1[3-9]\d{9}/g) || [];
   for (let i = 0; i < all.length; i++) {
     const p = all[i];
