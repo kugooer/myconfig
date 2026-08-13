@@ -90,13 +90,18 @@ var AutoSignAfterLearn = false;
 var PurgeBadLearnedEndpoints = true;
 // 是否尝试移动云盘签到（ycloud startSignIn；抓包 2026-08-13 证实有效）
 var EnableCloudSign = true;
-// 打开移动云盘 / 捕获到 Basic 或 portal token 后是否立刻自动签到
+// 打开移动云盘后自动签：仅在拿到 jwt / newsignin SSO / App 自己 startSignIn 结果时触发
+// （不要对裸 Basic 立刻自换票——querySpec 出来的票常被 App 抢用或 sourceId 不匹配，tyrz 会失败）
 var AutoCloudSignOnAuth = true;
+// 软跳过（SSO/tyrz 失败）是否弹通知：默认 false，避免「成功0/失败0」刷屏
+var NotifyCloudSoftSkip = false;
+// 云盘即时签防抖（ms）
+var CloudAutoDebounceMs = 15000;
 // 云盘活动参数（抓包固定值，非历史 body 回放）
 var CloudMarketName = "sign_in_3";
 var CloudSourceId = "1002";
-var CloudTargetSourceId = "001005"; // querySpecToken / portal targetSourceId
-var CloudTargetSourceIdAlt = "001003"; // 部分 App 入口备用
+var CloudTargetSourceId = "001005"; // newsignin / startSignIn 对应 targetSourceId
+var CloudTargetSourceIdAlt = "001003"; // 仅作 querySpec 兜底，不优先
 // 是否允许从任意文本裸扫 11 位号（极易把 CDN 图链数字当手机号，默认关）
 var AllowBarePhoneFallback = false;
 // 是否自动领取 domark 返回的 taskAwardChance
@@ -360,140 +365,208 @@ async function GetCookie() {
     } catch (e) {}
   }
 
-  // 3) 云盘/笔记 Authorization + portal SSO token —— 打开移动云盘后入库并可立刻签到
+  // 3) 云盘/笔记 Authorization + portal SSO / ycloud jwt —— 打开移动云盘后入库
+  //    自动签策略（避免 Basic 过早自换票失败）：
+  //    - 裸 Basic：只入库，不签
+  //    - App tyrzLogin 成功拿到 jwt：用该 jwt 调 startSignIn
+  //    - App startSignIn 响应：直接解析结果并通知（App 已签也算成功）
+  //    - portal newsignin 的 YZsid：可尝试（有竞态，App 可能先消费）
   if (/caiyun\.feixin\.10086\.cn|yun\.139\.com|mcloud\.139\.com|vsbo\.caiyun/i.test(url)) {
-    let cloudTouched = false;
     let saved = null;
+    let autoReason = ""; // jwt | portal-sso | app-signed | ""
     const auth = getHeader(headers, "Authorization") || getHeader(headers, "APP_AUTH") || "";
+    const uaHdr = getHeader(headers, "User-Agent") || "";
+    const deviceHdr = getHeader(headers, "deviceId") || ""; // 禁止用 x-DeviceInfo 冒充
+
     if (/Basic\s+/i.test(auth)) {
       const phone = decodeBasicPhone(auth) || extractPhoneStrict(body, respBody, headers);
-      const noteToken = getHeader(headers, "NOTE_TOKEN") || "";
-      const appNumber = getHeader(headers, "APP_NUMBER") || "";
       saved = upsertAccount({
         phone: phone,
         cloudAuthorization: auth,
-        noteToken: noteToken,
-        appNumber: appNumber,
-        cloudUA: getHeader(headers, "User-Agent") || "",
-        cloudDeviceId: getHeader(headers, "deviceId") || getHeader(headers, "x-DeviceInfo") || "",
+        noteToken: getHeader(headers, "NOTE_TOKEN") || "",
+        appNumber: getHeader(headers, "APP_NUMBER") || "",
+        cloudUA: uaHdr,
+        cloudDeviceId: deviceHdr || undefined,
         updatedAt: Date.now(),
         source: "cloud-auth"
       });
-      cloudTouched = true;
+      // 注意：Basic  alone 不置 autoReason
       if (isValidPhone(phone) && LogDetails) console.log("cloud-auth updated =>", maskPhone(phone));
     }
 
-    // portal 入口 token=YZsidssolg...（打开签到 H5 页）
+    // portal 入口：仅 path=newsignin 的 YZsid 才视为签到 SSO
+    const ref = getHeader(headers, "Referer") || "";
+    const portalNewSign =
+      /path=newsignin/i.test(url) || /path=newsignin/i.test(ref) || /marketName=sign_in_3|activityId=sign_in_3/i.test(url + ref);
     const portalTok =
       matchOne(url, /[?&]token=(YZsidssolg[^&]+)/i) ||
-      matchOne(getHeader(headers, "Referer") || "", /[?&]token=(YZsidssolg[^&]+)/i) ||
+      matchOne(ref, /[?&]token=(YZsidssolg[^&]+)/i) ||
       matchOne(String(body || ""), /"token"\s*:\s*"(YZsidssolg[^"]+)"/i) ||
       "";
-    // querySpecTokenV2 明文响应
+
+    // querySpecToken 明文（response）：入库供 cron，默认不即时自签（sourceId 常不匹配 / 单次票）
     let specTok = "";
     if (/querySpecToken/i.test(url) && respBody) {
       try {
         const j = JSON.parse(stripChunkPrefix(respBody) || "{}");
-        specTok = (j && j.data && j.data.token) || (j && j.result) || "";
+        specTok = (j && j.data && j.data.token) || (typeof j.result === "string" ? j.result : "") || "";
         if (typeof specTok !== "string") specTok = "";
       } catch (e) {
         specTok = matchOne(String(respBody || ""), /"(?:token|result)"\s*:\s*"(YZsidssolg[^"]+)"/i) || "";
       }
+      if (specTok && /^YZsidssolg/i.test(specTok)) {
+        saved = upsertAccount({
+          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url),
+          cloudSsoToken: specTok,
+          cloudAuthorization: auth && /Basic\s+/i.test(auth) ? auth : undefined,
+          cloudUA: uaHdr,
+          cloudDeviceId: deviceHdr || undefined,
+          updatedAt: Date.now(),
+          source: "cloud-spec-token"
+        }, true) || saved;
+      }
     }
-    // tyrzLogin 请求里的 SSO token / 响应 jwtToken
-    let tyrzJwt = "";
+
+    if (portalTok && /^YZsidssolg/i.test(portalTok) && portalNewSign) {
+      saved = upsertAccount({
+        phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url),
+        cloudSsoToken: portalTok,
+        cloudAuthorization: auth && /Basic\s+/i.test(auth) ? auth : undefined,
+        cloudUA: uaHdr,
+        cloudDeviceId: deviceHdr || undefined,
+        updatedAt: Date.now(),
+        source: "cloud-portal-newsignin"
+      }, true) || saved;
+      // portal SSO 可尝试；若 App 已先 tyrz 消费，LiveCloudSign 会软跳过
+      autoReason = "portal-sso";
+    }
+
+    // App 自己的 tyrzLogin：成功则拿到 jwt，再用 jwt 签（最稳）
     if (/ycloud\/auth-service\/auth\/tyrzLogin/i.test(url)) {
       const tokInBody = matchOne(String(body || ""), /"token"\s*:\s*"(YZsidssolg[^"]+)"/i);
       if (tokInBody) {
         saved = upsertAccount({
           phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
           cloudSsoToken: tokInBody,
-          cloudUA: getHeader(headers, "User-Agent") || "",
-          cloudDeviceId: getHeader(headers, "deviceId") || "",
+          cloudUA: uaHdr,
+          cloudDeviceId: deviceHdr || undefined,
           updatedAt: Date.now(),
           source: "cloud-tyrz-req"
         }, true) || saved;
-        cloudTouched = true;
       }
       if ($response && respBody) {
+        let tyrzJwt = "";
+        let tyrzCode = null;
+        let tyrzMsg = "";
         try {
           const j = JSON.parse(stripChunkPrefix(respBody) || "{}");
+          tyrzCode = j && j.code;
+          tyrzMsg = (j && j.msg) || "";
           tyrzJwt = (j && j.result && j.result.token) || "";
         } catch (e) {
           tyrzJwt = matchOne(String(respBody || ""), /"token"\s*:\s*"(eyJ[^"]+)"/i) || "";
         }
-        if (tyrzJwt) {
+        if (tyrzJwt && tyrzJwt.length > 20) {
           saved = upsertAccount({
             phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
             cloudJwt: tyrzJwt,
-            cloudSsoToken: tokInBody || portalTok || specTok || "",
-            cloudUA: getHeader(headers, "User-Agent") || "",
-            cloudDeviceId: getHeader(headers, "deviceId") || "",
+            // 一次性 SSO 已被 App 消费，清掉避免脚本复用失败票
+            cloudSsoToken: "",
+            cloudUA: uaHdr,
+            cloudDeviceId: deviceHdr || undefined,
             updatedAt: Date.now(),
             source: "cloud-tyrz-resp"
           }, true) || saved;
-          cloudTouched = true;
+          autoReason = "jwt";
+          console.log("cloud jwt captured from app tyrzLogin");
+        } else if (tyrzMsg) {
+          console.log("app tyrzLogin fail =>", tyrzCode, tyrzMsg);
+          // App 换票失败则清过期 SSO，留给 Basic+cron
+          if (tokInBody) {
+            upsertAccount({
+              phone: (saved && saved.phone) || "",
+              cloudSsoToken: "",
+              updatedAt: Date.now(),
+              source: "cloud-tyrz-fail-clear"
+            }, true);
+          }
         }
       }
     }
 
-    const ssoToken = portalTok || specTok || "";
-    if (ssoToken && /^YZsidssolg/i.test(ssoToken)) {
-      saved = upsertAccount({
-        phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url),
-        cloudSsoToken: ssoToken,
-        cloudAuthorization: auth && /Basic\s+/i.test(auth) ? auth : undefined,
-        cloudUA: getHeader(headers, "User-Agent") || "",
-        cloudDeviceId: getHeader(headers, "deviceId") || "",
-        updatedAt: Date.now(),
-        source: portalTok ? "cloud-portal-token" : "cloud-spec-token"
-      }, true) || saved;
-      cloudTouched = true;
-    }
-
-    // 捕获 startSignIn 响应里的 jwt / 结果（仅入库，不学为 endpoint 模板）
+    // App 已调 startSignIn：直接吃响应（这是「打开云盘后已签」的最可靠观测）
     if (/ycloud\/signin\/page\/startSignIn/i.test(url)) {
       const jwtHdr = getHeader(headers, "jwtToken") || matchOne(getHeader(headers, "Cookie") || "", /jwtToken=([^;]+)/i) || "";
       if (jwtHdr) {
         saved = upsertAccount({
           phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
           cloudJwt: jwtHdr,
-          cloudUA: getHeader(headers, "User-Agent") || "",
-          cloudDeviceId: getHeader(headers, "deviceId") || "",
+          cloudUA: uaHdr,
+          cloudDeviceId: deviceHdr || undefined,
           updatedAt: Date.now(),
-          source: "cloud-startSignIn"
+          source: "cloud-startSignIn-req"
         }, true) || saved;
-        cloudTouched = true;
+      }
+      if ($response && respBody) {
+        const parsed = parseCloudStartSignInBody(respBody);
+        saved = upsertAccount({
+          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
+          cloudJwt: jwtHdr || (saved && saved.cloudJwt) || "",
+          cloudUA: uaHdr,
+          cloudDeviceId: deviceHdr || undefined,
+          updatedAt: Date.now(),
+          source: "cloud-startSignIn-resp"
+        }, true) || saved;
+        if (parsed && parsed.ok && EnableCloudSign && AutoCloudSignOnAuth) {
+          // 观测到 App 签到结果：直接通知，不再二次请求
+          if (shouldFireCloudAuto(saved)) {
+            markCloudAuto(saved);
+            merge = {};
+            merge.CloudSign = {
+              success: 1,
+              notify: parsed.already
+                ? ("云盘: 今日已签到" + (parsed.points != null ? ` · ${parsed.points}豆` : ""))
+                : ("云盘: 签到成功" + (parsed.points != null ? ` · +${parsed.points}豆` : "")),
+              bean: parsed.points != null ? (parsed.points + "豆") : ""
+            };
+            if (parsed.signCount != null) merge.CloudSign.notify += ` · 连签${parsed.signCount}天`;
+            ACCOUNT = normalizeAccount(reloadAccount(saved) || saved);
+            await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘即时签到");
+            return;
+          }
+        }
+        // 若响应失败且我们有 jwt，可尝试补枪
+        if (parsed && !parsed.ok && jwtHdr) autoReason = "jwt";
+      } else if (jwtHdr && !$response) {
+        // request 阶段：有 jwt 也可补枪（response 规则会再跑一次，靠防抖）
+        autoReason = autoReason || "jwt";
       }
     }
 
-    // 打开移动云盘后自动签到：需要 Basic 或已有 SSO/jwt
+    // 仅 jwt / portal-sso 触发自签；裸 Basic / 普通 querySpec 不触发
     if (
       EnableCloudSign &&
       AutoCloudSignOnAuth &&
       saved &&
-      (saved.cloudAuthorization || saved.cloudSsoToken || saved.cloudJwt) &&
-      (isValidPhone(saved.phone) || saved.cloudSsoToken || saved.cloudJwt)
+      (autoReason === "jwt" || autoReason === "portal-sso") &&
+      (saved.cloudJwt || saved.cloudSsoToken)
     ) {
-      // 防抖：同一账号 8 秒内不重复即时云盘签到
-      const now = Date.now();
-      if (!saved.cloudAutoAt || now - Number(saved.cloudAutoAt || 0) > 8000) {
-        upsertAccount({
-          phone: saved.phone,
-          cloudAuthorization: saved.cloudAuthorization,
-          cloudSsoToken: saved.cloudSsoToken,
-          cloudJwt: saved.cloudJwt,
-          cloudAutoAt: now,
-          updatedAt: now,
-          source: "cloud-auto-mark"
-        }, true);
+      if (shouldFireCloudAuto(saved)) {
+        markCloudAuto(saved);
         ACCOUNT = normalizeAccount(reloadAccount(saved) || saved);
+        // jwt 优先；portal-sso 时清掉旧 jwt 以免过期 jwt 挡道
+        if (autoReason === "portal-sso" && !ACCOUNT.cloudJwt) {
+          // ok
+        }
         merge = {};
         await LiveCloudSign(0);
-        await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘即时签到");
+        const soft = merge.CloudSign && !merge.CloudSign.success && !merge.CloudSign.error;
+        if (!soft || NotifyCloudSoftSkip) {
+          await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘即时签到");
+        } else if (merge.CloudSign && merge.CloudSign.notify) {
+          console.log("cloud soft-skip (no notify) =>", merge.CloudSign.notify);
+        }
       }
-    } else if (cloudTouched && LogDetails) {
-      console.log("cloud session updated", maskPhone((saved && saved.phone) || ""));
     }
   }
 
@@ -538,10 +611,13 @@ async function GetCookie() {
 /********************* 动态签到：移动云盘（ycloud） *********************/
 /**
  * 真链路（2026-08-13-102725 / 18374993457 +3 豆）：
- * Basic → querySpecTokenV2(toSourceId=001005) → YZsidssolg...
- *   → POST /ycloud/auth-service/auth/tyrzLogin → jwtToken
- *   → GET  /ycloud/signin/page/startSignIn?client=app
- * 优先使用捕获到的 cloudSsoToken / cloudJwt，避免密文 querySpecToken。
+ * Basic → querySpecTokenV2 → YZsidssolg → tyrzLogin → jwt → startSignIn
+ *
+ * 实操优先级：
+ * 1) 已捕获 cloudJwt（App tyrzLogin 成功）→ 直接 startSignIn
+ * 2) 捕获到 newsignin 的 cloudSsoToken → tyrzLogin → startSignIn
+ * 3) Basic 现场 querySpecTokenV2(001005) → tyrz（cron 用；即时自动签已不再裸 Basic 触发）
+ * SSO 为单次票：失败即丢弃，禁止反复用坏票轰炸 tyrz。
  */
 function LiveCloudSign(s) {
   merge.CloudSign = {};
@@ -561,59 +637,84 @@ function LiveCloudSign(s) {
           "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) MCloudApp/13.0.0 iPhone AppLanguage/zh-CN";
         const deviceId = ACCOUNT.cloudDeviceId || "";
 
-        // A) 拿 YZsidssolg SSO token（现场换或用捕获值）
-        let ssoToken = ACCOUNT.cloudSsoToken || "";
-        if (!ssoToken || !/^YZsidssolg/i.test(ssoToken)) {
-          ssoToken = await fetchCloudSsoToken(ua);
-        }
-        // B) 换 jwtToken（优先已有，否则 tyrzLogin）
-        let jwtToken = ACCOUNT.cloudJwt || "";
-        if (!jwtToken || jwtToken.length < 20) {
+        let jwtToken = (ACCOUNT.cloudJwt && ACCOUNT.cloudJwt.length > 20) ? ACCOUNT.cloudJwt : "";
+        let ssoToken = (ACCOUNT.cloudSsoToken && /^YZsidssolg/i.test(ACCOUNT.cloudSsoToken)) ? ACCOUNT.cloudSsoToken : "";
+
+        // A) 无 jwt：用 SSO 换；失败则丢弃 SSO 再 querySpec 一次
+        if (!jwtToken) {
+          if (!ssoToken) ssoToken = await fetchCloudSsoToken(ua);
           if (!ssoToken) {
-            merge.CloudSign.notify = "跳过云盘：未拿到 YZsid SSO（Basic 可能过期，请重新打开云盘）";
+            merge.CloudSign.notify = "跳过云盘：未拿到 YZsid SSO（请打开云盘签到页）";
             return resolve();
           }
           jwtToken = await fetchCloudJwtFromTyrz(ssoToken, ua, deviceId);
+          if (!jwtToken) {
+            // 单次票作废
+            clearCloudSso(ACCOUNT.phone);
+            ACCOUNT.cloudSsoToken = "";
+            // 仅当有 Basic 时再换一次新 SSO 重试
+            const fresh = await fetchCloudSsoToken(ua);
+            if (fresh && fresh !== ssoToken) {
+              ssoToken = fresh;
+              jwtToken = await fetchCloudJwtFromTyrz(ssoToken, ua, deviceId);
+            }
+          } else {
+            // SSO 已被消费，清掉
+            clearCloudSso(ACCOUNT.phone);
+            ACCOUNT.cloudSsoToken = "";
+          }
         }
+
         if (!jwtToken) {
-          merge.CloudSign.notify = "跳过云盘：tyrzLogin 未换到 jwtToken（SSO 过期/票据验证失败）";
+          merge.CloudSign.notify = "跳过云盘：tyrzLogin 未换到 jwt（SSO 已失效/被 App 抢用）。进一次云盘「签到」页即可";
           return resolve();
         }
 
-        // 回写会话，供下次 cron 复用（仍以动态签到为准，不固化 body）
         try {
           upsertAccount({
             phone: ACCOUNT.phone,
-            cloudSsoToken: ssoToken || ACCOUNT.cloudSsoToken || "",
+            cloudSsoToken: "", // 用过即清
             cloudJwt: jwtToken,
             cloudAuthorization: ACCOUNT.cloudAuthorization || "",
             cloudUA: ua,
-            cloudDeviceId: deviceId,
+            cloudDeviceId: deviceId || undefined,
             updatedAt: Date.now(),
             source: "cloud-sign-session"
           }, true);
           ACCOUNT.cloudJwt = jwtToken;
-          if (ssoToken) ACCOUNT.cloudSsoToken = ssoToken;
         } catch (e) {}
 
-        const signHeaders = buildCloudSignHeaders(jwtToken, ua, deviceId, ssoToken);
+        const signHeaders = buildCloudSignHeaders(jwtToken, ua, deviceId, ssoToken || "");
 
-        // C) startSignIn：抓包证实该 GET 既是“签到动作”也返回状态
-        //    todaySignIn:false + signInPoints:3 = 本次新签成功
-        //    todaySignIn:true  + signInPoints:3 = 今日已签（或重复调用仍带分数字段）
-        const signed = await callCloudStartSignIn(signHeaders);
+        // B) startSignIn
+        let signed = await callCloudStartSignIn(signHeaders);
+        // jwt 过期：清空后用 Basic 再换一轮
+        if (!signed.ok && signed.needNewJwt && ACCOUNT.cloudAuthorization) {
+          console.log("cloud jwt invalid, refresh via Basic…");
+          clearCloudJwt(ACCOUNT.phone);
+          ACCOUNT.cloudJwt = "";
+          const freshSso = await fetchCloudSsoToken(ua);
+          if (freshSso) {
+            const nj = await fetchCloudJwtFromTyrz(freshSso, ua, deviceId);
+            if (nj) {
+              jwtToken = nj;
+              ACCOUNT.cloudJwt = nj;
+              clearCloudSso(ACCOUNT.phone);
+              signed = await callCloudStartSignIn(buildCloudSignHeaders(jwtToken, ua, deviceId, freshSso));
+            }
+          }
+        }
+
         if (signed.ok) {
           merge.CloudSign.success = 1;
           if (signed.already) {
-            merge.CloudSign.notify = "云盘: 今日已签到" + (signed.points ? ` · ${signed.points}豆` : "");
+            merge.CloudSign.notify = "云盘: 今日已签到" + (signed.points != null ? ` · ${signed.points}豆` : "");
           } else {
-            merge.CloudSign.notify = "云盘: 签到成功" + (signed.points ? ` · +${signed.points}豆` : "");
+            merge.CloudSign.notify = "云盘: 签到成功" + (signed.points != null ? ` · +${signed.points}豆` : "");
           }
-          if (signed.points) merge.CloudSign.bean = signed.points + "豆";
+          if (signed.points != null) merge.CloudSign.bean = signed.points + "豆";
           else if (signed.reward) merge.CloudSign.bean = signed.reward;
-          if (signed.signCount != null) {
-            merge.CloudSign.notify += ` · 连签${signed.signCount}天`;
-          }
+          if (signed.signCount != null) merge.CloudSign.notify += ` · 连签${signed.signCount}天`;
           return resolve();
         }
 
@@ -631,6 +732,74 @@ function LiveCloudSign(s) {
       }
     }, s);
   });
+}
+
+function shouldFireCloudAuto(acc) {
+  if (!acc) return false;
+  const now = Date.now();
+  const gap = Number(CloudAutoDebounceMs) || 15000;
+  return !acc.cloudAutoAt || now - Number(acc.cloudAutoAt || 0) > gap;
+}
+
+function markCloudAuto(acc) {
+  const now = Date.now();
+  upsertAccount({
+    phone: acc && acc.phone,
+    cloudAuthorization: acc && acc.cloudAuthorization,
+    cloudSsoToken: acc && acc.cloudSsoToken,
+    cloudJwt: acc && acc.cloudJwt,
+    cloudAutoAt: now,
+    updatedAt: now,
+    source: "cloud-auto-mark"
+  }, true);
+}
+
+function clearCloudSso(phone) {
+  if (!isValidPhone(phone)) return;
+  upsertAccount({ phone: phone, cloudSsoToken: "", updatedAt: Date.now(), source: "cloud-clear-sso" }, true);
+}
+
+function clearCloudJwt(phone) {
+  if (!isValidPhone(phone)) return;
+  upsertAccount({ phone: phone, cloudJwt: "", updatedAt: Date.now(), source: "cloud-clear-jwt" }, true);
+}
+
+function parseCloudStartSignInBody(raw) {
+  try {
+    const j = typeof raw === "string" ? JSON.parse(stripChunkPrefix(raw) || "{}") : (raw || {});
+    return interpretCloudStartSignIn(j);
+  } catch (e) {
+    return { ok: false, msg: "parse fail" };
+  }
+}
+
+function interpretCloudStartSignIn(j) {
+  if (!j) return { ok: false, msg: "空响应" };
+  const text = typeof j === "string" ? j : JSON.stringify(j);
+  if (isCloudMarketDead(j) || /request not found|not found|404/i.test(text)) {
+    return { ok: false, softSkip: true, msg: "ycloud startSignIn 不可用" };
+  }
+  if (Number(j.code) !== 0 && j.msg && !/success/i.test(String(j.msg))) {
+    if (/票据|过期|登录|未授权|token|jwt/i.test(String(j.msg))) {
+      return { ok: false, softSkip: true, needNewJwt: true, msg: j.msg };
+    }
+    return { ok: false, msg: j.msg || ("code=" + j.code) };
+  }
+  const result = (j && j.result) || {};
+  const today = !!result.todaySignIn;
+  const points = result.signInPoints != null ? Number(result.signInPoints) : null;
+  const signCount = result.signCount != null ? Number(result.signCount) : null;
+  if (Number(j.code) === 0 || /success/i.test(String(j.msg || ""))) {
+    return {
+      ok: true,
+      already: today,
+      points: Number.isFinite(points) ? points : null,
+      signCount: Number.isFinite(signCount) ? signCount : null,
+      reward: points != null ? (points + "豆") : extractReward(text),
+      raw: j
+    };
+  }
+  return { ok: false, msg: j.msg || shortBody(text), raw: j };
 }
 
 function buildCloudSignHeaders(jwtToken, ua, deviceId, ssoToken) {
@@ -654,7 +823,8 @@ function buildCloudSignHeaders(jwtToken, ua, deviceId, ssoToken) {
 }
 
 async function fetchCloudSsoToken(ua) {
-  // 1) 首选：user-njs querySpecTokenV2 + Basic（抓包 #908 明文成功）
+  // 1) 首选：user-njs querySpecTokenV2 + Basic
+  // 注意：签到页 portal 用 targetSourceId=001005；001003 多为其它入口，tyrz(market sign_in_3) 易失败
   if (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization)) {
     const headers = {
       "User-Agent": ua,
@@ -668,17 +838,24 @@ async function fetchCloudSsoToken(ua) {
       "https://user-njs.yun.139.com/user/querySpecTokenV2",
       "https://user.yun.139.com/user/querySpecTokenV2"
     ];
+    // 优先 001005；失败再试 alt
     const sources = [CloudTargetSourceId || "001005", CloudTargetSourceIdAlt || "001003"];
-    for (let i = 0; i < hosts.length; i++) {
-      for (let j = 0; j < sources.length; j++) {
+    for (let si = 0; si < sources.length; si++) {
+      for (let hi = 0; hi < hosts.length; hi++) {
         try {
-          const jres = await httpJson("POST", hosts[i], headers, { toSourceId: sources[j] });
+          const jres = await httpJson("POST", hosts[hi], headers, { toSourceId: sources[si] });
           const tok = jres && jres.data && jres.data.token;
-          if (tok && /^YZsidssolg/i.test(tok)) return tok;
-          // 兼容加密/非 JSON 失败
-          if (jres && jres.success === false) continue;
+          if (tok && /^YZsidssolg/i.test(tok)) {
+            console.log("querySpecTokenV2 ok =>", sources[si], hosts[hi].replace(/^https:\/\//, "").split("/")[0]);
+            return tok;
+          }
+          if (jres && jres.raw && typeof jres.raw === "string" && jres.raw.length > 20 && !/^\{/.test(jres.raw.trim())) {
+            // 密文响应：本机无法解，换 host/source 继续
+            console.log("querySpecTokenV2 cipher on", sources[si]);
+          }
         } catch (e) {}
       }
+      // 001005 拿到就返回；只有全失败才试 alt（外层 loop 已覆盖）
     }
   }
 
@@ -705,10 +882,11 @@ async function fetchCloudSsoToken(ua) {
 async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
   if (!ssoToken) return "";
   const headers = buildCloudSignHeaders("pending", ua, deviceId, ssoToken);
-  // tyrz 请求阶段尚无 jwt，去掉无效 jwt 头，仅保留 UA/Referer/activity
+  // tyrz 请求阶段尚无 jwt，去掉无效 jwt 头
   delete headers.jwtToken;
-  headers.Cookie = "";
+  delete headers.Cookie;
   headers["Content-Type"] = "application/json;charset=UTF-8";
+  // 抓包还有 showLoading:true，可无；deviceId 若是 B 前缀短串可带
   try {
     const j = await httpJson("POST",
       "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
@@ -721,7 +899,8 @@ async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
       }
     );
     if (j && Number(j.code) === 0 && j.result && j.result.token) return j.result.token;
-    if (j && j.msg) console.log("tyrzLogin fail =>", j.code, j.msg);
+    if (j && (j.msg || j.code != null)) console.log("tyrzLogin fail =>", j.code, j.msg || "");
+    else if (j && j.raw) console.log("tyrzLogin non-json =>", String(j.raw).slice(0, 80));
     return "";
   } catch (e) {
     console.log("tyrzLogin error =>", e);
@@ -736,35 +915,7 @@ async function callCloudStartSignIn(headers) {
       headers,
       null
     );
-    if (!j) return { ok: false, msg: "空响应" };
-    const text = typeof j === "string" ? j : JSON.stringify(j);
-    if (isCloudMarketDead(j) || /request not found|not found|404/i.test(text)) {
-      return { ok: false, softSkip: true, msg: "ycloud startSignIn 不可用" };
-    }
-    if (Number(j.code) !== 0 && j.msg && !/success/i.test(String(j.msg))) {
-      // 统一通信证失败等
-      if (/票据|过期|登录|未授权|token/i.test(String(j.msg))) {
-        return { ok: false, softSkip: true, msg: j.msg };
-      }
-      return { ok: false, msg: j.msg || ("code=" + j.code) };
-    }
-    const result = (j && j.result) || {};
-    const today = !!result.todaySignIn;
-    const points = result.signInPoints != null ? Number(result.signInPoints) : null;
-    const signCount = result.signCount != null ? Number(result.signCount) : null;
-    // 抓包：首次与重复调用 code 均为 0；用 todaySignIn 区分文案
-    // 若 result 里明确有 signInPoints，视为有效签到会话
-    if (Number(j.code) === 0 || /success/i.test(String(j.msg || ""))) {
-      return {
-        ok: true,
-        already: today,
-        points: Number.isFinite(points) ? points : null,
-        signCount: Number.isFinite(signCount) ? signCount : null,
-        reward: points ? (points + "豆") : extractReward(text),
-        raw: j
-      };
-    }
-    return { ok: false, msg: j.msg || shortBody(text), raw: j };
+    return interpretCloudStartSignIn(j);
   } catch (e) {
     return { ok: false, msg: String(e) };
   }
@@ -1725,6 +1876,11 @@ function mergeAccount(oldItem, neo) {
     "ticketId", "provinceCode", "cityCode", "carrierOperator",
     "activityId", "channelId", "yx", "userCheckId", "source"
   ].forEach(k => {
+    // cloudSsoToken / cloudJwt 允许写空串（单次票消费后必须清）
+    if (k === "cloudSsoToken" || k === "cloudJwt") {
+      if (neo[k] !== undefined && neo[k] !== null) o[k] = neo[k];
+      return;
+    }
     if (neo[k] !== undefined && neo[k] !== null && neo[k] !== "") o[k] = neo[k];
   });
   if (neo.qwhdSessionAt) o.qwhdSessionAt = neo.qwhdSessionAt;
