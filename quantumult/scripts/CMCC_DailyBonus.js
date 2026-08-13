@@ -88,14 +88,16 @@ var PurgeBadLearnedEndpoints = true;
 var EnableCloudSign = true;
 // 打开移动云盘后：是否允许云盘自动签到链路（含通知）
 var AutoCloudSignOnAuth = true;
-// 打开云盘（捕获 getUser Basic）时：脚本自行 LiveCloudSign（querySpec→tyrz→startSignIn）
-// 目标：不必进「签到页」；自签优先用脚本新换的 SSO，不抢 App 已持有的一次性票
+// 打开云盘（getUser）时：优先用已缓存 jwt 直接 startSignIn（无需进签到页）
+// 说明：脚本在 QX 内自调 tyrzLogin 长期失败；jwt 需从 App 真 tyrz/startSignIn 捕获一次
 var AutoCloudLiveSignOnOpen = true;
+// 打开时是否允许脚本尝试 querySpec→tyrz（实测 QX 内常失败，默认关；有 jwt 时根本不走）
+var CloudAllowTyrzOnOpen = false;
 // 每日每号只自签成功一次（打开多次 / rewrite 并发 / 签到页观测 都共享此锁）
 var CloudDailyOnce = true;
-// 软跳过（SSO/tyrz 失败）是否弹通知：默认 false（打开自签失败会单独 NotifyCloudOpenFail）
+// 软跳过（SSO/tyrz 失败）是否弹通知：默认 false
 var NotifyCloudSoftSkip = false;
-// 打开自签失败（tyrz/SSO）是否弹一次通知，便于定位「打开没签上」
+// 打开自签失败是否弹一次：默认 true，提示「先缓存 jwt」
 var NotifyCloudOpenFail = true;
 // 云盘结果通知防抖（ms）
 var CloudAutoDebounceMs = 120000;
@@ -437,8 +439,9 @@ function isInterestingCaptureUrl(url) {
 
 function isCloudCaptureUrl(url) {
   const u = String(url || "");
-  // 刻意不再匹配 querySpec/tyrz/portal：脚本自签发出的请求若被 rewrite 二次拦截会超时/乱签
+  // getUser：打开触发；tyrz/startSignIn 仅 response 缓存 jwt（勿挂 request，防嵌套）
   return /user(?:-njs)?\.yun\.139\.com\/user\/getUser/i.test(u) ||
+    /m\.mcloud\.139\.com\/ycloud\/auth-service\/auth\/tyrzLogin/i.test(u) ||
     /m\.mcloud\.139\.com\/ycloud\/signin\/page\/startSignIn/i.test(u);
 }
 
@@ -449,7 +452,7 @@ async function captureCloudTraffic(url, headers, body, respBody, hasResp) {
   const ref = getHeader(headers, "Referer") || "";
   let saved = null;
 
-  // Basic：仅 getUser（打开云盘）。不再 hook querySpec/tyrz——避免脚本自签 HTTP 嵌套进 rewrite 导致超时/失败
+  // Basic：getUser（打开云盘）
   if (/Basic\s+/i.test(auth) && /user(?:-njs)?\.yun\.139\.com\/user\/getUser/i.test(url)) {
     const phone = decodeBasicPhone(auth);
     if (isValidPhone(phone)) {
@@ -473,8 +476,8 @@ async function captureCloudTraffic(url, headers, body, respBody, hasResp) {
           cloudDeviceId: deviceHdr || undefined
         }));
       }
-      // request：只存 Basic，不重签（rewrite-request 硬超时太短，3 并发 querySpec 会半途死亡）
-      // response：才 LiveCloudSign（超时余量更大，且与 App 侧 getUser 完成同步）
+      // request：只存 Basic
+      // response：有 jwt 则 startSignIn；无 jwt 时默认不 tyrz（App 路径才稳定）
       if (!hasResp) return;
       await tryCloudAutoSignOnOpen({
         phone: phone,
@@ -489,7 +492,30 @@ async function captureCloudTraffic(url, headers, body, respBody, hasResp) {
     return;
   }
 
-  // startSignIn 响应：仅兜底观测（App 自己签时）；不挂 request，减少嵌套
+  // App tyrzLogin 响应：缓存 jwt（进入签到页时 App 会打；供之后「只打开云盘」自签）
+  if (/tyrzLogin/i.test(url) && hasResp && respBody) {
+    let tyrzJwt = extractJwtFromTyrz(safeJson(respBody));
+    if (!tyrzJwt) {
+      try {
+        tyrzJwt = matchOne(String(respBody || ""), /"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+)"/) || "";
+      } catch (e) {}
+    }
+    if (tyrzJwt && tyrzJwt.length > 20) {
+      const phoneHint = decodeBasicPhone(auth) || resolveRecentCloudPhone();
+      upsertCloudSession({
+        phone: phoneHint,
+        cloudJwt: tyrzJwt,
+        cloudSsoToken: "",
+        cloudUA: uaHdr,
+        cloudDeviceId: deviceHdr || undefined,
+        source: "cloud-tyrz-resp"
+      });
+      clog("cloud jwt cached from App tyrzLogin " + maskPhone(phoneHint || "") + " len=" + tyrzJwt.length);
+    }
+    return;
+  }
+
+  // startSignIn 响应：缓存 jwt + 结果通知（进签到页 / App 自签）
   if (/startSignIn/i.test(url) && hasResp && respBody) {
     const jwtHdr = getHeader(headers, "jwtToken") || matchOne(getHeader(headers, "Cookie") || "", /jwtToken=([^;]+)/i) || "";
     const phoneHint = resolveRecentCloudPhone();
@@ -501,6 +527,7 @@ async function captureCloudTraffic(url, headers, body, respBody, hasResp) {
         cloudDeviceId: deviceHdr || undefined,
         source: "cloud-startSignIn-resp"
       });
+      clog("cloud jwt cached from startSignIn " + maskPhone(phoneHint || "") + " len=" + String(jwtHdr).length);
     }
     if (!(EnableCloudSign && AutoCloudSignOnAuth)) return;
     const parsed = parseCloudStartSignInBody(respBody);
@@ -523,11 +550,19 @@ async function captureCloudTraffic(url, headers, body, respBody, hasResp) {
   }
 }
 
+function safeJson(raw) {
+  try {
+    return JSON.parse(stripChunkPrefix(String(raw || "")) || "{}");
+  } catch (e) {
+    return { raw: String(raw || "") };
+  }
+}
+
 /**
- * 打开云盘（getUser）→ 自行 LiveCloudSign 一次。
- * - 不要求进入签到页
- * - 每日每号成功仅一次；失败可再次打开重试
- * - 自签使用脚本新申请的 SSO，不消费 App 已拿到的 querySpec 票
+ * 打开云盘（getUser）→ 优先 jwt→startSignIn。
+ * - 有缓存 jwt：不进签到页也能签（每日一次）
+ * - 无 jwt：默认不 tyrz（QX 内 tyrz 实测失败）；提示先进签到页缓存 jwt
+ * - 已进签到页时由 App startSignIn 观测通知，与此互斥
  */
 async function tryCloudAutoSignOnOpen(seed) {
   if (!(EnableCloudSign && AutoCloudSignOnAuth && AutoCloudLiveSignOnOpen)) return;
@@ -535,18 +570,35 @@ async function tryCloudAutoSignOnOpen(seed) {
   if (!phone) return;
   if (!(seed.cloudAuthorization && /Basic\s+/i.test(seed.cloudAuthorization))) return;
   if (CloudDailyOnce && isCloudDoneToday(phone)) {
-    // 今日已成功：静默（最多再靠签到页观测补历史，不在此弹）
     clog("cloud open skip: done today " + maskPhone(phone));
     return;
   }
-  // 并发 getUser：CAS 互斥（先写锁 → 短等 → 复核），避免 3 路同时 querySpec
   if (!(await claimCloudOpenInflightCas(phone))) {
     clog("cloud open skip: inflight " + maskPhone(phone));
     return;
   }
-  clog("cloud open sign start " + maskPhone(phone) + " " + (seed.fromResp ? "resp" : "req"));
   try {
     const base = findAccountByPhone(phone) || {};
+    const cachedJwt = (base.cloudJwt && String(base.cloudJwt).length > 20) ? base.cloudJwt : "";
+    clog("cloud open sign start " + maskPhone(phone) + " jwt=" + (cachedJwt ? ("yes len=" + cachedJwt.length) : "no"));
+
+    // 无 jwt 且禁止打开 tyrz：安静/友好提示，等用户进一次签到页
+    if (!cachedJwt && !CloudAllowTyrzOnOpen) {
+      merge = {};
+      merge.CloudSign = {
+        notify: "跳过云盘：尚无 jwt。请先打开一次云盘「签到」页完成缓存；之后只需打开云盘即可自动签"
+      };
+      clog("cloud open need jwt bootstrap");
+      if (NotifyCloudOpenFail) {
+        const failParsed = { ok: false, already: false, points: null, signCount: null, soft: 1, msg: "need-jwt" };
+        ACCOUNT = normalizeAccount(Object.assign({}, base, { phone: phone, cloudAuthorization: seed.cloudAuthorization }));
+        if (claimCloudAutoNotify(ACCOUNT, failParsed)) {
+          await notify(maskPhone(phone) + "·云盘");
+        }
+      }
+      return;
+    }
+
     const acc = normalizeAccount(Object.assign({}, base, {
       phone: phone,
       cloudAuthorization: seed.cloudAuthorization,
@@ -554,8 +606,8 @@ async function tryCloudAutoSignOnOpen(seed) {
       cloudDeviceId: seed.cloudDeviceId || base.cloudDeviceId || "",
       noteToken: seed.noteToken || base.noteToken || "",
       appNumber: seed.appNumber || base.appNumber || "",
-      // 打开自签强制现换 SSO/jwt
-      cloudJwt: "",
+      // 关键：保留缓存 jwt，绝不在打开时清空
+      cloudJwt: cachedJwt,
       cloudSsoToken: "",
       updatedAt: Date.now(),
       source: "cloud-open-auto"
@@ -567,16 +619,15 @@ async function tryCloudAutoSignOnOpen(seed) {
       cloudDeviceId: acc.cloudDeviceId || undefined,
       noteToken: acc.noteToken || "",
       appNumber: acc.appNumber || "",
-      cloudJwt: "",
-      cloudSsoToken: "",
+      cloudJwt: acc.cloudJwt || "",
       updatedAt: Date.now(),
       source: "cloud-open-auto"
     }, true);
 
     ACCOUNT = acc;
     merge = {};
-    // open 模式：单次 querySpec(njs+001005)→tyrz→startSignIn
-    await LiveCloudSign(0, { openOnce: true });
+    // preferJwt：只打 startSignIn；缺 jwt 且 CloudAllowTyrzOnOpen 才 tyrz
+    await LiveCloudSign(0, { openOnce: true, preferJwt: true, allowTyrz: !!CloudAllowTyrzOnOpen });
     const cs = merge.CloudSign || {};
     if (cs.success) {
       const pseudo = cloudNotifyPseudoFromMerge(cs);
@@ -589,10 +640,13 @@ async function tryCloudAutoSignOnOpen(seed) {
       clog("cloud open sign ok " + maskPhone(phone) + " " + (cs.notify || ""));
       return;
     }
-    // 失败 / 软跳过：打日志；打开场景默认可弹一次失败原因
+    // jwt 过期：清空并提示再进签到页
+    if (cs.needNewJwt) {
+      clearCloudJwt(phone);
+      cs.notify = "跳过云盘：jwt 已失效，请再打开一次云盘「签到」页刷新";
+    }
     clog("cloud open sign fail => " + (cs.notify || cs.error || "unknown"));
-    if (cs.notify && (cs.error || NotifyCloudOpenFail || NotifyCloudSoftSkip)) {
-      // 失败通知用更短防抖键，避免与成功签名混淆；仍 3s 硬锁
+    if (cs.notify && (cs.error || cs.needNewJwt || NotifyCloudOpenFail || NotifyCloudSoftSkip)) {
       const failParsed = {
         ok: false,
         already: false,
@@ -609,8 +663,6 @@ async function tryCloudAutoSignOnOpen(seed) {
   } catch (e) {
     clog("tryCloudAutoSignOnOpen error => " + e);
   } finally {
-    // 成功则保留 inflight 到 CloudOpenInflightMs，防止紧接第二次 getUser 再跑
-    // 失败则立刻释放，允许重新打开云盘重试
     const cs = merge.CloudSign || {};
     if (!cs.success) releaseCloudOpenInflight(phone);
   }
@@ -747,15 +799,18 @@ function rememberCloudBasic(auth) {
 
 /********************* 动态签到：移动云盘（ycloud） *********************/
 /**
- * Basic → querySpecTokenV2 → tyrzLogin → startSignIn
- * - 定时任务：always
- * - 打开云盘 getUser：AutoCloudLiveSignOnOpen=true 时由 tryCloudAutoSignOnOpen 调用
+ * 有 jwt → startSignIn；无 jwt 时可选 querySpec→tyrz（cron 默认开，打开默认关）
  * @param {number} s delay ms
- * @param {{openOnce?:boolean}} opts openOnce=true 时不做第二轮 SSO/jwt 重试，降低 rewrite 超时风险
+ * @param {{openOnce?:boolean,preferJwt?:boolean,allowTyrz?:boolean}} opts
  */
 function LiveCloudSign(s, opts) {
   merge.CloudSign = {};
   const openOnce = !!(opts && opts.openOnce);
+  const preferJwt = !!(opts && opts.preferJwt);
+  // 打开路径默认 allowTyrz=CloudAllowTyrzOnOpen；cron 默认 true
+  const allowTyrz = opts && Object.prototype.hasOwnProperty.call(opts, "allowTyrz")
+    ? !!opts.allowTyrz
+    : !openOnce;
   return new Promise(resolve => {
     setTimeout(async () => {
       try {
@@ -768,7 +823,7 @@ function LiveCloudSign(s, opts) {
           return resolve();
         }
 
-        // 每日锁：成功过的号当天不再打接口。openOnce 且仍要「打开即签体验」时：本地锁命中仍当成功返回，外层会通知一次已签。
+        // 每日锁：成功过的号当天不再打接口
         if (CloudDailyOnce && isValidPhone(ACCOUNT.phone) && isCloudDoneToday(ACCOUNT.phone)) {
           merge.CloudSign.success = 1;
           merge.CloudSign.notify = "云盘: 今日已签到";
@@ -782,9 +837,14 @@ function LiveCloudSign(s, opts) {
         let jwtToken = (ACCOUNT.cloudJwt && ACCOUNT.cloudJwt.length > 20) ? ACCOUNT.cloudJwt : "";
         let ssoToken = (ACCOUNT.cloudSsoToken && /^YZsidssolg/i.test(ACCOUNT.cloudSsoToken)) ? ACCOUNT.cloudSsoToken : "";
 
-        // A) 无 jwt：Basic 现换 SSO → tyrz（打开路径最多 2 轮新票，避免 rewrite 超时）
+        // A) 无 jwt 时才 tyrz；打开路径默认禁止（CloudAllowTyrzOnOpen=false）
         if (!jwtToken) {
-          // 打开自签不用缓存 SSO（可能已被 App/上次失败污染）
+          if (!allowTyrz) {
+            merge.CloudSign.notify = "跳过云盘：尚无 jwt。请先打开一次云盘「签到」页缓存 jwt；之后只需打开云盘即可自动签";
+            merge.CloudSign.needNewJwt = 1;
+            clog("cloud skip tyrz (allowTyrz=false, preferJwt=" + preferJwt + ")");
+            return resolve();
+          }
           if (openOnce || (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization))) {
             const got = await fetchCloudJwtWithFreshSso(ua, deviceId, openOnce);
             jwtToken = got.jwt || "";
@@ -812,7 +872,8 @@ function LiveCloudSign(s, opts) {
         if (!jwtToken) {
           const diag = readCloudTyrzDiag();
           merge.CloudSign.notify =
-            "跳过云盘：tyrzLogin 未换到 jwt" + (diag ? (" · " + diag.slice(0, 160)) : "（日志无原文，请更新脚本）");
+            "跳过云盘：tyrzLogin 未换到 jwt" + (diag ? (" · " + diag.slice(0, 160)) : "；请进签到页让 App 生成 jwt");
+          merge.CloudSign.needNewJwt = 1;
           clog("cloud jwt empty after tyrz " + (diag || ""));
           return resolve();
         }
@@ -835,9 +896,16 @@ function LiveCloudSign(s, opts) {
 
         // B) startSignIn
         let signed = await callCloudStartSignIn(signHeaders);
-        // jwt 过期：cron 再换一轮；打开自签为赶 rewrite 时限不再重试
-        if (!signed.ok && signed.needNewJwt && ACCOUNT.cloudAuthorization && !openOnce) {
-          console.log("cloud jwt invalid, refresh via Basic…");
+        // jwt 过期：cron 再换一轮；打开路径只标记 needNewJwt
+        if (!signed.ok && signed.needNewJwt) {
+          if (openOnce || !allowTyrz) {
+            clearCloudJwt(ACCOUNT.phone);
+            ACCOUNT.cloudJwt = "";
+            merge.CloudSign.needNewJwt = 1;
+            merge.CloudSign.notify = "跳过云盘：jwt 已失效，请再打开一次云盘「签到」页刷新";
+            return resolve();
+          }
+          clog("cloud jwt invalid, refresh via Basic…");
           clearCloudJwt(ACCOUNT.phone);
           ACCOUNT.cloudJwt = "";
           const freshSso = await fetchCloudSsoToken(ua);
