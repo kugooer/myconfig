@@ -536,15 +536,15 @@ async function tryCloudAutoSignOnOpen(seed) {
   if (!(seed.cloudAuthorization && /Basic\s+/i.test(seed.cloudAuthorization))) return;
   if (CloudDailyOnce && isCloudDoneToday(phone)) {
     // 今日已成功：静默（最多再靠签到页观测补历史，不在此弹）
-    console.log("cloud open skip: done today", maskPhone(phone));
+    clog("cloud open skip: done today " + maskPhone(phone));
     return;
   }
   // 并发 getUser：CAS 互斥（先写锁 → 短等 → 复核），避免 3 路同时 querySpec
   if (!(await claimCloudOpenInflightCas(phone))) {
-    console.log("cloud open skip: inflight", maskPhone(phone));
+    clog("cloud open skip: inflight " + maskPhone(phone));
     return;
   }
-  console.log("cloud open sign start", maskPhone(phone), seed.fromResp ? "resp" : "req");
+  clog("cloud open sign start " + maskPhone(phone) + " " + (seed.fromResp ? "resp" : "req"));
   try {
     const base = findAccountByPhone(phone) || {};
     const acc = normalizeAccount(Object.assign({}, base, {
@@ -582,15 +582,15 @@ async function tryCloudAutoSignOnOpen(seed) {
       const pseudo = cloudNotifyPseudoFromMerge(cs);
       markCloudDoneToday(phone, pseudo);
       if (!claimCloudAutoNotify(ACCOUNT, pseudo)) {
-        console.log("cloud open success but notify deduped", maskPhone(phone));
+        clog("cloud open success but notify deduped " + maskPhone(phone));
         return;
       }
       await notify(maskPhone(ACCOUNT.phone || phone) + "·云盘");
-      console.log("cloud open sign ok", maskPhone(phone), cs.notify || "");
+      clog("cloud open sign ok " + maskPhone(phone) + " " + (cs.notify || ""));
       return;
     }
     // 失败 / 软跳过：打日志；打开场景默认可弹一次失败原因
-    console.log("cloud open sign fail =>", cs.notify || cs.error || "unknown");
+    clog("cloud open sign fail => " + (cs.notify || cs.error || "unknown"));
     if (cs.notify && (cs.error || NotifyCloudOpenFail || NotifyCloudSoftSkip)) {
       // 失败通知用更短防抖键，避免与成功签名混淆；仍 3s 硬锁
       const failParsed = {
@@ -600,14 +600,14 @@ async function tryCloudAutoSignOnOpen(seed) {
         signCount: null,
         fail: cs.error ? 1 : 0,
         soft: cs.error ? 0 : 1,
-        msg: String(cs.notify || "").slice(0, 80)
+        msg: String(cs.notify || "").slice(0, 120)
       };
       if (claimCloudAutoNotify(ACCOUNT, failParsed)) {
         await notify(maskPhone(ACCOUNT.phone || phone) + "·云盘");
       }
     }
   } catch (e) {
-    console.log("tryCloudAutoSignOnOpen error =>", e);
+    clog("tryCloudAutoSignOnOpen error => " + e);
   } finally {
     // 成功则保留 inflight 到 CloudOpenInflightMs，防止紧接第二次 getUser 再跑
     // 失败则立刻释放，允许重新打开云盘重试
@@ -810,8 +810,10 @@ function LiveCloudSign(s, opts) {
         }
 
         if (!jwtToken) {
-          merge.CloudSign.notify = "跳过云盘：tyrzLogin 未换到 jwt（请进一次签到页或查看日志 tyrzLogin fail 原文）";
-          console.log("cloud jwt empty after tyrz");
+          const diag = readCloudTyrzDiag();
+          merge.CloudSign.notify =
+            "跳过云盘：tyrzLogin 未换到 jwt" + (diag ? (" · " + diag.slice(0, 160)) : "（日志无原文，请更新脚本）");
+          clog("cloud jwt empty after tyrz " + (diag || ""));
           return resolve();
         }
 
@@ -1086,12 +1088,12 @@ async function fetchCloudSsoToken(ua, opts) {
           const jres = await httpJson("POST", hosts[hi], headers, { toSourceId: sources[si] });
           const tok = jres && jres.data && jres.data.token;
           if (tok && /^YZsidssolg/i.test(tok)) {
-            console.log("querySpecTokenV2 ok =>", sources[si], hosts[hi].replace(/^https:\/\//, "").split("/")[0]);
+            clog("querySpecTokenV2 ok => " + sources[si] + " " + hosts[hi].replace(/^https:\/\//, "").split("/")[0]);
             return tok;
           }
           if (jres && jres.raw && typeof jres.raw === "string" && jres.raw.length > 20 && !/^\{/.test(jres.raw.trim())) {
             // 密文响应：本机无法解，换 host/source 继续
-            console.log("querySpecTokenV2 cipher on", sources[si]);
+            clog("querySpecTokenV2 cipher on " + sources[si]);
           }
         } catch (e) {}
       }
@@ -1184,59 +1186,104 @@ async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
       "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MCloudApp/13.0.0";
   }
   if (deviceId) headers.deviceId = deviceId;
-  // 部分环境 tyrz 也认 Basic（与 querySpec 同源身份）
-  if (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization)) {
-    headers.Authorization = ACCOUNT.cloudAuthorization;
-  }
+  // 注意：真实 H5 tyrz 通常不带 Basic Authorization；带 Basic 可能导致空/拒响应
+  // 不在此附加 ACCOUNT.cloudAuthorization
 
-  // 同一 SSO 只打 1 枪主 body（YZsid 多为一次性）；用 httpRaw 打全量状态诊断
+  // 同一 SSO 只打 1 枪；必要时再试「精简头」一次（部分 QX 环境下冗余头导致空响应）
   const bodyObj = buildTyrzBodies(ssoToken)[0];
+  const payload = JSON.stringify(bodyObj);
+  const headerVariants = [
+    headers,
+    {
+      "User-Agent": headers["User-Agent"] || ua,
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "application/json;charset=UTF-8",
+      Origin: "https://m.mcloud.139.com",
+      Referer: headers.Referer
+    }
+  ];
   let lastDiag = "";
-  try {
-    const raw = await httpRaw(
-      "POST",
-      "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
-      headers,
-      JSON.stringify(bodyObj)
-    );
-    let bodyText = raw && raw.body != null ? stripChunkPrefix(String(raw.body)) : "";
-    console.log(
-      "tyrz raw =>",
-      "http=" + (raw && raw.status),
-      "err=" + (raw && raw.error || ""),
-      "len=" + bodyText.length,
-      "head=" + bodyText.slice(0, 180)
-    );
-    let j = {};
-    if (bodyText) {
-      try { j = JSON.parse(bodyText); } catch (e) { j = { raw: bodyText, status: raw && raw.status }; }
-    } else {
-      j = { empty: true, status: raw && raw.status, error: raw && raw.error };
-    }
-    const jwt = extractJwtFromTyrz(j);
-    if (jwt) {
-      console.log("tyrzLogin ok", "len=" + jwt.length);
-      return jwt;
-    }
-    const keys = j && typeof j === "object" ? Object.keys(j).slice(0, 10).join(",") : "";
-    let resultType = "";
+  for (let hi = 0; hi < headerVariants.length; hi++) {
     try {
-      resultType = typeof (j && j.result);
-      if (j && j.result && typeof j.result === "object") {
-        resultType += "{" + Object.keys(j.result).slice(0, 8).join(",") + "}";
-      } else if (j && j.result != null) {
-        resultType += ":" + String(j.result).slice(0, 48);
+      const raw = await httpRaw(
+        "POST",
+        "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
+        headerVariants[hi],
+        payload
+      );
+      let bodyText = "";
+      if (raw && raw.body != null) {
+        bodyText = typeof raw.body === "string" ? raw.body : String(raw.body);
+        bodyText = stripChunkPrefix(bodyText);
       }
-    } catch (e) {}
-    lastDiag = "http=" + (raw && raw.status) + " code=" + (j && j.code) +
-      " msg=" + String((j && j.msg) || "") + " keys=" + keys + " result=" + resultType;
-    console.log("tyrzLogin fail =>", lastDiag);
-  } catch (e) {
-    lastDiag = "error " + e;
-    console.log("tyrzLogin error =>", e);
+      const st = raw ? (raw.status || 0) : 0;
+      const er = raw && raw.error ? String(raw.error) : "";
+      // 关键：QX 控制台多参数 log 会丢后续参数，必须拼成单字符串
+      lastDiag =
+        "h" + hi +
+        " http=" + st +
+        " err=" + er +
+        " len=" + bodyText.length +
+        " head=" + bodyText.replace(/\s+/g, " ").slice(0, 200);
+      clog("tyrz raw => " + lastDiag);
+      rememberCloudTyrzDiag(lastDiag);
+
+      let j = {};
+      if (bodyText) {
+        try { j = JSON.parse(bodyText); } catch (e) { j = { raw: bodyText, status: st }; }
+      } else {
+        j = { empty: true, status: st, error: er };
+      }
+      const jwt = extractJwtFromTyrz(j);
+      if (jwt) {
+        clog("tyrzLogin ok h=" + hi + " len=" + jwt.length);
+        return jwt;
+      }
+      // 有明确业务 JSON：不必换头重试（票可能已消费）
+      if (bodyText && /\{/.test(bodyText) && (j.code != null || j.msg || j.result != null)) {
+        const keys = Object.keys(j).slice(0, 10).join(",");
+        lastDiag =
+          "h" + hi +
+          " http=" + st +
+          " code=" + j.code +
+          " msg=" + String(j.msg || "") +
+          " keys=" + keys +
+          " head=" + bodyText.replace(/\s+/g, " ").slice(0, 160);
+        clog("tyrzLogin fail => " + lastDiag);
+        rememberCloudTyrzDiag(lastDiag);
+        break;
+      }
+      // 空响应 / 非 JSON：换精简头再试（同一 SSO 第二次请求可能仍有效或仍空）
+      if (hi + 1 < headerVariants.length && (!bodyText || st === 0)) {
+        clog("tyrz empty/0, retry minimal headers");
+        continue;
+      }
+      clog("tyrzLogin fail => " + lastDiag);
+      rememberCloudTyrzDiag(lastDiag);
+    } catch (e) {
+      lastDiag = "error " + e;
+      clog("tyrzLogin error => " + lastDiag);
+      rememberCloudTyrzDiag(lastDiag);
+    }
   }
-  if (lastDiag) console.log("tyrzLogin last =>", lastDiag);
+  if (lastDiag) clog("tyrzLogin last => " + lastDiag);
   return "";
+}
+
+function rememberCloudTyrzDiag(diag) {
+  try {
+    $nobyda.write(String(diag || "").slice(0, 500), "CMCC_LastTyrzDiag");
+  } catch (e) {}
+  try {
+    if (typeof merge === "object" && merge) merge._lastTyrzDiag = String(diag || "").slice(0, 500);
+  } catch (e) {}
+}
+
+function readCloudTyrzDiag() {
+  try {
+    if (merge && merge._lastTyrzDiag) return String(merge._lastTyrzDiag);
+  } catch (e) {}
+  try { return $nobyda.read("CMCC_LastTyrzDiag") || ""; } catch (e) { return ""; }
 }
 
 /**
@@ -1248,15 +1295,15 @@ async function fetchCloudJwtWithFreshSso(ua, deviceId, openOnce) {
   for (let r = 0; r < rounds; r++) {
     const sso = await fetchCloudSsoToken(ua, { once: openOnce && r === 0 });
     if (!sso) {
-      console.log("cloud sso empty round", r);
+      clog("cloud sso empty round " + r);
       break;
     }
     if (sso === lastSso) {
-      console.log("cloud sso same as last, stop");
+      clog("cloud sso same as last, stop");
       break;
     }
     lastSso = sso;
-    console.log("cloud tyrz try round", r, "ssoTail", String(sso).slice(-12));
+    clog("cloud tyrz try round " + r + " ssoTail=" + String(sso).slice(-12));
     const jwt = await fetchCloudJwtFromTyrz(sso, ua, deviceId);
     if (jwt) return { jwt: jwt, sso: sso };
     // 票已废，清缓存再申请
@@ -2332,6 +2379,7 @@ function httpRaw(method, url, headers, body) {
     // QX: opts.redirection = false；Surge/Loon: auto-redirect = false
     const opts = {
       url: url,
+      method: m,
       headers: headers || {},
       "auto-redirect": false,
       opts: { redirection: false }
@@ -2344,10 +2392,18 @@ function httpRaw(method, url, headers, body) {
 
     const cb = (error, response, data) => {
       clearTimeout(timer);
-      if (error) return finish({ error: String(error), status: 0, body: "", headers: {} });
+      if (error) {
+        const errStr = typeof error === "object"
+          ? (error.error || error.message || JSON.stringify(error))
+          : String(error);
+        const st = response ? (response.status || response.statusCode || 0) : 0;
+        const b = data != null ? data : (response && response.body) || "";
+        return finish({ error: errStr, status: st, body: b || "", headers: (response && (response.headers || response.header)) || {} });
+      }
       const status = response ? (response.status || response.statusCode || 0) : 0;
       const respHeaders = (response && (response.headers || response.header)) || {};
-      finish({ status: status, body: data || "", error: null, headers: respHeaders, url: url });
+      const bodyOut = data != null ? data : (response && response.body) || "";
+      finish({ status: status, body: bodyOut, error: null, headers: respHeaders, url: url });
     };
 
     if (m === "GET") $nobyda.get(opts, cb);
@@ -2566,6 +2622,22 @@ function matchOne(text, re) {
 
 function wait(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+/** QX 控制台多参数 console.log 会丢后续参数，统一拼成单字符串 */
+function clog() {
+  try {
+    const s = Array.prototype.map.call(arguments, x => {
+      if (x == null) return "";
+      if (typeof x === "object") {
+        try { return JSON.stringify(x); } catch (e) { return String(x); }
+      }
+      return String(x);
+    }).join(" ");
+    console.log(s);
+  } catch (e) {
+    try { console.log(String(arguments[0])); } catch (e2) {}
+  }
 }
 
 function base64Decode(input) {
