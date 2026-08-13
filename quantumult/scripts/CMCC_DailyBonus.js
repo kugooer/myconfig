@@ -1184,43 +1184,56 @@ async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
       "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MCloudApp/13.0.0";
   }
   if (deviceId) headers.deviceId = deviceId;
+  // 部分环境 tyrz 也认 Basic（与 querySpec 同源身份）
+  if (ACCOUNT.cloudAuthorization && /Basic\s+/i.test(ACCOUNT.cloudAuthorization)) {
+    headers.Authorization = ACCOUNT.cloudAuthorization;
+  }
 
-  // 同一 SSO 只打 1 枪主 body（YZsid 多为一次性；多 body 连试会浪费票）
-  // 第二枪仅在「明确非票据错误且未消费」时用 sourceId 数字形态
-  const bodies = buildTyrzBodies(ssoToken).slice(0, 1);
+  // 同一 SSO 只打 1 枪主 body（YZsid 多为一次性）；用 httpRaw 打全量状态诊断
+  const bodyObj = buildTyrzBodies(ssoToken)[0];
   let lastDiag = "";
-  for (let i = 0; i < bodies.length; i++) {
-    try {
-      const j = await httpJson("POST",
-        "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
-        headers,
-        bodies[i]
-      );
-      const jwt = extractJwtFromTyrz(j);
-      if (jwt) {
-        console.log("tyrzLogin ok", "try=" + i, "len=" + jwt.length);
-        return jwt;
-      }
-      const keys = j && typeof j === "object" ? Object.keys(j).slice(0, 10).join(",") : "";
-      let resultType = "";
-      try {
-        resultType = typeof (j && j.result);
-        if (j && j.result && typeof j.result === "object") {
-          resultType += "{" + Object.keys(j.result).slice(0, 8).join(",") + "}";
-        } else if (j && j.result != null) {
-          resultType += ":" + String(j.result).slice(0, 48);
-        }
-      } catch (e) {}
-      const snip = j && j.raw
-        ? String(j.raw).slice(0, 220)
-        : (() => { try { return JSON.stringify(j).slice(0, 220); } catch (e) { return String(j); } })();
-      lastDiag = "try=" + i + " http=" + (j && j.status) + " code=" + (j && j.code) +
-        " msg=" + String((j && j.msg) || "") + " keys=" + keys + " result=" + resultType + " body=" + snip;
-      console.log("tyrzLogin fail =>", lastDiag);
-    } catch (e) {
-      lastDiag = "error " + e;
-      console.log("tyrzLogin error =>", e);
+  try {
+    const raw = await httpRaw(
+      "POST",
+      "https://m.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin",
+      headers,
+      JSON.stringify(bodyObj)
+    );
+    let bodyText = raw && raw.body != null ? stripChunkPrefix(String(raw.body)) : "";
+    console.log(
+      "tyrz raw =>",
+      "http=" + (raw && raw.status),
+      "err=" + (raw && raw.error || ""),
+      "len=" + bodyText.length,
+      "head=" + bodyText.slice(0, 180)
+    );
+    let j = {};
+    if (bodyText) {
+      try { j = JSON.parse(bodyText); } catch (e) { j = { raw: bodyText, status: raw && raw.status }; }
+    } else {
+      j = { empty: true, status: raw && raw.status, error: raw && raw.error };
     }
+    const jwt = extractJwtFromTyrz(j);
+    if (jwt) {
+      console.log("tyrzLogin ok", "len=" + jwt.length);
+      return jwt;
+    }
+    const keys = j && typeof j === "object" ? Object.keys(j).slice(0, 10).join(",") : "";
+    let resultType = "";
+    try {
+      resultType = typeof (j && j.result);
+      if (j && j.result && typeof j.result === "object") {
+        resultType += "{" + Object.keys(j.result).slice(0, 8).join(",") + "}";
+      } else if (j && j.result != null) {
+        resultType += ":" + String(j.result).slice(0, 48);
+      }
+    } catch (e) {}
+    lastDiag = "http=" + (raw && raw.status) + " code=" + (j && j.code) +
+      " msg=" + String((j && j.msg) || "") + " keys=" + keys + " result=" + resultType;
+    console.log("tyrzLogin fail =>", lastDiag);
+  } catch (e) {
+    lastDiag = "error " + e;
+    console.log("tyrzLogin error =>", e);
   }
   if (lastDiag) console.log("tyrzLogin last =>", lastDiag);
   return "";
