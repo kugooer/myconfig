@@ -34,8 +34,8 @@ var DeleteCookie = false;
 var out = 15000; // 单请求超时(ms)
 // 登录成功后是否立刻自动签到（核心开关）
 var AutoSignAfterLogin = true;
-// 登录后延迟多久开始签到，避免会话未完全落地
-var SignDelayMs = 800;
+// 登录后延迟多久开始签到，给 H5/云盘子请求一点落库时间
+var SignDelayMs = 1800;
 // 并发账号间隔
 var AccountGapMs = 600;
 
@@ -76,8 +76,10 @@ var AutoUseLearnedEndpoints = true;
 var AutoSignAfterLearn = false;
 // 是否清理历史误学习的查询类接口（推荐 true）
 var PurgeBadLearnedEndpoints = true;
-// 是否尝试云盘签到（辅路径，市场接口可能 404）
-var EnableCloudSign = true;
+// 是否尝试云盘签到（辅路径；当前多环境 market 返回 request not found，默认关闭，避免刷失败通知）
+var EnableCloudSign = false;
+// 捕获到云盘 Authorization 时是否单独弹一次云盘签到结果（默认关）
+var AutoCloudSignOnAuth = false;
 // 是否自动领取 domark 返回的 taskAwardChance
 var AutoClaimTaskAward = true;
 // 签到领奖活动页（抓包：qwhdmark/1021122301）
@@ -137,6 +139,11 @@ function ReadCookie() {
 
 async function all(account, opts) {
   ACCOUNT = normalizeAccount(account);
+  // 登录触发：延迟后再读一次，合并同号 cloud/H5 会话
+  if (opts && opts.reason === "login-trigger") {
+    const fresh = reloadAccount(ACCOUNT);
+    if (fresh) ACCOUNT = fresh;
+  }
   merge = {};
   $nobyda.time();
 
@@ -146,10 +153,17 @@ async function all(account, opts) {
   // 主路径：签到领奖(qwhdhub)；辅路径：云盘 / 已学习动作端点
   // 必须串行优先 Qwhd：避免未换 H5 会话前盲打 mark API 造成 302/404 噪音
   await LiveQwhdSign(0);
-  await Promise.all([
-    EnableCloudSign ? LiveCloudSign(0) : Promise.resolve(),
-    LiveEndpointSign(0)
-  ]);
+  // Qwhd 成功后，再刷新一次 ACCOUNT（SSO 可能写入 qwhdSession）
+  const again = reloadAccount(ACCOUNT);
+  if (again) ACCOUNT = again;
+
+  const jobs = [];
+  if (EnableCloudSign) jobs.push(LiveCloudSign(0));
+  else merge.CloudSign = { notify: "" }; // 默认不展示云盘跳过噪音
+  // 已有 Qwhd 主路径成功时，不必再靠 learned 端点补枪
+  if (!(merge.QwhdSign && merge.QwhdSign.success)) jobs.push(LiveEndpointSign(0));
+  else merge.AppSign = { notify: "" };
+  if (jobs.length) await Promise.all(jobs);
 
   await notify(tag);
 }
@@ -200,12 +214,18 @@ async function GetCookie() {
     };
 
     const saved = upsertAccount(acc);
-    $nobyda.notify("中国移动", "登录会话已更新", maskPhone(saved.phone || saved.uid || "账号"));
+    const label = maskPhone(saved.phone || saved.uid || "账号");
+    $nobyda.notify(
+      "中国移动",
+      "登录会话已更新",
+      label + (saved.phone ? "" : "（指纹登录密文，无明文手机号属正常；H5 仍可签）")
+    );
 
     if (AutoSignAfterLogin) {
-      // 用「本次登录」会话立即动态签到
+      // 稍等，便于同号 H5/云盘请求落库后合并
       if (SignDelayMs > 0) await wait(SignDelayMs);
-      await all(saved, { reason: "login-trigger" });
+      const latest = reloadAccount(saved) || saved;
+      await all(latest, { reason: "login-trigger" });
     }
     return;
   }
@@ -322,14 +342,14 @@ async function GetCookie() {
         source: "cloud-auth"
       });
 
-      // 云盘凭证到来时：仅签「这个手机号」对应账号，绝不回落到其他号
-      if (AutoSignAfterLogin && saved.cloudAuthorization && isValidPhone(saved.phone)) {
+      // 云盘凭证：默认只入库，不单独弹失败连枪（market 常 404 / request not found）
+      if (EnableCloudSign && AutoCloudSignOnAuth && saved.cloudAuthorization && isValidPhone(saved.phone)) {
         ACCOUNT = normalizeAccount(saved);
         merge = {};
         await LiveCloudSign(0);
         await notify(maskPhone(ACCOUNT.phone) + "·云盘即时签到");
-      } else if (isValidPhone(phone)) {
-        $nobyda.notify("中国移动", "云盘凭证已更新", maskPhone(phone));
+      } else if (isValidPhone(phone) && LogDetails) {
+        console.log("cloud-auth updated =>", maskPhone(phone));
       }
     }
   }
@@ -378,6 +398,10 @@ function LiveCloudSign(s) {
   return new Promise(resolve => {
     setTimeout(async () => {
       try {
+        if (!EnableCloudSign) {
+          merge.CloudSign.notify = "跳过云盘签到：EnableCloudSign=false";
+          return resolve();
+        }
         if (!ACCOUNT.cloudAuthorization && !ACCOUNT.noteToken) {
           merge.CloudSign.notify = "跳过云盘签到：尚无本次云盘凭证";
           return resolve();
@@ -416,8 +440,8 @@ function LiveCloudSign(s) {
         }
 
         if (!jwtToken) {
-          // 退化：若只有 Authorization，尝试直接查签到状态（部分环境可用）
-          merge.CloudSign.notify = "云盘动态鉴权未换到 jwtToken（可能 Authorization 已过期或接口变更）";
+          // 鉴权失败：不算业务失败，软跳过
+          merge.CloudSign.notify = "跳过云盘：jwtToken 未换到（接口变更/凭证过期）";
           return resolve();
         }
 
@@ -436,8 +460,12 @@ function LiveCloudSign(s) {
         ).catch(e => ({ __err: String(e) }));
 
         if (info && info.__err) {
-          merge.CloudSign.error = 1;
-          merge.CloudSign.notify = "云盘签到查询失败: " + info.__err;
+          merge.CloudSign.notify = "跳过云盘：查询失败 " + info.__err;
+          return resolve();
+        }
+        // market 路径常见：request not found / 404
+        if (isCloudMarketDead(info)) {
+          merge.CloudSign.notify = "跳过云盘：market 接口不可用(request not found/404)";
           return resolve();
         }
 
@@ -449,10 +477,8 @@ function LiveCloudSign(s) {
         }
 
         // 步骤 D：执行签到（动态）
-        // 新版常见：先取 market rule，再 signin
-        // 这里采用官方 market 路径族中的动态调用；失败时回退旧 action
         let signed = await tryCloudMarketSign(signHeaders, ts);
-        if (!signed.ok) {
+        if (!signed.ok && !isCloudDeadMsg(signed.msg)) {
           signed = await tryCloudLegacySign(signHeaders, ts);
         }
 
@@ -460,18 +486,30 @@ function LiveCloudSign(s) {
           merge.CloudSign.success = 1;
           merge.CloudSign.notify = "云盘: 签到成功" + (signed.msg ? ` (${signed.msg})` : "");
           if (signed.reward) merge.CloudSign.bean = signed.reward;
+        } else if (isCloudDeadMsg(signed.msg) || isCloudMarketDead(signed.raw)) {
+          // 不计入失败，避免「成功0/失败1」刷屏
+          merge.CloudSign.notify = "跳过云盘：market 不可用 · " + (signed.msg || "request not found");
         } else {
           merge.CloudSign.error = 1;
           merge.CloudSign.notify = "云盘: 签到未成功" + (signed.msg ? ` · ${signed.msg}` : "");
         }
       } catch (e) {
-        merge.CloudSign.error = 1;
-        merge.CloudSign.notify = "云盘动态签到异常: " + e;
+        merge.CloudSign.notify = "跳过云盘：异常 " + e;
       } finally {
         resolve();
       }
     }, s);
   });
+}
+
+function isCloudMarketDead(j) {
+  if (!j) return false;
+  const s = typeof j === "string" ? j : JSON.stringify(j);
+  return /request not found|not found|404|path error|接口不存在/i.test(s);
+}
+
+function isCloudDeadMsg(msg) {
+  return /request not found|not found|404|接口不存在/i.test(String(msg || ""));
 }
 
 async function tryCloudMarketSign(headers, ts) {
@@ -542,6 +580,12 @@ function LiveQwhdSign(s) {
         if (!sess.ok) {
           merge.QwhdSign.error = 1;
           merge.QwhdSign.notify = "签到领奖: H5 SSO 失败 · " + (sess.msg || "未知");
+          return resolve();
+        }
+        // 硬门槛：没有 QWHD_SESSION_TOKEN 绝不打 mark API（否则固定返回 HTML 404 页）
+        if (!ACCOUNT.qwhdSession) {
+          merge.QwhdSign.error = 1;
+          merge.QwhdSign.notify = "签到领奖: 缺 QWHD_SESSION_TOKEN。请在 App 打开一次「签到领奖」页（MITM 捕获会话）";
           return resolve();
         }
 
@@ -625,9 +669,9 @@ function LiveQwhdSign(s) {
         }
 
         // 失败分支
-        if (isQwhdAuthFail(mr)) {
+        if (isQwhdAuthFail(mr) || isHtmlNotice(text)) {
           merge.QwhdSign.error = 1;
-          merge.QwhdSign.notify = "签到领奖: 会话无效(302/404)，请重新登录 App";
+          merge.QwhdSign.notify = "签到领奖: H5 会话无效（返回登录页/404）。请打开一次「签到领奖」后再登录触发";
         } else if (/已签|重复/i.test(text)) {
           merge.QwhdSign.success = 1;
           merge.QwhdSign.notify = "签到领奖: 今日已签";
@@ -884,7 +928,16 @@ function isQwhdAuthFail(r) {
   const b = String(r.body || "");
   const loc = getHeader(r.headers || {}, "Location") || "";
   if (/notice\/404|qwhdsso\/login/i.test(loc + b)) return true;
+  if (isHtmlNotice(b)) return true;
   if (r.status >= 300 && r.status < 400 && !b) return true;
+  return false;
+}
+
+function isHtmlNotice(text) {
+  const s = String(text || "").trim();
+  if (!s) return false;
+  if (/^<!DOCTYPE html/i.test(s) || /^<html[\s>]/i.test(s)) return true;
+  if (/notice\/404|请在中国移动APP内访问/i.test(s)) return true;
   return false;
 }
 
@@ -1347,8 +1400,12 @@ function notify(tag) {
         if (it.bean) lines.push(`奖励: ${it.bean}`);
       });
       const title = `中国移动 · ${tag || "签到"}`;
-      const subtitle = `成功${ok} / 失败${fail}`;
-      const message = lines.join("\n") || "无结果";
+      // 主路径成功时，subtitle 强调主结果，避免辅路径失败主导观感
+      const mainOk = !!(merge.QwhdSign && merge.QwhdSign.success);
+      const subtitle = mainOk
+        ? (fail ? `签到领奖成功（其它 ${fail} 项可忽略）` : "签到领奖成功")
+        : `成功${ok} / 失败${fail}`;
+      const message = lines.filter(Boolean).join("\n") || "无结果";
       $nobyda.notify(title, subtitle, message);
       console.log(`\n${title}\n${subtitle}\n${message}`);
     } catch (e) {
@@ -1468,6 +1525,24 @@ function findAccountByPhone(phone) {
   const p = sanitizePhone(phone);
   if (!isValidPhone(p)) return null;
   return loadAccounts().find(a => a.phone === p) || null;
+}
+
+function reloadAccount(acc) {
+  const n = normalizeAccount(acc || {});
+  const list = loadAccounts();
+  if (n.phone) {
+    const byPhone = list.find(a => a.phone === n.phone);
+    if (byPhone) return normalizeAccount(byPhone);
+  }
+  if (n.uid) {
+    const byUid = list.find(a => a.uid === n.uid);
+    if (byUid) return normalizeAccount(byUid);
+  }
+  if (n.jsessionid) {
+    const byJs = list.find(a => a.jsessionid === n.jsessionid);
+    if (byJs) return normalizeAccount(byJs);
+  }
+  return n.cookie || n.jsessionid || n.qwhdSession ? n : null;
 }
 
 /********************* HTTP 封装 *********************/
