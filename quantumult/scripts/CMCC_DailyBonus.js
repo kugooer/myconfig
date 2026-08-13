@@ -90,13 +90,16 @@ var AutoSignAfterLearn = false;
 var PurgeBadLearnedEndpoints = true;
 // 是否尝试移动云盘签到（ycloud startSignIn；抓包 2026-08-13 证实有效）
 var EnableCloudSign = true;
-// 打开移动云盘后自动签：仅在拿到 jwt / newsignin SSO / App 自己 startSignIn 结果时触发
-// （不要对裸 Basic 立刻自换票——querySpec 出来的票常被 App 抢用或 sourceId 不匹配，tyrz 会失败）
+// 打开移动云盘后：是否根据 App 真实 startSignIn 响应弹一次结果
+// （不再在打开时自调 tyrzLogin——会与 App 抢一次性 SSO，刷 fail + 重复通知）
 var AutoCloudSignOnAuth = true;
+// 打开时是否允许脚本自己 LiveCloudSign（tyrz+startSignIn）。默认 false，只观测 App。
+// cron / 手动 all() 仍会走 LiveCloudSign。
+var AutoCloudLiveSignOnOpen = false;
 // 软跳过（SSO/tyrz 失败）是否弹通知：默认 false，避免「成功0/失败0」刷屏
 var NotifyCloudSoftSkip = false;
-// 云盘即时签防抖（ms）
-var CloudAutoDebounceMs = 15000;
+// 云盘即时结果防抖（ms），跨并发 rewrite 脚本实例
+var CloudAutoDebounceMs = 60000;
 // 云盘活动参数（抓包固定值，非历史 body 回放）
 var CloudMarketName = "sign_in_3";
 var CloudSourceId = "1002";
@@ -127,7 +130,10 @@ function ReadCookie() {
     $nobyda.write("", "CookiesCMCC");
     $nobyda.write("", "CookieCMCC");
     $nobyda.write("", "CMCC_SignEndpoints");
-    $nobyda.notify("中国移动", "", "已清空 CookiesCMCC / CookieCMCC / CMCC_SignEndpoints");
+    $nobyda.write("", "CMCC_CloudAutoAt");
+    $nobyda.write("", "CMCC_CloudNotifySig");
+    $nobyda.write("", "CMCC_CloudAutoKey");
+    $nobyda.notify("中国移动", "", "已清空 CookiesCMCC / CookieCMCC / CMCC_SignEndpoints / 云盘防抖键");
     return $nobyda.done();
   }
 
@@ -365,18 +371,16 @@ async function GetCookie() {
     } catch (e) {}
   }
 
-  // 3) 云盘/笔记 Authorization + portal SSO / ycloud jwt —— 打开移动云盘后入库
-  //    自动签策略（避免 Basic 过早自换票失败）：
-  //    - 裸 Basic：只入库，不签
-  //    - App tyrzLogin 成功拿到 jwt：用该 jwt 调 startSignIn
-  //    - App startSignIn 响应：直接解析结果并通知（App 已签也算成功）
-  //    - portal newsignin 的 YZsid：可尝试（有竞态，App 可能先消费）
+  // 3) 云盘会话捕获 + 打开时只观测 App startSignIn 结果
+  //    - Basic / portal / tyrz / jwt：只入库，供 cron LiveCloudSign
+  //    - startSignIn 响应：解析成功后最多通知 1 次（跨并发防抖）
+  //    - 默认不在打开时自调 tyrz（AutoCloudLiveSignOnOpen=false）
   if (/caiyun\.feixin\.10086\.cn|yun\.139\.com|mcloud\.139\.com|vsbo\.caiyun/i.test(url)) {
     let saved = null;
-    let autoReason = ""; // jwt | portal-sso | app-signed | ""
     const auth = getHeader(headers, "Authorization") || getHeader(headers, "APP_AUTH") || "";
     const uaHdr = getHeader(headers, "User-Agent") || "";
-    const deviceHdr = getHeader(headers, "deviceId") || ""; // 禁止用 x-DeviceInfo 冒充
+    const deviceHdr = getHeader(headers, "deviceId") || "";
+    const ref = getHeader(headers, "Referer") || "";
 
     if (/Basic\s+/i.test(auth)) {
       const phone = decodeBasicPhone(auth) || extractPhoneStrict(body, respBody, headers);
@@ -390,12 +394,9 @@ async function GetCookie() {
         updatedAt: Date.now(),
         source: "cloud-auth"
       });
-      // 注意：Basic  alone 不置 autoReason
       if (isValidPhone(phone) && LogDetails) console.log("cloud-auth updated =>", maskPhone(phone));
     }
 
-    // portal 入口：仅 path=newsignin 的 YZsid 才视为签到 SSO
-    const ref = getHeader(headers, "Referer") || "";
     const portalNewSign =
       /path=newsignin/i.test(url) || /path=newsignin/i.test(ref) || /marketName=sign_in_3|activityId=sign_in_3/i.test(url + ref);
     const portalTok =
@@ -404,9 +405,9 @@ async function GetCookie() {
       matchOne(String(body || ""), /"token"\s*:\s*"(YZsidssolg[^"]+)"/i) ||
       "";
 
-    // querySpecToken 明文（response）：入库供 cron，默认不即时自签（sourceId 常不匹配 / 单次票）
-    let specTok = "";
+    // querySpecToken 明文：仅入库
     if (/querySpecToken/i.test(url) && respBody) {
+      let specTok = "";
       try {
         const j = JSON.parse(stripChunkPrefix(respBody) || "{}");
         specTok = (j && j.data && j.data.token) || (typeof j.result === "string" ? j.result : "") || "";
@@ -415,112 +416,101 @@ async function GetCookie() {
         specTok = matchOne(String(respBody || ""), /"(?:token|result)"\s*:\s*"(YZsidssolg[^"]+)"/i) || "";
       }
       if (specTok && /^YZsidssolg/i.test(specTok)) {
-        saved = upsertAccount({
-          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url),
+        saved = upsertCloudSession({
+          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url) || resolveRecentCloudPhone(),
           cloudSsoToken: specTok,
           cloudAuthorization: auth && /Basic\s+/i.test(auth) ? auth : undefined,
           cloudUA: uaHdr,
           cloudDeviceId: deviceHdr || undefined,
-          updatedAt: Date.now(),
           source: "cloud-spec-token"
-        }, true) || saved;
+        });
       }
     }
 
     if (portalTok && /^YZsidssolg/i.test(portalTok) && portalNewSign) {
-      saved = upsertAccount({
-        phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url),
+      // 只存票，打开时不 tyrz（App 马上会消费）
+      saved = upsertCloudSession({
+        phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers, url) || resolveRecentCloudPhone(),
         cloudSsoToken: portalTok,
         cloudAuthorization: auth && /Basic\s+/i.test(auth) ? auth : undefined,
         cloudUA: uaHdr,
         cloudDeviceId: deviceHdr || undefined,
-        updatedAt: Date.now(),
         source: "cloud-portal-newsignin"
-      }, true) || saved;
-      // portal SSO 可尝试；若 App 已先 tyrz 消费，LiveCloudSign 会软跳过
-      autoReason = "portal-sso";
+      });
     }
 
-    // App 自己的 tyrzLogin：成功则拿到 jwt，再用 jwt 签（最稳）
     if (/ycloud\/auth-service\/auth\/tyrzLogin/i.test(url)) {
       const tokInBody = matchOne(String(body || ""), /"token"\s*:\s*"(YZsidssolg[^"]+)"/i);
+      const phoneHint = (saved && saved.phone) || extractPhoneStrict(body, respBody, headers) || resolveRecentCloudPhone();
       if (tokInBody) {
-        saved = upsertAccount({
-          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
+        saved = upsertCloudSession({
+          phone: phoneHint,
           cloudSsoToken: tokInBody,
           cloudUA: uaHdr,
           cloudDeviceId: deviceHdr || undefined,
-          updatedAt: Date.now(),
           source: "cloud-tyrz-req"
-        }, true) || saved;
+        });
       }
       if ($response && respBody) {
         let tyrzJwt = "";
-        let tyrzCode = null;
-        let tyrzMsg = "";
         try {
           const j = JSON.parse(stripChunkPrefix(respBody) || "{}");
-          tyrzCode = j && j.code;
-          tyrzMsg = (j && j.msg) || "";
           tyrzJwt = (j && j.result && j.result.token) || "";
+          if (!(tyrzJwt && tyrzJwt.length > 20) && j && j.msg && LogDetails) {
+            console.log("app tyrzLogin =>", j.code, j.msg);
+          }
         } catch (e) {
           tyrzJwt = matchOne(String(respBody || ""), /"token"\s*:\s*"(eyJ[^"]+)"/i) || "";
         }
         if (tyrzJwt && tyrzJwt.length > 20) {
-          saved = upsertAccount({
-            phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
+          saved = upsertCloudSession({
+            phone: phoneHint,
             cloudJwt: tyrzJwt,
-            // 一次性 SSO 已被 App 消费，清掉避免脚本复用失败票
-            cloudSsoToken: "",
+            cloudSsoToken: "", // App 已消费 SSO
             cloudUA: uaHdr,
             cloudDeviceId: deviceHdr || undefined,
-            updatedAt: Date.now(),
             source: "cloud-tyrz-resp"
-          }, true) || saved;
-          autoReason = "jwt";
-          console.log("cloud jwt captured from app tyrzLogin");
-        } else if (tyrzMsg) {
-          console.log("app tyrzLogin fail =>", tyrzCode, tyrzMsg);
-          // App 换票失败则清过期 SSO，留给 Basic+cron
-          if (tokInBody) {
-            upsertAccount({
-              phone: (saved && saved.phone) || "",
-              cloudSsoToken: "",
-              updatedAt: Date.now(),
-              source: "cloud-tyrz-fail-clear"
-            }, true);
-          }
+          });
+          if (LogDetails) console.log("cloud jwt captured from app tyrzLogin");
+        } else if (tokInBody) {
+          // App 侧也失败时清坏票
+          upsertCloudSession({ phone: phoneHint, cloudSsoToken: "", source: "cloud-tyrz-fail-clear" });
         }
       }
     }
 
-    // App 已调 startSignIn：直接吃响应（这是「打开云盘后已签」的最可靠观测）
+    // App startSignIn：主观测点
     if (/ycloud\/signin\/page\/startSignIn/i.test(url)) {
       const jwtHdr = getHeader(headers, "jwtToken") || matchOne(getHeader(headers, "Cookie") || "", /jwtToken=([^;]+)/i) || "";
+      const phoneHint =
+        (saved && saved.phone) ||
+        extractPhoneStrict(body, respBody, headers) ||
+        resolveRecentCloudPhone();
+
       if (jwtHdr) {
-        saved = upsertAccount({
-          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
+        saved = upsertCloudSession({
+          phone: phoneHint,
           cloudJwt: jwtHdr,
           cloudUA: uaHdr,
           cloudDeviceId: deviceHdr || undefined,
-          updatedAt: Date.now(),
-          source: "cloud-startSignIn-req"
-        }, true) || saved;
+          source: $response ? "cloud-startSignIn-resp" : "cloud-startSignIn-req"
+        });
       }
-      if ($response && respBody) {
+
+      if ($response && respBody && EnableCloudSign && AutoCloudSignOnAuth) {
         const parsed = parseCloudStartSignInBody(respBody);
-        saved = upsertAccount({
-          phone: (saved && saved.phone) || extractPhoneStrict(body, respBody, headers),
+        saved = upsertCloudSession({
+          phone: phoneHint,
           cloudJwt: jwtHdr || (saved && saved.cloudJwt) || "",
           cloudUA: uaHdr,
           cloudDeviceId: deviceHdr || undefined,
-          updatedAt: Date.now(),
           source: "cloud-startSignIn-resp"
-        }, true) || saved;
-        if (parsed && parsed.ok && EnableCloudSign && AutoCloudSignOnAuth) {
-          // 观测到 App 签到结果：直接通知，不再二次请求
-          if (shouldFireCloudAuto(saved)) {
-            markCloudAuto(saved);
+        }) || saved;
+
+        if (parsed && parsed.ok) {
+          const acc = normalizeAccount(reloadAccount(saved) || saved || {});
+          if (!isValidPhone(acc.phone) && isValidPhone(phoneHint)) acc.phone = phoneHint;
+          if (claimCloudAutoNotify(acc, parsed)) {
             merge = {};
             merge.CloudSign = {
               success: 1,
@@ -530,42 +520,30 @@ async function GetCookie() {
               bean: parsed.points != null ? (parsed.points + "豆") : ""
             };
             if (parsed.signCount != null) merge.CloudSign.notify += ` · 连签${parsed.signCount}天`;
-            ACCOUNT = normalizeAccount(reloadAccount(saved) || saved);
-            await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘即时签到");
-            return;
+            ACCOUNT = acc;
+            await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘");
           }
+          return;
         }
-        // 若响应失败且我们有 jwt，可尝试补枪
-        if (parsed && !parsed.ok && jwtHdr) autoReason = "jwt";
-      } else if (jwtHdr && !$response) {
-        // request 阶段：有 jwt 也可补枪（response 规则会再跑一次，靠防抖）
-        autoReason = autoReason || "jwt";
       }
     }
 
-    // 仅 jwt / portal-sso 触发自签；裸 Basic / 普通 querySpec 不触发
+    // 可选：打开时脚本自签（默认关）。仅 jwt 路径，禁止 portal-sso 自 tyrz。
     if (
       EnableCloudSign &&
       AutoCloudSignOnAuth &&
+      AutoCloudLiveSignOnOpen &&
       saved &&
-      (autoReason === "jwt" || autoReason === "portal-sso") &&
-      (saved.cloudJwt || saved.cloudSsoToken)
+      saved.cloudJwt &&
+      shouldFireCloudAuto(saved)
     ) {
-      if (shouldFireCloudAuto(saved)) {
-        markCloudAuto(saved);
-        ACCOUNT = normalizeAccount(reloadAccount(saved) || saved);
-        // jwt 优先；portal-sso 时清掉旧 jwt 以免过期 jwt 挡道
-        if (autoReason === "portal-sso" && !ACCOUNT.cloudJwt) {
-          // ok
-        }
-        merge = {};
-        await LiveCloudSign(0);
-        const soft = merge.CloudSign && !merge.CloudSign.success && !merge.CloudSign.error;
-        if (!soft || NotifyCloudSoftSkip) {
-          await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘即时签到");
-        } else if (merge.CloudSign && merge.CloudSign.notify) {
-          console.log("cloud soft-skip (no notify) =>", merge.CloudSign.notify);
-        }
+      markCloudAuto(saved);
+      ACCOUNT = normalizeAccount(reloadAccount(saved) || saved);
+      merge = {};
+      await LiveCloudSign(0);
+      const soft = merge.CloudSign && !merge.CloudSign.success && !merge.CloudSign.error;
+      if (!soft || NotifyCloudSoftSkip) {
+        await notify(maskPhone(ACCOUNT.phone || "云盘") + "·云盘");
       }
     }
   }
@@ -734,34 +712,119 @@ function LiveCloudSign(s) {
   });
 }
 
+function cloudAutoKey(acc) {
+  const p = acc && isValidPhone(acc.phone) ? acc.phone : "";
+  if (p) return "p:" + p;
+  const jwt = acc && acc.cloudJwt ? String(acc.cloudJwt).slice(-24) : "";
+  if (jwt) return "j:" + jwt;
+  const auth = acc && acc.cloudAuthorization ? String(acc.cloudAuthorization).slice(-24) : "";
+  if (auth) return "a:" + auth;
+  return "global";
+}
+
 function shouldFireCloudAuto(acc) {
-  if (!acc) return false;
   const now = Date.now();
-  const gap = Number(CloudAutoDebounceMs) || 15000;
+  const gap = Number(CloudAutoDebounceMs) || 60000;
+  // 进程内快路径（同一次 QX 多 rewrite 并发靠存储）
+  try {
+    const gAt = Number($nobyda.read("CMCC_CloudAutoAt") || 0);
+    if (gAt && now - gAt < gap) return false;
+  } catch (e) {}
+  if (!acc) return true;
   return !acc.cloudAutoAt || now - Number(acc.cloudAutoAt || 0) > gap;
 }
 
 function markCloudAuto(acc) {
   const now = Date.now();
-  upsertAccount({
-    phone: acc && acc.phone,
-    cloudAuthorization: acc && acc.cloudAuthorization,
-    cloudSsoToken: acc && acc.cloudSsoToken,
-    cloudJwt: acc && acc.cloudJwt,
-    cloudAutoAt: now,
-    updatedAt: now,
-    source: "cloud-auto-mark"
-  }, true);
+  try { $nobyda.write(String(now), "CMCC_CloudAutoAt"); } catch (e) {}
+  try { $nobyda.write(cloudAutoKey(acc), "CMCC_CloudAutoKey"); } catch (e) {}
+  const phone = (acc && isValidPhone(acc.phone) && acc.phone) || resolveRecentCloudPhone();
+  if (phone || (acc && (acc.cloudJwt || acc.cloudAuthorization))) {
+    upsertAccount({
+      phone: phone || (acc && acc.phone) || "",
+      cloudAuthorization: acc && acc.cloudAuthorization,
+      cloudSsoToken: acc && acc.cloudSsoToken,
+      cloudJwt: acc && acc.cloudJwt,
+      cloudAutoAt: now,
+      updatedAt: now,
+      source: "cloud-auto-mark"
+    }, true);
+  }
+}
+
+// 跨并发抢锁：谁先 claim 谁通知；结果签名相同则 60s 内只报一次
+function claimCloudAutoNotify(acc, parsed) {
+  const now = Date.now();
+  const gap = Number(CloudAutoDebounceMs) || 60000;
+  const sig = [
+    parsed && parsed.already ? "1" : "0",
+    parsed && parsed.points != null ? parsed.points : "",
+    parsed && parsed.signCount != null ? parsed.signCount : "",
+    (acc && acc.phone) || "",
+    (acc && acc.cloudJwt ? String(acc.cloudJwt).slice(-12) : "")
+  ].join("|");
+  try {
+    const lastAt = Number($nobyda.read("CMCC_CloudAutoAt") || 0);
+    const lastSig = $nobyda.read("CMCC_CloudNotifySig") || "";
+    if (lastAt && now - lastAt < gap && lastSig === sig) return false;
+    if (lastAt && now - lastAt < 3000) return false; // 3s 硬锁防并发双报
+    $nobyda.write(String(now), "CMCC_CloudAutoAt");
+    $nobyda.write(sig, "CMCC_CloudNotifySig");
+  } catch (e) {}
+  markCloudAuto(acc);
+  return true;
+}
+
+function upsertCloudSession(fields) {
+  const phone =
+    (fields && isValidPhone(fields.phone) && fields.phone) ||
+    resolveRecentCloudPhone() ||
+    "";
+  const patch = Object.assign({}, fields || {}, {
+    phone: phone || (fields && fields.phone) || "",
+    updatedAt: Date.now()
+  });
+  // 无任何身份则放弃（避免幽灵）
+  if (!isValidPhone(patch.phone) && !patch.cloudAuthorization && !patch.cloudJwt && !patch.cloudSsoToken) {
+    return null;
+  }
+  // 有 jwt/sso 但无号：尽量并入最近云盘号账号
+  if (!isValidPhone(patch.phone)) {
+    const recent = findRecentCloudAccount();
+    if (recent && isValidPhone(recent.phone)) patch.phone = recent.phone;
+  }
+  return upsertAccount(patch, true);
+}
+
+function resolveRecentCloudPhone() {
+  const a = findRecentCloudAccount();
+  return a && isValidPhone(a.phone) ? a.phone : "";
+}
+
+function findRecentCloudAccount() {
+  try {
+    const list = loadAccounts()
+      .filter(a => a && (a.cloudAuthorization || a.cloudJwt || a.cloudSsoToken || (a.phone && isValidPhone(a.phone))))
+      .sort((x, y) => Number(y.updatedAt || 0) - Number(x.updatedAt || 0));
+    // 优先有合法手机号且带云盘字段的
+    const withPhone = list.find(a => isValidPhone(a.phone) && (a.cloudAuthorization || a.cloudJwt));
+    if (withPhone) return withPhone;
+    return list.find(a => isValidPhone(a.phone)) || list[0] || null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function clearCloudSso(phone) {
-  if (!isValidPhone(phone)) return;
-  upsertAccount({ phone: phone, cloudSsoToken: "", updatedAt: Date.now(), source: "cloud-clear-sso" }, true);
+  const p = isValidPhone(phone) ? phone : resolveRecentCloudPhone();
+  if (!isValidPhone(p)) return;
+  upsertAccount({ phone: p, cloudSsoToken: "", updatedAt: Date.now(), source: "cloud-clear-sso" }, true);
 }
 
 function clearCloudJwt(phone) {
-  if (!isValidPhone(phone)) return;
-  upsertAccount({ phone: phone, cloudJwt: "", updatedAt: Date.now(), source: "cloud-clear-jwt" }, true);
+  const p = isValidPhone(phone) ? phone : resolveRecentCloudPhone();
+  if (!isValidPhone(p)) return;
+  upsertAccount({ phone: p, cloudJwt: "", updatedAt: Date.now(), source: "cloud-clear-jwt" }, true);
 }
 
 function parseCloudStartSignInBody(raw) {
@@ -899,11 +962,13 @@ async function fetchCloudJwtFromTyrz(ssoToken, ua, deviceId) {
       }
     );
     if (j && Number(j.code) === 0 && j.result && j.result.token) return j.result.token;
-    if (j && (j.msg || j.code != null)) console.log("tyrzLogin fail =>", j.code, j.msg || "");
-    else if (j && j.raw) console.log("tyrzLogin non-json =>", String(j.raw).slice(0, 80));
+    if (LogDetails) {
+      if (j && (j.msg || j.code != null)) console.log("tyrzLogin fail =>", j.code, j.msg || "");
+      else if (j && j.raw) console.log("tyrzLogin non-json =>", String(j.raw).slice(0, 80));
+    }
     return "";
   } catch (e) {
-    console.log("tyrzLogin error =>", e);
+    if (LogDetails) console.log("tyrzLogin error =>", e);
     return "";
   }
 }
