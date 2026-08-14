@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v5.1-no-super-host)
+  更新时间: 2026.08.14 (capture-v6-mina-body)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -459,7 +459,7 @@ function buildNoCookieTip() {
     "4) 彻底杀进程后打开「比亚迪」主 App（非小组件）\n" +
     "5) 我的 → 每日签到 / 积分商城，点一次签到\n" +
     "6) 应出现「凭证新增/更新成功」；再跑定时任务\n" +
-    "若打开签到页仍无新诊断：可能 App 对 dilink 证书固定，MitM 看不到包，把最新 [BYD capture] 日志发我";
+    "若只有 mina 日志（op=com.app.dynasty.srv）：说明签到走 mPaaS 网关；请进入「每日签到」点一次后把 [BYD mina] 行发我";
   if (diag) {
     tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 700);
     if (/vehicleRealTime|getStatusNow|superappserver/i.test(diag) && !/dilinkappserver|\/club\/|Sign\.signIn|mina\.byd/i.test(diag)) {
@@ -503,9 +503,101 @@ function GetCookie() {
     console.log("[BYD capture] " + diagLine);
     appendDiag(diagLine);
 
-    // mina 统一网关：多为 protobuf 加密，只能诊断
+    // mina / mPaaS 统一网关：抓 header + body 诊断；疑似签到时保存可重放网关凭证
     if (isMina) {
-      console.log("[BYD] mina 网关诊断: " + (opType || "(no Operation-Type)") + " — 不入库");
+      const h = req.headers || {};
+      const pick = (keys) => {
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i];
+          if (h[k] != null && h[k] !== "") return String(h[k]);
+          const hit = Object.keys(h).find((x) => x.toLowerCase() === k.toLowerCase());
+          if (hit && h[hit] != null && h[hit] !== "") return String(h[hit]);
+        }
+        return "";
+      };
+      const apiName = pick(["Api", "api", "Operation-Type", "operation-type", "RpcId", "rpcId"]);
+      const productId = pick(["productId", "ProductId", "AppId", "appId"]);
+      const workspaceId = pick(["WorkspaceId", "workspaceId"]);
+      const sign = pick(["Sign", "sign"]);
+      const did = pick(["Did", "did"]);
+      const uuid = pick(["uuid", "UUID"]);
+      const cookie = pick(["Cookie", "cookie"]);
+      const identifier = pick(["identifier", "Identifier"]);
+      const encryToken = pick(["encryToken", "EncryToken"]);
+      const contentType = pick(["Content-Type", "content-type"]);
+
+      // body 里可能混有可读 ASCII（签名方法名 / signIn 等）
+      let bodyAscii = "";
+      try {
+        bodyAscii = String(bodyText || "")
+          .replace(/[^\x20-\x7E\u4e00-\u9fff]/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 160);
+      } catch (e) {}
+
+      const minaSignLike = /sign|checkIn|checkin|integral|point|score|activity\.sign|Sign\.|每日签|签到/i.test(
+        [opType, apiName, url, bodyAscii].join(" ")
+      );
+
+      const diagMina =
+        new Date().toISOString() +
+        ` | MINA | op=${(opType || apiName || "-").slice(0, 100)} | product=${(productId || "-").slice(0, 40)}` +
+        ` | bodyLen=${bodyText.length} | signLike=${minaSignLike ? 1 : 0}` +
+        (bodyAscii ? ` | bodyHint=${bodyAscii.slice(0, 80)}` : "");
+      console.log("[BYD mina] " + diagMina);
+      appendDiag(diagMina);
+
+      // 保存最近一次完整网关头，便于后续适配回放（无论是否签到）
+      const minaSnap = {
+        type: "mina",
+        host,
+        url,
+        method,
+        opType: opType || apiName || "",
+        productId,
+        workspaceId,
+        sign,
+        did,
+        uuid,
+        cookie,
+        identifier,
+        encryToken,
+        contentType,
+        headers: sanitizeHeaders(h),
+        bodyLen: bodyText.length,
+        bodyB64: "",
+        bodyHint: bodyAscii,
+        minaSignLike: !!minaSignLike,
+        update: new Date().toISOString()
+      };
+
+      // body 以 base64 形式短存（体积限制）
+      try {
+        if (bodyText && bodyText.length > 0 && bodyText.length <= 8000) {
+          if (typeof $nobyda.base64 !== "undefined") {
+            // no-op placeholder
+          }
+          // QX/JS 环境不保证 Buffer；尽量原样截断保存
+          minaSnap.bodyB64 = bodyText.length <= 2048 ? bodyText : bodyText.slice(0, 2048);
+        }
+      } catch (e) {}
+
+      $nobyda.write(JSON.stringify(minaSnap), "BYD_MinaLast");
+      if (minaSignLike) {
+        $nobyda.write(JSON.stringify(minaSnap), "BYD_MinaSign");
+        const tip =
+          `已捕获疑似签到 mina 请求\n` +
+          `op: ${(opType || apiName || "-").slice(0, 120)}\n` +
+          `product: ${productId || "-"}\n` +
+          `bodyLen: ${bodyText.length}\n` +
+          `hint: ${bodyAscii.slice(0, 80) || "(binary)"}\n` +
+          "请把此通知原文发我，继续做回放适配";
+        console.log("[BYD] " + tip);
+        $nobyda.notify("比亚迪 mina 签到线索", (opType || apiName || host).slice(0, 40), tip);
+      } else {
+        console.log("[BYD] mina 普通网关: " + (opType || apiName || "(no op)") + " — 仅诊断/快照，不入库签到 cookie");
+      }
       $nobyda.done({});
       return;
     }

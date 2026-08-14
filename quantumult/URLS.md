@@ -164,6 +164,17 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_di
 5. 抓凭证时：保持 rewrite 开启 → 进入签到页点一次 → 出现「凭证成功」通知后，可临时关闭 rewrite 只留定时任务
 
 
+
+### 日志只有 mina.byd.com + op=com.app.dynasty.srv（capture-v6）
+
+说明：主 App 已进入 **王朝 mPaaS 网关**，旧 `dilinkappserver/club/Sign.signIn` 路径可能已不再触发。
+
+1. 强制更新 rewrite 到 capture-v6（mina 使用 **script-request-body**，不要 header-only）
+2. 打开主 App → **我的 → 每日签到/签到抽盲盒**，点一次签到
+3. 日志应出现 `[BYD mina]`，关注 `op=`、`bodyLen`、`signLike`、`bodyHint`
+4. 若弹出「比亚迪 mina 签到线索」：把通知全文发我，继续做回放
+5. 若 bodyLen 仍为 0：确认资源已更新为 body 规则
+
 ### 日志里大量 vehicleRealTime / getStatusNow 且 signLike=0
 
 这些是**车况/小组件接口**，`request` 字段不能用于积分签到。
