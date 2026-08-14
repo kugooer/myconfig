@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v5-discover)
+  更新时间: 2026.08.14 (capture-v5.1-no-super-host)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -39,7 +39,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/URLS.md
 比亚迪_每日签到 = type=cron,cronexp=10 8 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js
 
 [MITM]
-hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
+hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto, mina.byd.com
 
 【Quantumult X】
 ----------------
@@ -50,7 +50,7 @@ hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
 10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到, enabled=true
 
 [mitm]
-hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
+hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto, mina.byd.com
 
 【Loon】
 ----------------
@@ -59,7 +59,7 @@ http-request ^https:\/\/dilinkappserver(-cn)?\.byd\.auto\/.*(club|Sign\.signIn|i
 cron "10 8 * * *" script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪_每日签到
 
 [Mitm]
-hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
+hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto, mina.byd.com
 
 【Node.js】
 ----------------
@@ -125,7 +125,8 @@ function isValidSignCookie(item) {
   if (item._manual) return true;
   const url = String(item.url || "");
   const host = String(item.host || "");
-  if (/vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data|dilinksuper/i.test(url + host)) return false;
+  if (/vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data/i.test(url)) return false;
+  if (/superappserver/i.test(host)) return false;
   if (item.signLike === true) return true;
   if (/Sign\.signIn|serviceDir=Sign|integralMall|\/club\//i.test(url)) return true;
   if (/dilinkappserver/i.test(host) && /\/club\//i.test(url) && item.request.length >= 64) return true;
@@ -461,7 +462,7 @@ function buildNoCookieTip() {
     "若打开签到页仍无新诊断：可能 App 对 dilink 证书固定，MitM 看不到包，把最新 [BYD capture] 日志发我";
   if (diag) {
     tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 700);
-    if (/dilinksuper|vehicleRealTime|getStatusNow/i.test(diag) && !/dilinkappserver|\/club\/|Sign\.signIn|mina\.byd/i.test(diag)) {
+    if (/vehicleRealTime|getStatusNow|superappserver/i.test(diag) && !/dilinkappserver|\/club\/|Sign\.signIn|mina\.byd/i.test(diag)) {
       tip += "\n—— 解读 ——\n只有车况/小组件流量，没有主 App 签到流量。请进主 App 签到页；若仍无 dilinkappserver 诊断，优先怀疑证书固定/重写未生效。";
     }
   } else {
@@ -488,7 +489,7 @@ function GetCookie() {
     const opType = (req.headers && (req.headers["Operation-Type"] || req.headers["operation-type"])) || "";
 
     const isMina = /mina\.byd\.com/i.test(host) || /\/mgw\.htm/i.test(url);
-    const isVehicleNoise = /vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data|dilinksuperappserver/i.test(url + " " + host);
+    const isVehicleNoise = /vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data/i.test(url) || /superappserver/i.test(host);
     // 明确签到，或 dilinkappserver + /club/ （公开资料中的积分 club 网关）
     const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall|\/club\//i.test(url);
     const isAppServer = /dilinkappserver/i.test(host);

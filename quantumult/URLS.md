@@ -104,7 +104,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 
 1. 开启 MITM，信任证书；**重写资源右上角强制更新**
 2. hostname 应含：`dilinkappserver-cn.byd.auto`、`dilinkappserver.byd.auto`、`mina.byd.com`  
-   **不要**加 `dilinksuperappserver`（车况/控件无效）
+   **不要**加 车况 super 域名（无效）
 3. **彻底杀掉比亚迪进程**后打开主 App（不是桌面小组件）
 4. 我的 → **每日签到 / 积分商城 / 福利**，点一次签到
 5. 成功通知：`比亚迪签到凭证新增/更新成功`，日志 `signLike=1` 且 URL 含 `club`/`Sign.signIn`
@@ -139,7 +139,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 7. 再手动运行任务验证
 
 若仍失败：查看 QX 日志中的 `[BYD capture]`：
-- 时间戳仍是旧的 `dilinksuper...vehicleRealTime`：主 App 签到流量没进来
+- 时间戳仍是旧的车况 `vehicleRealTime`：主 App 签到流量没进来
 - 出现 `host=mina.byd.com`：主 App 网关可达，继续进签到页找 `dilinkappserver`
 - 出现 `host=dilinkappserver... /club/` 且 `signLike=1`：应已入库
 - 出现「未确认签到 URL」通知：把完整 URL 发我放宽规则
@@ -169,7 +169,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_di
 这些是**车况/小组件接口**，`request` 字段不能用于积分签到。
 
 正确姿势：
-1. 更新 rewrite 到最新（已排除 `dilinksuperappserver`）
+1. 更新 rewrite 到最新（已排除车况 super 域名）
 2. 打开 App → **我的/积分/签到/福利** 页，点一次「签到」
 3. 日志应出现 URL 含 `club` 或 `Sign.signIn`，且 `signLike=1`
 4. 再运行定时任务
