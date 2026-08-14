@@ -1,0 +1,4 @@
+# 比亚迪 App 每日签到
+# 先挂 rewrite/BYD_DailyBonus.conf，登录 App 后打开一次「积分商城/签到」页抓取凭证
+
+10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
