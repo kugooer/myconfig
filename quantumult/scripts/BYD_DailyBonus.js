@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v8-binary-replay)
+  更新时间: 2026.08.14 (capture-v8.1-newest-mina)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -214,6 +214,7 @@ function normalizeCookie(input) {
         headers: input.headers || null,
         opType: input.opType || "",
         productId: input.productId || "",
+        update: input.update || "",
         signLike: true,
         _manual: !!input._manual
       };
@@ -869,24 +870,41 @@ function pickBestMinaCandidate() {
   } catch (e) {
     last = null;
   }
-  const all = [];
-  if (last) all.push(last);
-  ring.forEach((x) => all.push(x));
 
-  // 排除配置开关类 RPC
-  const usable = all.filter((x) => {
-    if (!x || !x.url) return false;
-    if (!(x.body || x.bodyB64)) return false;
+  // 合并去重：优先保留 update 较新的条目
+  const map = {};
+  const pushOne = (x) => {
+    if (!x || !x.url || !(x.body || x.bodyB64)) return;
     const op = String(x.opType || "");
-    if (/switches\.all\.get|afterloginPb|alipay\.client\.switches/i.test(op)) return false;
-    return true;
-  });
+    // 排除配置开关/资源类 RPC（进首页噪音）
+    if (/switches\.all\.get|afterloginPb|alipay\.client\.switches|getUnionResource/i.test(op)) return;
+    const key = (x.bodyHex || "") + ":" + (x.bodyLen || 0) + ":" + String(x.bodyB64 || "").slice(0, 24);
+    const old = map[key];
+    if (!old) {
+      map[key] = x;
+      return;
+    }
+    const ot = Date.parse(old.update || 0) || 0;
+    const nt = Date.parse(x.update || 0) || 0;
+    if (nt >= ot) map[key] = x;
+  };
+  ring.forEach(pushOne);
+  pushOne(last);
 
-  // 优先 com.app.dynasty.srv，且 bodyLen 较大者
+  const usable = Object.keys(map).map((k) => map[k]);
+
+  // 点完签到后立刻 Mark：取「最新」dynasty.srv，而不是 body 最大
+  // 进签到页往往会先发较大 body 的查询包；真正签到包通常更靠后
   usable.sort((a, b) => {
     const sa = /com\.app\.dynasty\.srv/i.test(String(a.opType || "")) ? 1 : 0;
     const sb = /com\.app\.dynasty\.srv/i.test(String(b.opType || "")) ? 1 : 0;
     if (sa !== sb) return sb - sa;
+    const ta = Date.parse(a.update || 0) || 0;
+    const tb = Date.parse(b.update || 0) || 0;
+    if (ta !== tb) return tb - ta;
+    const ba = a.bodyB64 ? 1 : 0;
+    const bb = b.bodyB64 ? 1 : 0;
+    if (ba !== bb) return bb - ba;
     return (Number(b.bodyLen) || 0) - (Number(a.bodyLen) || 0);
   });
   return usable[0] || last || ring[0] || null;
@@ -1082,6 +1100,8 @@ function markLastMinaAsSign() {
     `bodyLen: ${item.bodyLen || String(item.body || "").length}\n` +
     `hex: ${item.bodyHex || toHexPreview(item.body, 16)}\n` +
     `hasB64: ${item.bodyB64 ? 1 : 0}\n` +
+    `capturedAt: ${item.update || last.update || "-"}\n` +
+    "说明：已按「最新 dynasty.srv」选取（不是 body 最大）\n" +
     "请立刻把 MarkMinaAsSign 改回 false，再手动运行一次任务做回放验证\n" +
     "若回放仍失败：把通知里的 http/respHex/BYD_LastReplay 发我"
   );
