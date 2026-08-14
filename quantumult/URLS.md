@@ -103,9 +103,9 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 ### 挂载后操作
 
 1. 开启 MITM，信任证书
-2. 确认 hostname：`dilinkappserver-cn.byd.auto`、`dilinksuperappserver-cn.byd.auto`、`dilinkappserver.byd.auto`
+2. 确认 hostname **仅**：`dilinkappserver-cn.byd.auto`、`dilinkappserver.byd.auto`（**不要**加 `dilinksuperappserver`，那是车况/控件域）
 3. 打开 **比亚迪 App**，保持登录
-4. 进入 **积分商城/签到**（必要时手动点一次签到），看到「凭证新增/更新成功」
+4. 进入 **积分商城/签到/福利**（必要时手动点一次签到），直到通知「凭证新增/更新成功」，且日志 `signLike=1`、URL 含 `club`/`Sign.signIn`
 5. 之后由定时任务每日自动签到；凭证失效后重复第 4 步
 
 ---
@@ -121,18 +121,20 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 报错 `未获取到签到凭证` 表示定时任务正常，但 **还没有成功抓到 `request`**。
 
 按顺序确认：
-1. 更新并启用重写：`quantumult/rewrite/BYD_DailyBonus.conf`
+1. 更新并启用重写：`quantumult/rewrite/BYD_DailyBonus.conf`（右上角强制更新）
 2. QX：`MitM → HTTPS 解密` 开启，已安装/信任证书
-3. hostname 包含：
+3. hostname 仅：
    - `dilinkappserver-cn.byd.auto`
-   - `dilinksuperappserver-cn.byd.auto`
-4. 不要只跑定时任务：必须先打开比亚迪 App → **积分商城/签到**，必要时**点一次签到**
-5. 成功时应弹通知：`比亚迪签到凭证新增/更新成功`
-6. 再手动运行任务验证
+   - `dilinkappserver.byd.auto`
+4. 若本地曾保存车况凭证：清空 `BYD_Cookie` / `BYD_Cookies`（或在脚本临时设 `DeleteCookie=true` 跑一次）
+5. 不要只跑定时任务：必须先打开比亚迪 App → **积分商城/签到**，必要时**点一次签到**
+6. 成功通知：`比亚迪签到凭证新增/更新成功`（内容应显示 url 含 Sign/club）
+7. 再手动运行任务验证
 
-若仍失败：查看 QX 日志中的 `[BYD capture]` 行，或失败通知里的「最近抓包诊断」。
-- 诊断为「无」：rewrite/MitM 未命中 dilink
-- 有 URL 无 request：需要根据真实接口再适配
+若仍失败：查看 QX 日志中的 `[BYD capture]`：
+- `signLike=0` 且 URL 含 `vehicleRealTime`/`getStatusNow`/`query_configs`：这是车况，**忽略**；请进签到页再点一次
+- 无任何 `[BYD capture]`：rewrite/MitM 未命中 `dilinkappserver`
+- `signLike=1` 但「无 request」：把该 URL 发我继续适配
 
 
 ### 分流直连（推荐，防网络错误）
@@ -151,3 +153,14 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_di
 3. 策略里把 `*.byd.auto`、`*.bydauto.com.cn` 设为 **DIRECT**（仍可对 rewrite 命中域名解密）
 4. 若仍报网络错误：先禁用该重写资源，确认 App 恢复，再只启用最新 conf
 5. 抓凭证时：保持 rewrite 开启 → 进入签到页点一次 → 出现「凭证成功」通知后，可临时关闭 rewrite 只留定时任务
+
+
+### 日志里大量 vehicleRealTime / getStatusNow 且 signLike=0
+
+这些是**车况/小组件接口**，`request` 字段不能用于积分签到。
+
+正确姿势：
+1. 更新 rewrite 到最新（已排除 `dilinksuperappserver`）
+2. 打开 App → **我的/积分/签到/福利** 页，点一次「签到」
+3. 日志应出现 URL 含 `club` 或 `Sign.signIn`，且 `signLike=1`
+4. 再运行定时任务

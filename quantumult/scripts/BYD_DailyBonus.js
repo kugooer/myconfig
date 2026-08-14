@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v3-narrow)
+  更新时间: 2026.08.14 (capture-v4-signOnly)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -35,31 +35,31 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/URLS.md
 【Surge】
 ----------------
 [Script]
-比亚迪_获取CK = type=http-request,pattern=^https:\/\/dilink(super)?appserver(-cn)?\.byd\.auto\/.*Sign\.signIn,requires-body=1,max-size=0,script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js
+比亚迪_获取CK = type=http-request,pattern=^https:\/\/dilinkappserver(-cn)?\.byd\.auto\/.*(club|Sign\.signIn|integralMall),requires-body=1,max-size=0,script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js
 比亚迪_每日签到 = type=cron,cronexp=10 8 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js
 
 [MITM]
-hostname = dilinkappserver-cn.byd.auto, dilinksuperappserver-cn.byd.auto, dilinkappserver.byd.auto
+hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
 
 【Quantumult X】
 ----------------
 [rewrite_local]
-^https:\/\/dilink(super)?appserver(-cn)?\.byd\.auto\/.*Sign\.signIn url script-request-body https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js
+^https:\/\/dilinkappserver(-cn)?\.byd\.auto\/.*(club|Sign\.signIn|integralMall) url script-request-body https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js
 
 [task_local]
 10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到, enabled=true
 
 [mitm]
-hostname = dilinkappserver-cn.byd.auto, dilinksuperappserver-cn.byd.auto, dilinkappserver.byd.auto
+hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
 
 【Loon】
 ----------------
 [Script]
-http-request ^https:\/\/dilink(super)?appserver(-cn)?\.byd\.auto\/.*Sign\.signIn script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, requires-body=true, timeout=10, tag=比亚迪_获取CK
+http-request ^https:\/\/dilinkappserver(-cn)?\.byd\.auto\/.*(club|Sign\.signIn|integralMall) script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, requires-body=true, timeout=10, tag=比亚迪_获取CK
 cron "10 8 * * *" script-path=https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪_每日签到
 
 [Mitm]
-hostname = dilinkappserver-cn.byd.auto, dilinksuperappserver-cn.byd.auto, dilinkappserver.byd.auto
+hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto
 
 【Node.js】
 ----------------
@@ -119,37 +119,54 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
   }
 })();
 
+function isValidSignCookie(item) {
+  if (!item || !item.request) return false;
+  if (item._manual) return true;
+  const url = String(item.url || "");
+  if (item.signLike === true) return true;
+  if (/Sign\.signIn|serviceDir=Sign|integralMall|\/club\//i.test(url)) return true;
+  if (/vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data/i.test(url)) return false;
+  return false;
+}
+
 function ReadCookies() {
   const list = [];
   const multi = $nobyda.read("BYD_Cookies");
-  const single = $nobyda.read("BYD_Cookie") || OtherKey;
+  const single = $nobyda.read("BYD_Cookie");
+
+  const pushIf = (ck) => {
+    if (ck && isValidSignCookie(ck)) list.push(ck);
+    else if (ck) console.log("[BYD] 忽略非签到凭证: " + String(ck.url || ck.name || "").slice(0, 140));
+  };
 
   if (multi) {
     try {
       const arr = JSON.parse(multi);
-      if (Array.isArray(arr)) {
-        arr.forEach((item) => {
-          const ck = normalizeCookie(item);
-          if (ck) list.push(ck);
-        });
-      }
+      if (Array.isArray(arr)) arr.forEach((item) => pushIf(normalizeCookie(item)));
     } catch (e) {
       console.log("BYD_Cookies 解析失败: " + e.message);
     }
   }
 
-  if (!list.length && single) {
-    String(single)
+  if (single) {
+    pushIf(normalizeCookie(single));
+  }
+
+  // 脚本内 OtherKey 手填
+  if (OtherKey && String(OtherKey).trim()) {
+    String(OtherKey)
       .split(/[\n&]+/)
       .map((s) => s.trim())
       .filter(Boolean)
       .forEach((raw) => {
         const ck = normalizeCookie(raw);
-        if (ck) list.push(ck);
+        if (ck) {
+          ck._manual = true;
+          list.push(ck);
+        }
       });
   }
 
-  // 去重: request 前 32 位
   const seen = {};
   return list.filter((item) => {
     const k = (item.request || "").slice(0, 32);
@@ -440,7 +457,7 @@ function buildNoCookieTip() {
   if (diag) {
     tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 500);
   } else {
-    tip += "\n—— 最近抓包诊断 ——\n无: 说明 rewrite/MitM 可能未命中任何 dilink 请求";
+    tip += "\n—— 最近抓包诊断 ——\n无有效签到包: 当前可能只抓到了车况接口，请进入「积分商城/签到」并点一次签到";
   }
   return tip;
 }
@@ -460,16 +477,21 @@ function GetCookie() {
     const bodyText = typeof req.body === "string" ? req.body : (req.body ? String(req.body) : "");
     const method = req.method || "";
 
-    // 记录诊断，便于定时任务失败时提示
-    const isBydHost = /byd\.auto|bydauto\.com|mina\.byd\.com/i.test(url + " " + host);
-    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall/i.test(url);
+    // 只认签到/积分 club；车况/控件一律忽略（你日志里的 vehicleRealTime* 都是无效凭证）
+    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall|\/club\/\?/i.test(url);
+    const isVehicleNoise = /vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data/i.test(url);
+
     const diagLine =
       new Date().toISOString() +
       ` | ${method} | host=${host || "-"} | bodyLen=${bodyText.length} | signLike=${isSignLike ? 1 : 0} | url=${url.slice(0, 220)}`;
     console.log("[BYD capture] " + diagLine);
     appendDiag(diagLine);
 
-    if (!isBydHost) {
+    // 非签到接口：静默放行，不通知、不入库
+    if (!isSignLike || isVehicleNoise) {
+      if (isVehicleNoise) {
+        console.log("[BYD] 忽略车况/控件请求（不能用于签到）");
+      }
       $nobyda.done({});
       return;
     }
@@ -484,9 +506,8 @@ function GetCookie() {
       } catch (e) {
         const m1 = bodyText.match(/(?:^|[&?])request=([^&]+)/i);
         if (m1) requestVal = decodeURIComponent(m1[1].replace(/\+/g, " "));
-        // JSON 被截断或夹杂时兜底
         if (!requestVal) {
-          const m2 = bodyText.match(/"request"\s*:\s*"([0-9A-Fa-f+/=]{32,})"/);
+          const m2 = bodyText.match(/"request"\s*:\s*"([^"]{32,})"/);
           if (m2) requestVal = m2[1];
         }
       }
@@ -502,45 +523,29 @@ function GetCookie() {
       requestVal = bodyText.trim();
     }
 
-    // 非签到类、且 body 无 request：只记诊断不打扰
     if (!requestVal) {
-      if (isSignLike) {
-        const msg =
-          "已命中疑似签到请求，但 body 无 request 字段\n" +
-          `url: ${url.slice(0, 180)}\n` +
-          `bodyLen: ${bodyText.length}\n` +
-          "请在 QX 日志查看 [BYD capture] 完整 URL，并把该请求发我适配";
-        console.log("[BYD] " + msg);
-        $nobyda.notify("比亚迪抓包", "未解析到 request", msg);
-      }
+      const msg =
+        "已命中签到相关 URL，但 body 无 request\n" +
+        `url: ${url.slice(0, 200)}\n` +
+        `bodyLen: ${bodyText.length}\n` +
+        "请把该 URL 发我继续适配";
+      console.log("[BYD] " + msg);
+      $nobyda.notify("比亚迪抓包", "签到请求无 request", msg);
       $nobyda.done({});
       return;
     }
 
-    // 有 request 密文：签到页优先保存；其它 dilink 也保存为备选（前缀标记）
     const item = {
       request: requestVal,
       host: String(host || HOST).replace(/:\d+$/, ""),
       url: url,
-      name: isSignLike ? "签到页" : " dilink-request",
+      name: "签到页",
       headers: sanitizeHeaders(req.headers || {}),
       update: new Date().toISOString(),
-      signLike: !!isSignLike
+      signLike: true
     };
 
-    // 若已有明确签到凭证，非签到类 request 不覆盖单账号键
-    const prevRaw = $nobyda.read("BYD_Cookie");
-    let prev = null;
-    try {
-      prev = prevRaw ? JSON.parse(prevRaw) : null;
-    } catch (e) {
-      prev = null;
-    }
-
-    const shouldWritePrimary = isSignLike || !prev || !prev.request || prev.signLike === false;
-    if (shouldWritePrimary) {
-      $nobyda.write(JSON.stringify(item), "BYD_Cookie");
-    }
+    $nobyda.write(JSON.stringify(item), "BYD_Cookie");
 
     let list = [];
     try {
@@ -550,34 +555,34 @@ function GetCookie() {
       list = [];
     }
 
+    // 清理历史车况脏数据
+    list = list
+      .map((x) => normalizeCookie(x))
+      .filter((x) => x && isValidSignCookie(x));
+
     const key = requestVal.slice(0, 32);
     let type = "新增";
     let found = false;
     list = list.map((old) => {
-      const o = normalizeCookie(old);
-      if (o && (o.request || "").slice(0, 32) === key) {
+      if (old && (old.request || "").slice(0, 32) === key) {
         found = true;
         type = "更新";
-        return Object.assign({}, o, item);
+        return item;
       }
-      return o || old;
+      return old;
     });
-    if (!found) {
-      // 签到类置顶
-      if (isSignLike) list.unshift(item);
-      else list.push(item);
-    }
-    // 最多保留 10 条
+    if (!found) list.unshift(item);
     list = list.slice(0, 10);
     $nobyda.write(JSON.stringify(list), "BYD_Cookies");
+    $nobyda.write("", "BYD_CaptureDiag"); // 成功后清诊断噪音
 
     const tip =
       `类型: ${type}\n` +
       `host: ${item.host}\n` +
-      `signLike: ${isSignLike ? "是" : "否"}\n` +
+      `url含Sign/club: 是\n` +
       `request: ${requestVal.slice(0, 16)}...(${requestVal.length})\n` +
-      (isSignLike ? "可手动运行「比亚迪签到」任务验证" : "已缓存 request，建议再进一次签到页以获得 signIn 凭证");
-    console.log("\n比亚迪凭证" + type + "成功\n" + tip);
+      "可手动运行「比亚迪签到」任务";
+    console.log("\n比亚迪签到凭证" + type + "成功\n" + tip);
     $nobyda.notify("比亚迪签到凭证" + type + "成功", item.host, tip);
   } catch (e) {
     console.log("GetCookie 异常: " + (e.stack || e));
@@ -585,6 +590,7 @@ function GetCookie() {
   }
   $nobyda.done({});
 }
+
 
 function appendDiag(line) {
   try {
