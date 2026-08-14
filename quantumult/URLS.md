@@ -100,13 +100,19 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
 ```
 
-### 挂载后操作
+### 挂载后操作（capture-v5）
 
-1. 开启 MITM，信任证书
-2. 确认 hostname **仅**：`dilinkappserver-cn.byd.auto`、`dilinkappserver.byd.auto`（**不要**加 `dilinksuperappserver`，那是车况/控件域）
-3. 打开 **比亚迪 App**，保持登录
-4. 进入 **积分商城/签到/福利**（必要时手动点一次签到），直到通知「凭证新增/更新成功」，且日志 `signLike=1`、URL 含 `club`/`Sign.signIn`
-5. 之后由定时任务每日自动签到；凭证失效后重复第 4 步
+1. 开启 MITM，信任证书；**重写资源右上角强制更新**
+2. hostname 应含：`dilinkappserver-cn.byd.auto`、`dilinkappserver.byd.auto`、`mina.byd.com`  
+   **不要**加 `dilinksuperappserver`（车况/控件无效）
+3. **彻底杀掉比亚迪进程**后打开主 App（不是桌面小组件）
+4. 我的 → **每日签到 / 积分商城 / 福利**，点一次签到
+5. 成功通知：`比亚迪签到凭证新增/更新成功`，日志 `signLike=1` 且 URL 含 `club`/`Sign.signIn`
+6. 再手动运行定时任务；凭证失效后重复第 4 步
+
+若打开签到页「没有任何反应」且日志无新的 `[BYD capture]`（诊断时间戳仍是旧车况）：
+- rewrite/MitM 未命中主 App 流量，或 dilink 证书固定导致看不到包
+- 请更新 v5 后重进签到页，把**最新**日志发我
 
 ---
 
@@ -123,17 +129,20 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 按顺序确认：
 1. 更新并启用重写：`quantumult/rewrite/BYD_DailyBonus.conf`（右上角强制更新）
 2. QX：`MitM → HTTPS 解密` 开启，已安装/信任证书
-3. hostname 仅：
+3. hostname 含：
    - `dilinkappserver-cn.byd.auto`
    - `dilinkappserver.byd.auto`
-4. 若本地曾保存车况凭证：清空 `BYD_Cookie` / `BYD_Cookies`（或在脚本临时设 `DeleteCookie=true` 跑一次）
-5. 不要只跑定时任务：必须先打开比亚迪 App → **积分商城/签到**，必要时**点一次签到**
-6. 成功通知：`比亚迪签到凭证新增/更新成功`（内容应显示 url 含 Sign/club）
+   - `mina.byd.com`（诊断用）
+4. 清空旧脏凭证：`BYD_Cookie` / `BYD_Cookies` / `BYD_CaptureDiag`（或 `DeleteCookie=true` 跑一次）
+5. 主 App → **我的 → 每日签到**，点一次签到（不是小组件刷新）
+6. 成功通知：`比亚迪签到凭证新增/更新成功`
 7. 再手动运行任务验证
 
 若仍失败：查看 QX 日志中的 `[BYD capture]`：
-- `signLike=0` 且 URL 含 `vehicleRealTime`/`getStatusNow`/`query_configs`：这是车况，**忽略**；请进签到页再点一次
-- 无任何 `[BYD capture]`：rewrite/MitM 未命中 `dilinkappserver`
+- 时间戳仍是旧的 `dilinksuper...vehicleRealTime`：主 App 签到流量没进来
+- 出现 `host=mina.byd.com`：主 App 网关可达，继续进签到页找 `dilinkappserver`
+- 出现 `host=dilinkappserver... /club/` 且 `signLike=1`：应已入库
+- 出现「未确认签到 URL」通知：把完整 URL 发我放宽规则
 - `signLike=1` 但「无 request」：把该 URL 发我继续适配
 
 
@@ -148,8 +157,8 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_di
 原因通常是 **MITM 范围过大** 或 **脚本拦截了非签到接口**，App 证书校验/关键链路失败。
 
 处理：
-1. 更新 rewrite 到最新（已收窄为仅 `Sign.signIn` / `integralMall` / `club` 签到相关）
-2. 关闭对 `mina.byd.com`、地图、埋点域名的 MITM
+1. 更新 rewrite 到最新 capture-v5（不 MitM 车况 super 域）
+2. 关闭地图/埋点等无关 MITM；`mina.byd.com` 仅用于诊断，若导致异常可临时去掉
 3. 策略里把 `*.byd.auto`、`*.bydauto.com.cn` 设为 **DIRECT**（仍可对 rewrite 命中域名解密）
 4. 若仍报网络错误：先禁用该重写资源，确认 App 恢复，再只启用最新 conf
 5. 抓凭证时：保持 rewrite 开启 → 进入签到页点一次 → 出现「凭证成功」通知后，可临时关闭 rewrite 只留定时任务

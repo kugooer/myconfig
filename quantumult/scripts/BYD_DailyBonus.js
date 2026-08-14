@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v4-signOnly)
+  更新时间: 2026.08.14 (capture-v5-discover)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -93,7 +93,8 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
     if (DeleteCookie) {
       $nobyda.write("", "BYD_Cookie");
       $nobyda.write("", "BYD_Cookies");
-      throw new Error("已清除比亚迪签到凭证，请重新打开 App 签到页抓取 ‼️");
+      $nobyda.write("", "BYD_CaptureDiag");
+      throw new Error("已清除比亚迪签到凭证/诊断，请重新打开 App 签到页抓取 ‼️");
     }
 
     if ($nobyda.isRequest) {
@@ -123,9 +124,11 @@ function isValidSignCookie(item) {
   if (!item || !item.request) return false;
   if (item._manual) return true;
   const url = String(item.url || "");
+  const host = String(item.host || "");
+  if (/vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data|dilinksuper/i.test(url + host)) return false;
   if (item.signLike === true) return true;
   if (/Sign\.signIn|serviceDir=Sign|integralMall|\/club\//i.test(url)) return true;
-  if (/vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data/i.test(url)) return false;
+  if (/dilinkappserver/i.test(host) && /\/club\//i.test(url) && item.request.length >= 64) return true;
   return false;
 }
 
@@ -447,23 +450,28 @@ function buildNoCookieTip() {
   const diag = $nobyda.read("BYD_CaptureDiag") || "";
   let tip =
     "未获取到签到凭证 ‼️\n" +
-    "请按顺序检查:\n" +
-    "1) 重写资源已启用并更新到最新\n" +
-    "2) MITM 已开 HTTPS 解密，信任证书\n" +
-    "3) hostname 仅签到域，不要对整站 BYD 强制代理/解密\n" +
-    "3b) 策略：比亚迪相关域名可 DIRECT，只保留 rewrite 解密\n" +
-    "4) 打开比亚迪 App → 积分商城/签到页（必要时点一次签到）\n" +
-    "5) 看到「凭证新增/更新成功」后再跑定时任务";
+    "当前没有可用 Sign/club 凭证（小组件车况 request 无效）。\n" +
+    "请严格按下面步骤：\n" +
+    "1) 重写资源强制更新到 capture-v5\n" +
+    "2) MitM 开 HTTPS 解密并信任证书；hostname 含 dilinkappserver-cn.byd.auto、mina.byd.com\n" +
+    "3) 策略 BYD 域名 DIRECT（保留 rewrite 解密）\n" +
+    "4) 彻底杀进程后打开「比亚迪」主 App（非小组件）\n" +
+    "5) 我的 → 每日签到 / 积分商城，点一次签到\n" +
+    "6) 应出现「凭证新增/更新成功」；再跑定时任务\n" +
+    "若打开签到页仍无新诊断：可能 App 对 dilink 证书固定，MitM 看不到包，把最新 [BYD capture] 日志发我";
   if (diag) {
-    tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 500);
+    tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 700);
+    if (/dilinksuper|vehicleRealTime|getStatusNow/i.test(diag) && !/dilinkappserver|\/club\/|Sign\.signIn|mina\.byd/i.test(diag)) {
+      tip += "\n—— 解读 ——\n只有车况/小组件流量，没有主 App 签到流量。请进主 App 签到页；若仍无 dilinkappserver 诊断，优先怀疑证书固定/重写未生效。";
+    }
   } else {
-    tip += "\n—— 最近抓包诊断 ——\n无有效签到包: 当前可能只抓到了车况接口，请进入「积分商城/签到」并点一次签到";
+    tip += "\n—— 最近抓包诊断 ——\n无。说明 rewrite 完全未命中。请强制更新重写并确认 MitM hostname。";
   }
   return tip;
 }
 
 function GetCookie() {
-  // 只读取 body 写本地凭证，不改请求；最后 $done({}) 原样放行
+  // 只读取 body/header 写本地凭证或诊断，不改请求；最后 $done({}) 原样放行
   try {
     const req = typeof $request !== "undefined" ? $request : null;
     if (!req || !req.url) {
@@ -473,25 +481,37 @@ function GetCookie() {
     }
 
     const url = String(req.url || "");
-    const host = (req.headers && (req.headers.Host || req.headers.host)) || extractHost(url) || "";
+    const hostRaw = (req.headers && (req.headers.Host || req.headers.host)) || extractHost(url) || "";
+    const host = String(hostRaw).replace(/:\d+$/, "");
     const bodyText = typeof req.body === "string" ? req.body : (req.body ? String(req.body) : "");
     const method = req.method || "";
+    const opType = (req.headers && (req.headers["Operation-Type"] || req.headers["operation-type"])) || "";
 
-    // 只认签到/积分 club；车况/控件一律忽略（你日志里的 vehicleRealTime* 都是无效凭证）
-    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall|\/club\/\?/i.test(url);
-    const isVehicleNoise = /vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data/i.test(url);
+    const isMina = /mina\.byd\.com/i.test(host) || /\/mgw\.htm/i.test(url);
+    const isVehicleNoise = /vehicleRealTime|getStatusNow|query_configs|externalControl|external\/vehicle|cloud-app-api\/data|dilinksuperappserver/i.test(url + " " + host);
+    // 明确签到，或 dilinkappserver + /club/ （公开资料中的积分 club 网关）
+    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall|\/club\//i.test(url);
+    const isAppServer = /dilinkappserver/i.test(host);
+    const canTryStore = isSignLike || (isAppServer && !isVehicleNoise && !isMina);
 
     const diagLine =
       new Date().toISOString() +
-      ` | ${method} | host=${host || "-"} | bodyLen=${bodyText.length} | signLike=${isSignLike ? 1 : 0} | url=${url.slice(0, 220)}`;
+      ` | ${method} | host=${host || "-"} | bodyLen=${bodyText.length} | signLike=${isSignLike ? 1 : 0} | app=${isAppServer ? 1 : 0}` +
+      (opType ? ` | op=${String(opType).slice(0, 80)}` : "") +
+      ` | url=${url.slice(0, 180)}`;
     console.log("[BYD capture] " + diagLine);
     appendDiag(diagLine);
 
-    // 非签到接口：静默放行，不通知、不入库
-    if (!isSignLike || isVehicleNoise) {
-      if (isVehicleNoise) {
-        console.log("[BYD] 忽略车况/控件请求（不能用于签到）");
-      }
+    // mina 统一网关：多为 protobuf 加密，只能诊断
+    if (isMina) {
+      console.log("[BYD] mina 网关诊断: " + (opType || "(no Operation-Type)") + " — 不入库");
+      $nobyda.done({});
+      return;
+    }
+
+    // 车况/super：忽略
+    if (isVehicleNoise || !canTryStore) {
+      if (isVehicleNoise) console.log("[BYD] 忽略车况/控件请求（不能用于签到）");
       $nobyda.done({});
       return;
     }
@@ -524,13 +544,27 @@ function GetCookie() {
     }
 
     if (!requestVal) {
+      if (isSignLike) {
+        const msg =
+          "已命中签到相关 URL，但 body 无 request\n" +
+          `url: ${url.slice(0, 200)}\n` +
+          `bodyLen: ${bodyText.length}\n` +
+          "请把该 URL 发我继续适配";
+        console.log("[BYD] " + msg);
+        $nobyda.notify("比亚迪抓包", "签到请求无 request", msg);
+      }
+      $nobyda.done({});
+      return;
+    }
+
+    if (!isSignLike) {
       const msg =
-        "已命中签到相关 URL，但 body 无 request\n" +
-        `url: ${url.slice(0, 200)}\n` +
-        `bodyLen: ${bodyText.length}\n` +
-        "请把该 URL 发我继续适配";
+        "命中 dilinkappserver 且含 request，但 URL 非 Sign/club\n" +
+        `url: ${url.slice(0, 220)}\n` +
+        `requestLen: ${requestVal.length}\n` +
+        "若这是签到页发出的请求，把完整 URL 发我，我会放宽入库规则";
       console.log("[BYD] " + msg);
-      $nobyda.notify("比亚迪抓包", "签到请求无 request", msg);
+      $nobyda.notify("比亚迪抓包诊断", "未确认签到 URL", msg);
       $nobyda.done({});
       return;
     }
@@ -555,7 +589,6 @@ function GetCookie() {
       list = [];
     }
 
-    // 清理历史车况脏数据
     list = list
       .map((x) => normalizeCookie(x))
       .filter((x) => x && isValidSignCookie(x));
@@ -574,12 +607,12 @@ function GetCookie() {
     if (!found) list.unshift(item);
     list = list.slice(0, 10);
     $nobyda.write(JSON.stringify(list), "BYD_Cookies");
-    $nobyda.write("", "BYD_CaptureDiag"); // 成功后清诊断噪音
+    $nobyda.write("", "BYD_CaptureDiag");
 
     const tip =
       `类型: ${type}\n` +
       `host: ${item.host}\n` +
-      `url含Sign/club: 是\n` +
+      `url: ${url.slice(0, 160)}\n` +
       `request: ${requestVal.slice(0, 16)}...(${requestVal.length})\n` +
       "可手动运行「比亚迪签到」任务";
     console.log("\n比亚迪签到凭证" + type + "成功\n" + tip);
