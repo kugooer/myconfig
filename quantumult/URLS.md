@@ -133,3 +133,21 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 若仍失败：查看 QX 日志中的 `[BYD capture]` 行，或失败通知里的「最近抓包诊断」。
 - 诊断为「无」：rewrite/MitM 未命中 dilink
 - 有 URL 无 request：需要根据真实接口再适配
+
+
+### 分流直连（推荐，防网络错误）
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_direct.snippet
+```
+
+### 挂载后 App 提示「网络错误」
+
+原因通常是 **MITM 范围过大** 或 **脚本拦截了非签到接口**，App 证书校验/关键链路失败。
+
+处理：
+1. 更新 rewrite 到最新（已收窄为仅 `Sign.signIn` / `integralMall` / `club` 签到相关）
+2. 关闭对 `mina.byd.com`、地图、埋点域名的 MITM
+3. 策略里把 `*.byd.auto`、`*.bydauto.com.cn` 设为 **DIRECT**（仍可对 rewrite 命中域名解密）
+4. 若仍报网络错误：先禁用该重写资源，确认 App 恢复，再只启用最新 conf
+5. 抓凭证时：保持 rewrite 开启 → 进入签到页点一次 → 出现「凭证成功」通知后，可临时关闭 rewrite 只留定时任务

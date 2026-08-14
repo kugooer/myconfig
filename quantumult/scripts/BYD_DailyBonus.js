@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v2)
+  更新时间: 2026.08.14 (capture-v3-narrow)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -433,7 +433,8 @@ function buildNoCookieTip() {
     "请按顺序检查:\n" +
     "1) 重写资源已启用并更新到最新\n" +
     "2) MITM 已开 HTTPS 解密，信任证书\n" +
-    "3) hostname 含 dilinkappserver-cn.byd.auto / dilinksuperappserver-cn.byd.auto\n" +
+    "3) hostname 仅签到域，不要对整站 BYD 强制代理/解密\n" +
+    "3b) 策略：比亚迪相关域名可 DIRECT，只保留 rewrite 解密\n" +
     "4) 打开比亚迪 App → 积分商城/签到页（必要时点一次签到）\n" +
     "5) 看到「凭证新增/更新成功」后再跑定时任务";
   if (diag) {
@@ -445,6 +446,7 @@ function buildNoCookieTip() {
 }
 
 function GetCookie() {
+  // 只读取 body 写本地凭证，不改请求；最后 $done({}) 原样放行
   try {
     const req = typeof $request !== "undefined" ? $request : null;
     if (!req || !req.url) {
@@ -460,7 +462,7 @@ function GetCookie() {
 
     // 记录诊断，便于定时任务失败时提示
     const isBydHost = /byd\.auto|bydauto\.com|mina\.byd\.com/i.test(url + " " + host);
-    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall|[Ss]ign[Ii]n|\/club\/|积分|sign/i.test(url);
+    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall/i.test(url);
     const diagLine =
       new Date().toISOString() +
       ` | ${method} | host=${host || "-"} | bodyLen=${bodyText.length} | signLike=${isSignLike ? 1 : 0} | url=${url.slice(0, 220)}`;
@@ -833,9 +835,10 @@ function nobyda() {
   };
 
   const done = (value = {}) => {
-    if (isQuanX) return $done(value);
-    if (isSurge) isRequest ? $done(value) : $done();
-    if (isLoon) return $done(value);
+    // request 阶段：空对象表示“不修改，直接放行”
+    if (isQuanX) return $done(value || {})
+    if (isSurge) return isRequest ? $done(value || {}) : $done()
+    if (isLoon) return isRequest ? $done(value || {}) : $done()
   };
 
   return {
