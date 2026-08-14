@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v7-mina-mark)
+  更新时间: 2026.08.14 (capture-v8-binary-replay)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -136,7 +136,7 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
 function isValidSignCookie(item) {
   if (!item) return false;
   // mina 网关回放凭证
-  if (item.type === "mina" && item.body && item.url) return true;
+  if (item.type === "mina" && item.url && (item.body || item.bodyB64)) return true;
   if (!item.request) return false;
   if (item._manual) return true;
   const url = String(item.url || "");
@@ -199,11 +199,15 @@ function ReadCookies() {
 function normalizeCookie(input) {
   if (!input) return null;
   if (typeof input === "object") {
-    if (input.type === "mina" && input.body && input.url) {
+    if (input.type === "mina" && input.url && (input.body || input.bodyB64)) {
+      const bodyKey = input.bodyB64 || String(input.body || "");
       return {
         type: "mina",
-        request: String(input.body).slice(0, 64), // 去重 key
-        body: input.body,
+        request: String(bodyKey).slice(0, 64), // 去重 key
+        body: input.body || "",
+        bodyB64: input.bodyB64 || "",
+        bodyLen: input.bodyLen || 0,
+        bodyHex: input.bodyHex || "",
         host: (input.host || "mina.byd.com").replace(/^https?:\/\//, "").replace(/\/$/, ""),
         url: input.url,
         name: input.name || "mina签到",
@@ -259,18 +263,34 @@ function BYDSignIn(s, cookieItem) {
     setTimeout(() => {
       let options;
       if ((PreferMinaReplay && cookieItem && cookieItem.type === "mina") || (cookieItem && cookieItem.type === "mina")) {
-        // 回放 mPaaS 网关：尽量原样 headers + body
+        // 回放 mPaaS 网关：尽量原样 headers + bodyBytes(base64)
         const h = Object.assign({}, cookieItem.headers || {});
-        // 去掉可能被代理改写的头
         Object.keys(h).forEach((k) => {
           if (/^(Content-Length|Host|Connection|Accept-Encoding)$/i.test(k)) delete h[k];
         });
         options = {
           url: cookieItem.url || `https://${cookieItem.host || "mina.byd.com"}:31801/mgw.htm`,
-          headers: h,
-          body: cookieItem.body
+          headers: h
         };
-        console.log("[BYD] mina 回放: op=" + (cookieItem.opType || "-") + " bodyLen=" + String(cookieItem.body || "").length);
+        // 优先 bodyBytes（避免二进制经 string 损坏）
+        if (cookieItem.bodyB64) {
+          const ab = b64ToArrayBuffer(cookieItem.bodyB64);
+          if (ab) {
+            options.bodyBytes = ab;
+          } else {
+            options.body = cookieItem.body || "";
+          }
+        } else {
+          options.body = cookieItem.body || "";
+        }
+        console.log(
+          "[BYD] mina 回放: op=" +
+            (cookieItem.opType || "-") +
+            " bodyLen=" +
+            (cookieItem.bodyLen || String(cookieItem.body || "").length) +
+            " hasB64=" +
+            (cookieItem.bodyB64 ? 1 : 0)
+        );
       } else {
         const bodyObj = { request: KEY };
         const url = `https://${HOST}${SIGN_PATH}`;
@@ -293,7 +313,50 @@ function BYDSignIn(s, cookieItem) {
       $nobyda.post(options, function (error, response, data) {
         try {
           if (error) throw new Error(error);
-          const details = LogDetails ? "\nresponse:\n" + data : "";
+          const isMina = cookieItem && cookieItem.type === "mina";
+          const httpStatus = response && (response.statusCode || response.status);
+          let respHex = "";
+          let respLen = 0;
+          if (response && response.bodyBytes) {
+            try {
+              respHex = arrayBufferToHex(response.bodyBytes, 24);
+              respLen = response.bodyBytes.byteLength != null ? response.bodyBytes.byteLength : (response.bodyBytes.length || 0);
+            } catch (e) {
+              respHex = toHexPreview(data, 24);
+              respLen = data == null ? 0 : String(data).length;
+            }
+          } else {
+            respHex = toHexPreview(data, 24);
+            respLen = data == null ? 0 : String(data).length;
+          }
+          const details =
+            (LogDetails || isMina
+              ? "\nhttp=" +
+                (httpStatus == null ? "-" : httpStatus) +
+                " respLen=" +
+                respLen +
+                " respHex=" +
+                respHex +
+                "\nresponseHead:\n" +
+                String(data == null ? "" : data).slice(0, 240)
+              : "");
+          console.log("[BYD] response meta: http=" + (httpStatus == null ? "-" : httpStatus) + " len=" + respLen + " hex=" + respHex);
+
+          // 保存最近一次回放响应，方便你复制发我
+          try {
+            $nobyda.write(
+              JSON.stringify({
+                at: new Date().toISOString(),
+                http: httpStatus,
+                len: respLen,
+                hex: respHex,
+                head: String(data == null ? "" : data).slice(0, 400),
+                mina: !!isMina
+              }),
+              "BYD_LastReplay"
+            );
+          } catch (e) {}
+
           const cc = safeJSON(data);
 
           // 兼容多种返回结构
@@ -307,9 +370,38 @@ function BYDSignIn(s, cookieItem) {
           const reward = extractReward(cc);
 
           if (!cc) {
-            merge.BYDSign.notify = "比亚迪签到: 失败, 响应非 JSON ‼️";
-            merge.BYDSign.fail = 1;
-            console.log("\n比亚迪签到失败, 响应非 JSON " + details);
+            // mina/mPaaS 响应通常是二进制，不一定是失败
+            if (isMina) {
+              if (httpStatus && Number(httpStatus) >= 200 && Number(httpStatus) < 300 && respLen > 0) {
+                merge.BYDSign.notify =
+                  "比亚迪签到: mina回放已送达(HTTP " +
+                  httpStatus +
+                  "), 但响应为二进制无法自动判定成功/失败 ⚠️\n" +
+                  "respHex=" +
+                  respHex +
+                  " len=" +
+                  respLen +
+                  "\n请把本通知发我，并确认 App 积分是否变化";
+                // 不直接记 success，避免误报；记 fail 便于你继续迭代，同时附带元数据
+                merge.BYDSign.fail = 1;
+                merge.BYDSign.meta = "mina-binary-resp";
+                console.log("\n比亚迪 mina 回放响应为二进制 " + details);
+              } else {
+                merge.BYDSign.notify =
+                  "比亚迪签到: mina回放失败, HTTP=" +
+                  (httpStatus == null ? "-" : httpStatus) +
+                  ", respLen=" +
+                  respLen +
+                  " ‼️\nrespHex=" +
+                  respHex;
+                merge.BYDSign.fail = 1;
+                console.log("\n比亚迪 mina 回放失败 " + details);
+              }
+            } else {
+              merge.BYDSign.notify = "比亚迪签到: 失败, 响应非 JSON ‼️";
+              merge.BYDSign.fail = 1;
+              console.log("\n比亚迪签到失败, 响应非 JSON " + details);
+            }
           } else if (isInvalidToken(status, msg, data)) {
             merge.BYDSign.notify = "比亚迪签到: 失败, 原因: 凭证失效, 请重新打开签到页抓取 ‼️";
             merge.BYDSign.fail = 1;
@@ -576,6 +668,12 @@ function GetCookie() {
       const headerKeys = Object.keys(h).join(",");
       const bodyHex = toHexPreview(bodyText, 24);
 
+      const rawBody = getRawRequestBody(req);
+      const bodyB64 = rawBody.b64 || "";
+      const bodyForStore = rawBody.text != null ? rawBody.text : bodyText;
+      const bodyLenReal = rawBody.len != null ? rawBody.len : bodyText.length;
+      const bodyHexReal = rawBody.hex || bodyHex;
+
       const minaSnap = {
         type: "mina",
         host,
@@ -593,9 +691,11 @@ function GetCookie() {
         contentType,
         headerKeys,
         headers: sanitizeHeaders(h),
-        body: bodyText,
-        bodyLen: bodyText.length,
-        bodyHex,
+        body: bodyForStore,
+        bodyB64: bodyB64,
+        bodyLen: bodyLenReal,
+        bodyHex: bodyHexReal,
+        bodySource: rawBody.source || "text",
         update: new Date().toISOString()
       };
 
@@ -606,7 +706,7 @@ function GetCookie() {
       const diagMina =
         new Date().toISOString() +
         ` | MINA | op=${(minaSnap.opType || "-").slice(0, 80)} | product=${(productId || "-").slice(0, 28)}` +
-        ` | bodyLen=${bodyText.length} | hex=${bodyHex}` +
+        ` | bodyLen=${minaSnap.bodyLen} | hex=${minaSnap.bodyHex} | src=${minaSnap.bodySource}` +
         ` | keys=${headerKeys.slice(0, 120)}`;
       console.log("[BYD mina] " + diagMina);
       appendDiag(diagMina);
@@ -734,6 +834,137 @@ function GetCookie() {
 
 
 
+
+function getRawRequestBody(req) {
+  // 优先 bodyBytes，避免二进制经 UTF-8 string 损坏（hex 里大量 fd 就是损坏迹象）
+  try {
+    if (req && req.bodyBytes) {
+      const b64 = arrayBufferToB64(req.bodyBytes);
+      const hex = arrayBufferToHex(req.bodyBytes, 24);
+      const len = req.bodyBytes.byteLength != null ? req.bodyBytes.byteLength : (req.bodyBytes.length || 0);
+      return { source: "bodyBytes", b64: b64, hex: hex, len: len, text: "" };
+    }
+  } catch (e) {}
+  const t = typeof req.body === "string" ? req.body : (req.body ? String(req.body) : "");
+  return {
+    source: "text",
+    b64: textToB64(t),
+    hex: toHexPreview(t, 24),
+    len: t.length,
+    text: t
+  };
+}
+
+function pickBestMinaCandidate() {
+  let ring = [];
+  try {
+    ring = JSON.parse($nobyda.read("BYD_MinaRing") || "[]");
+    if (!Array.isArray(ring)) ring = [];
+  } catch (e) {
+    ring = [];
+  }
+  let last = null;
+  try {
+    last = JSON.parse($nobyda.read("BYD_MinaLast") || "null");
+  } catch (e) {
+    last = null;
+  }
+  const all = [];
+  if (last) all.push(last);
+  ring.forEach((x) => all.push(x));
+
+  // 排除配置开关类 RPC
+  const usable = all.filter((x) => {
+    if (!x || !x.url) return false;
+    if (!(x.body || x.bodyB64)) return false;
+    const op = String(x.opType || "");
+    if (/switches\.all\.get|afterloginPb|alipay\.client\.switches/i.test(op)) return false;
+    return true;
+  });
+
+  // 优先 com.app.dynasty.srv，且 bodyLen 较大者
+  usable.sort((a, b) => {
+    const sa = /com\.app\.dynasty\.srv/i.test(String(a.opType || "")) ? 1 : 0;
+    const sb = /com\.app\.dynasty\.srv/i.test(String(b.opType || "")) ? 1 : 0;
+    if (sa !== sb) return sb - sa;
+    return (Number(b.bodyLen) || 0) - (Number(a.bodyLen) || 0);
+  });
+  return usable[0] || last || ring[0] || null;
+}
+
+function arrayBufferToB64(buf) {
+  try {
+    const u8 = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf);
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let out = "";
+    for (let i = 0; i < u8.length; i += 3) {
+      const a = u8[i];
+      const b = i + 1 < u8.length ? u8[i + 1] : 0;
+      const c = i + 2 < u8.length ? u8[i + 2] : 0;
+      const n = (a << 16) | (b << 8) | c;
+      out += chars[(n >> 18) & 63] + chars[(n >> 12) & 63];
+      out += i + 1 < u8.length ? chars[(n >> 6) & 63] : "=";
+      out += i + 2 < u8.length ? chars[n & 63] : "=";
+    }
+    return out;
+  } catch (e) {
+    return "";
+  }
+}
+
+function arrayBufferToHex(buf, n) {
+  try {
+    const u8 = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf);
+    const max = Math.min(u8.length, n || 16);
+    let out = "";
+    for (let i = 0; i < max; i++) {
+      const c = u8[i];
+      out += (c < 16 ? "0" : "") + c.toString(16);
+    }
+    return out;
+  } catch (e) {
+    return "";
+  }
+}
+
+function textToB64(str) {
+  try {
+    const s = String(str || "");
+    // latin1 方式编码任意 0-255 字符
+    const u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+    return arrayBufferToB64(u8.buffer);
+  } catch (e) {
+    return "";
+  }
+}
+
+function b64ToArrayBuffer(b64) {
+  try {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let str = String(b64 || "").replace(/[^A-Za-z0-9\+\/]/g, "");
+    const len = str.length;
+    if (!len) return null;
+    const padding = (str[len - 1] === "=") + (str[len - 2] === "=");
+    const bytesLen = Math.floor((len * 3) / 4) - padding;
+    const u8 = new Uint8Array(bytesLen);
+    let p = 0;
+    for (let i = 0; i < len; i += 4) {
+      const n =
+        (chars.indexOf(str[i]) << 18) |
+        (chars.indexOf(str[i + 1]) << 12) |
+        ((str[i + 2] === "=" ? 0 : chars.indexOf(str[i + 2])) << 6) |
+        (str[i + 3] === "=" ? 0 : chars.indexOf(str[i + 3]));
+      if (p < bytesLen) u8[p++] = (n >> 16) & 255;
+      if (p < bytesLen) u8[p++] = (n >> 8) & 255;
+      if (p < bytesLen) u8[p++] = n & 255;
+    }
+    return u8.buffer;
+  } catch (e) {
+    return null;
+  }
+}
+
 function compactMina(snap) {
   // 持久化时保留回放必需字段
   return {
@@ -745,8 +976,10 @@ function compactMina(snap) {
     productId: snap.productId,
     headers: snap.headers,
     body: snap.body,
+    bodyB64: snap.bodyB64 || "",
     bodyLen: snap.bodyLen,
     bodyHex: snap.bodyHex,
+    bodySource: snap.bodySource || "",
     headerKeys: snap.headerKeys,
     update: snap.update
   };
@@ -809,22 +1042,10 @@ function maybeNotifyMinaHint(snap) {
 }
 
 function markLastMinaAsSign() {
-  let last = null;
-  try {
-    last = JSON.parse($nobyda.read("BYD_MinaLast") || "null");
-  } catch (e) {
-    last = null;
-  }
-  if (!last || !last.body || !last.url) {
-    // 尝试环形缓冲最新一条
-    try {
-      const ring = JSON.parse($nobyda.read("BYD_MinaRing") || "[]");
-      if (Array.isArray(ring) && ring[0]) last = ring[0];
-    } catch (e) {}
-  }
-  if (!last || !last.body || !last.url) {
+  let last = pickBestMinaCandidate();
+  if (!last || !(last.body || last.bodyB64) || !last.url) {
     return (
-      "标记失败：还没有 mina 抓包。\n" +
+      "标记失败：还没有可用 mina 抓包。\n" +
       "请先打开比亚迪 App 进入签到页点一次签到，确认日志有 [BYD mina] bodyLen>0，再 MarkMinaAsSign=true 运行"
     );
   }
@@ -858,10 +1079,11 @@ function markLastMinaAsSign() {
   return (
     "已标记最近 mina 请求为签到凭证 ✅\n" +
     `op: ${item.opType || "-"}\n` +
-    `bodyLen: ${String(item.body || "").length}\n` +
-    `hex: ${toHexPreview(item.body, 16)}\n` +
+    `bodyLen: ${item.bodyLen || String(item.body || "").length}\n` +
+    `hex: ${item.bodyHex || toHexPreview(item.body, 16)}\n` +
+    `hasB64: ${item.bodyB64 ? 1 : 0}\n` +
     "请立刻把 MarkMinaAsSign 改回 false，再手动运行一次任务做回放验证\n" +
-    "说明：mPaaS 包含时间戳/签名，回放可能失败；若失败把响应原文发我继续适配"
+    "若回放仍失败：把通知里的 http/respHex/BYD_LastReplay 发我"
   );
 }
 
@@ -1057,15 +1279,24 @@ function nobyda() {
   const post = (options, callback) => {
     if (!options.headers) options.headers = {};
     if (!options.headers["User-Agent"]) options.headers["User-Agent"] = DefaultUA;
-    // 允许调用方自定义 Content-Type；未设置时默认 JSON
-    if (options.body && !options.headers["Content-Type"] && !options.headers["content-type"]) {
+    // bodyBytes 场景不要强行写 JSON Content-Type
+    const hasBinaryBody = !!(options && options.bodyBytes);
+    if (options.body && !hasBinaryBody && !options.headers["Content-Type"] && !options.headers["content-type"]) {
       options.headers["Content-Type"] = "application/json; charset=UTF-8";
+    }
+    // 同时存在 bodyBytes 时，避免 string body 干扰
+    if (hasBinaryBody && options.body != null) {
+      try { delete options.body; } catch (e) { options.body = undefined; }
     }
     if (isQuanX) {
       if (typeof options == "string") options = { url: options };
       options["method"] = "POST";
       $task.fetch(options).then(
-        (response) => callback(null, adapterStatus(response), response.body),
+        (response) => {
+          // 优先 body（文本）；若 body 为空且有 bodyBytes，仍把 body 回传（QX 通常会填 body 为 latin1 字符串）
+          const payload = response && (response.body != null ? response.body : response.bodyBytes);
+          callback(null, adapterStatus(response), payload);
+        },
         (reason) => callback(reason.error, null, null)
       );
     }
@@ -1076,6 +1307,16 @@ function nobyda() {
       });
     }
     if (isNode) {
+      // node 下 bodyBytes 转 Buffer
+      if (hasBinaryBody) {
+        try {
+          const u8 = options.bodyBytes instanceof ArrayBuffer
+            ? Buffer.from(new Uint8Array(options.bodyBytes))
+            : Buffer.from(options.bodyBytes);
+          options.body = u8;
+          delete options.bodyBytes;
+        } catch (e) {}
+      }
       node.request.post(options, (error, response, body) => {
         callback(error, adapterStatus(response), body);
       });

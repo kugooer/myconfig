@@ -203,3 +203,34 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_di
 
 说明：mPaaS 请求常含时间戳/签名，**原样回放可能失败**；但先验证回放能否被服务端接受是必须一步。
 
+### mina 回放「响应非 JSON」/ 需二进制回放（capture-v8）
+
+现象（v7 已验证）：
+- `MarkMinaAsSign` 可标记成功，`bodyLen` 正常
+- 回放提示「响应非 JSON」：mina/mPaaS 返回常是**二进制**，不能按 JSON 判失败
+- 若 body hex 里大量 `fd`：说明 body 曾被当作 UTF-8 字符串损坏
+
+v8 改动：
+1. 抓包优先 `bodyBytes` → base64（`bodyB64`）持久化
+2. 回放用 `bodyBytes`，避免 string 损坏
+3. 响应输出 `http` / `respHex` / `respLen`，并写入 `BYD_LastReplay`
+4. 标记时优先 `com.app.dynasty.srv`，自动跳过 `switches` 类 RPC
+
+操作：
+1. **重写资源强制更新**到 capture-v8
+2. （建议）任务里 `DeleteCookie=true` 跑一次清旧凭证，再改回 false  
+   或至少清空 `BYD_Cookie` / `BYD_Cookies` / `BYD_MinaSign` / `BYD_MinaLast` / `BYD_MinaRing`
+3. 彻底杀掉比亚迪 App → 重新打开 → **我的 → 每日签到 → 点一次签到**
+4. 日志应出现：`[BYD mina] ... bodyLen=... src=bodyBytes`（`src=text` 也能用，但 bodyBytes 更稳）
+5. 本地脚本设 `MarkMinaAsSign = true` 跑一次 → 通知含 **`hasB64: 1`**
+6. **立刻改回** `MarkMinaAsSign = false`
+7. 再手动运行任务回放
+8. 把通知/日志里的 **`http` / `respHex` / `hasB64` / `BYD_LastReplay`** 发我
+
+结果解读：
+- `hasB64: 0`：本机 QX 未给出 bodyBytes，只能用 text 路径；把完整 [BYD mina] 日志发我
+- `mina回放已送达(HTTP 2xx)` + 二进制：请求已被服务端接受形态，**请对照 App 积分是否变化**；是否真正签到成功需结合积分/二次点签到验证
+- `HTTP 4xx/5xx` 或 respLen=0：可能是签名/时效/防重放，继续发元数据做判定
+
+说明：mPaaS 常含时间戳与网关签名，**不能保证长期纯回放稳定**；v8 先解决“二进制损坏 + 误判非 JSON”这两个确定问题。
+
