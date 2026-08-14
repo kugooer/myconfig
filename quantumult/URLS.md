@@ -116,13 +116,14 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 
 ## 三、无忧行(JegoTrip) 签到
 
-更新说明（2026-08-14 / capture-v1-token+AES-userSign）：
+更新说明（2026-08-14 / capture-v1.1-quiet-capture）：
 
 - 抓包定位：`app.jegotrip.com.cn` 任务中心 H5
 - `querySign`（明文）→ 选下一天 `signConfigId`（`isSign=2` 中 `completeNumber` 最小）
 - `userSign`：明文 `{"signConfigId":id}`，AES-ECB 包装为 `{sec,body}`
 - 密钥：`online_jego_h5` / `93EFE107DDE6DE51`（missioncenter 前端）
 - 抓包对照：两账号分别到账 **+8**、**+6** 无忧币（`getUserTripCoins` 记录「签到」）
+- **v1.1**：用户验收双账号「今日已签」正确；抓包路径不再打印「签到用时」；普通 cookie update 静默
 
 ### 推荐（QX 重写资源）
 
