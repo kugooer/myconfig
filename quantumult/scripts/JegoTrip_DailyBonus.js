@@ -2,7 +2,7 @@
 
   无忧行(JegoTrip) 每日签到脚本
 
-  更新时间: 2026-08-14 (capture-v1-token+AES-userSign)
+  更新时间: 2026-08-14 (capture-v1.1-quiet-capture)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -63,6 +63,7 @@ var merge = {};
     }
 
     if ($nobyda.isRequest) {
+      // 抓包路径：只更新凭证，不打印「签到用时」（由 GetCookie 内 $done）
       GetCookie();
       return;
     }
@@ -74,11 +75,18 @@ var merge = {};
       await all(cookies[i], i + 1);
     }
   } catch (e) {
-    $nobyda.notify("无忧行签到", "", String(e.message || e));
-    console.log("\n" + (e.stack || e));
+    if (!$nobyda.isRequest) {
+      $nobyda.notify("无忧行签到", "", String(e.message || e));
+      console.log("\n" + (e.stack || e));
+    } else {
+      console.log("[JegoTrip] capture err " + (e.message || e));
+    }
   } finally {
-    $nobyda.time();
-    $nobyda.done();
+    // request 模式下 GetCookie 已 $done；切勿再 time/done，否则日志刷屏
+    if (!$nobyda.isRequest) {
+      $nobyda.time();
+      $nobyda.done();
+    }
   }
 })();
 
@@ -341,6 +349,7 @@ function GetCookie() {
     const hostRaw = (req.headers && (req.headers.Host || req.headers.host)) || "";
     const host = String(hostRaw).replace(/:\d+$/, "") || HOST;
     const method = req.method || "";
+    const quietCapture = !LogDetails;
     const diag =
       new Date().toISOString() +
       " | " +
@@ -351,7 +360,12 @@ function GetCookie() {
       (token ? token.slice(0, 8) + "…" : "-") +
       " | url=" +
       url.slice(0, 160);
-    console.log("[JegoTrip capture] " + diag);
+    // 默认不刷屏：仅 querySign / userSign 打 capture；其它接口静默写库
+    const important =
+      /\/mission\/sign\/(querySign|userSign)/i.test(url) || /getUserTripCoins/i.test(url);
+    if (!quietCapture || important) {
+      console.log("[JegoTrip capture] " + diag);
+    }
     appendDiag(diag);
 
     if (!token || !isValidCookie({ token })) {
@@ -377,9 +391,10 @@ function GetCookie() {
     const saved = saveCookie(item);
     if (saved === "new") {
       $nobyda.notify("无忧行签到", item.name, "凭证新增 ✅\ntoken=" + shortToken(token));
+      console.log("[JegoTrip] cookie new " + item.name);
     } else if (saved === "update") {
-      if (LogDetails) $nobyda.notify("无忧行签到", item.name, "凭证已更新");
-      console.log("[JegoTrip] cookie updated " + item.name);
+      // 同一 token 反复 hit 不再每次 console，避免开页刷屏
+      if (LogDetails) console.log("[JegoTrip] cookie updated " + item.name);
     }
     $nobyda.done({});
   } catch (e) {
