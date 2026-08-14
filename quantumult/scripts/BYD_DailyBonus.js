@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v6-mina-body)
+  更新时间: 2026.08.14 (capture-v7-mina-mark)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -71,6 +71,10 @@ hostname = dilinkappserver-cn.byd.auto, dilinkappserver.byd.auto, mina.byd.com
 
 var LogDetails = false; // 是否打印完整响应
 var DeleteCookie = false; // true = 清除已保存凭证
+// true = 把「最近一次 mina 请求」标记为签到凭证（点完签到后立刻手动跑一次脚本）
+var MarkMinaAsSign = false;
+// true = 签到时只回放 mina 网关请求（默认自动识别 type=mina）
+var PreferMinaReplay = true;
 var out = 0; // 超时(ms)，0 表示不强制超时
 var Notify = true; // 是否推送通知
 
@@ -94,12 +98,21 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
       $nobyda.write("", "BYD_Cookie");
       $nobyda.write("", "BYD_Cookies");
       $nobyda.write("", "BYD_CaptureDiag");
+      $nobyda.write("", "BYD_MinaLast");
+      $nobyda.write("", "BYD_MinaSign");
+      $nobyda.write("", "BYD_MinaRing");
       throw new Error("已清除比亚迪签到凭证/诊断，请重新打开 App 签到页抓取 ‼️");
     }
 
     if ($nobyda.isRequest) {
       GetCookie();
       return;
+    }
+
+    // 点完 App「签到」后立刻跑一次：把最近 mina 请求标记为签到凭证
+    if (MarkMinaAsSign) {
+      const marked = markLastMinaAsSign();
+      throw new Error(marked);
     }
 
     const cookies = ReadCookies();
@@ -121,7 +134,10 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
 })();
 
 function isValidSignCookie(item) {
-  if (!item || !item.request) return false;
+  if (!item) return false;
+  // mina 网关回放凭证
+  if (item.type === "mina" && item.body && item.url) return true;
+  if (!item.request) return false;
   if (item._manual) return true;
   const url = String(item.url || "");
   const host = String(item.host || "");
@@ -183,6 +199,21 @@ function ReadCookies() {
 function normalizeCookie(input) {
   if (!input) return null;
   if (typeof input === "object") {
+    if (input.type === "mina" && input.body && input.url) {
+      return {
+        type: "mina",
+        request: String(input.body).slice(0, 64), // 去重 key
+        body: input.body,
+        host: (input.host || "mina.byd.com").replace(/^https?:\/\//, "").replace(/\/$/, ""),
+        url: input.url,
+        name: input.name || "mina签到",
+        headers: input.headers || null,
+        opType: input.opType || "",
+        productId: input.productId || "",
+        signLike: true,
+        _manual: !!input._manual
+      };
+    }
     if (!input.request) return null;
     return {
       request: String(input.request).trim(),
@@ -226,23 +257,38 @@ function BYDSignIn(s, cookieItem) {
   merge.BYDSign = {};
   return new Promise((resolve) => {
     setTimeout(() => {
-      const bodyObj = { request: KEY };
-      const url = `https://${HOST}${SIGN_PATH}`;
-      const headers = Object.assign(
-        {
-          Accept: "application/json",
-          "Content-Type": "application/json; charset=UTF-8",
-          "User-Agent": DefaultUA,
-          Connection: "keep-alive"
-        },
-        pickUsefulHeaders(cookieItem.headers)
-      );
-
-      const options = {
-        url,
-        headers,
-        body: JSON.stringify(bodyObj)
-      };
+      let options;
+      if ((PreferMinaReplay && cookieItem && cookieItem.type === "mina") || (cookieItem && cookieItem.type === "mina")) {
+        // 回放 mPaaS 网关：尽量原样 headers + body
+        const h = Object.assign({}, cookieItem.headers || {});
+        // 去掉可能被代理改写的头
+        Object.keys(h).forEach((k) => {
+          if (/^(Content-Length|Host|Connection|Accept-Encoding)$/i.test(k)) delete h[k];
+        });
+        options = {
+          url: cookieItem.url || `https://${cookieItem.host || "mina.byd.com"}:31801/mgw.htm`,
+          headers: h,
+          body: cookieItem.body
+        };
+        console.log("[BYD] mina 回放: op=" + (cookieItem.opType || "-") + " bodyLen=" + String(cookieItem.body || "").length);
+      } else {
+        const bodyObj = { request: KEY };
+        const url = `https://${HOST}${SIGN_PATH}`;
+        const headers = Object.assign(
+          {
+            Accept: "application/json",
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": DefaultUA,
+            Connection: "keep-alive"
+          },
+          pickUsefulHeaders(cookieItem.headers)
+        );
+        options = {
+          url,
+          headers,
+          body: JSON.stringify(bodyObj)
+        };
+      }
 
       $nobyda.post(options, function (error, response, data) {
         try {
@@ -453,13 +499,13 @@ function buildNoCookieTip() {
     "未获取到签到凭证 ‼️\n" +
     "当前没有可用 Sign/club 凭证（小组件车况 request 无效）。\n" +
     "请严格按下面步骤：\n" +
-    "1) 重写资源强制更新到 capture-v5\n" +
+    "1) 重写资源强制更新到 capture-v7\n" +
     "2) MitM 开 HTTPS 解密并信任证书；hostname 含 dilinkappserver-cn.byd.auto、mina.byd.com\n" +
     "3) 策略 BYD 域名 DIRECT（保留 rewrite 解密）\n" +
     "4) 彻底杀进程后打开「比亚迪」主 App（非小组件）\n" +
     "5) 我的 → 每日签到 / 积分商城，点一次签到\n" +
     "6) 应出现「凭证新增/更新成功」；再跑定时任务\n" +
-    "若只有 mina 日志（op=com.app.dynasty.srv）：说明签到走 mPaaS 网关；请进入「每日签到」点一次后把 [BYD mina] 行发我";
+    "当前主链路是 mina 加密网关：点签到后将脚本 MarkMinaAsSign=true 跑一次标记，再改回 false 做回放";
   if (diag) {
     tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 700);
     if (/vehicleRealTime|getStatusNow|superappserver/i.test(diag) && !/dilinkappserver|\/club\/|Sign\.signIn|mina\.byd/i.test(diag)) {
@@ -503,7 +549,8 @@ function GetCookie() {
     console.log("[BYD capture] " + diagLine);
     appendDiag(diagLine);
 
-    // mina / mPaaS 统一网关：抓 header + body 诊断；疑似签到时保存可重放网关凭证
+    // mina / mPaaS 统一网关：body 全加密，op 常固定为 com.app.dynasty.srv
+    // 策略：环形缓冲最近请求 + 用户点完签到后 MarkMinaAsSign 标记回放
     if (isMina) {
       const h = req.headers || {};
       const pick = (keys) => {
@@ -515,40 +562,20 @@ function GetCookie() {
         }
         return "";
       };
-      const apiName = pick(["Api", "api", "Operation-Type", "operation-type", "RpcId", "rpcId"]);
+
+      const apiName = pick(["Api", "api", "Operation-Type", "operation-type", "RpcId", "rpcId", "OperationType"]);
       const productId = pick(["productId", "ProductId", "AppId", "appId"]);
       const workspaceId = pick(["WorkspaceId", "workspaceId"]);
       const sign = pick(["Sign", "sign"]);
       const did = pick(["Did", "did"]);
       const uuid = pick(["uuid", "UUID"]);
-      const cookie = pick(["Cookie", "cookie"]);
-      const identifier = pick(["identifier", "Identifier"]);
-      const encryToken = pick(["encryToken", "EncryToken"]);
       const contentType = pick(["Content-Type", "content-type"]);
+      const ts = pick(["Ts", "ts", "tsValue"]);
+      const mpassVersion = pick(["mpassVersion", "mpaasVersion", "Version"]);
+      const platform = pick(["Platform", "platform"]);
+      const headerKeys = Object.keys(h).join(",");
+      const bodyHex = toHexPreview(bodyText, 24);
 
-      // body 里可能混有可读 ASCII（签名方法名 / signIn 等）
-      let bodyAscii = "";
-      try {
-        bodyAscii = String(bodyText || "")
-          .replace(/[^\x20-\x7E\u4e00-\u9fff]/g, " ")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 160);
-      } catch (e) {}
-
-      const minaSignLike = /sign|checkIn|checkin|integral|point|score|activity\.sign|Sign\.|每日签|签到/i.test(
-        [opType, apiName, url, bodyAscii].join(" ")
-      );
-
-      const diagMina =
-        new Date().toISOString() +
-        ` | MINA | op=${(opType || apiName || "-").slice(0, 100)} | product=${(productId || "-").slice(0, 40)}` +
-        ` | bodyLen=${bodyText.length} | signLike=${minaSignLike ? 1 : 0}` +
-        (bodyAscii ? ` | bodyHint=${bodyAscii.slice(0, 80)}` : "");
-      console.log("[BYD mina] " + diagMina);
-      appendDiag(diagMina);
-
-      // 保存最近一次完整网关头，便于后续适配回放（无论是否签到）
       const minaSnap = {
         type: "mina",
         host,
@@ -560,44 +587,32 @@ function GetCookie() {
         sign,
         did,
         uuid,
-        cookie,
-        identifier,
-        encryToken,
+        ts,
+        mpassVersion,
+        platform,
         contentType,
+        headerKeys,
         headers: sanitizeHeaders(h),
+        body: bodyText,
         bodyLen: bodyText.length,
-        bodyB64: "",
-        bodyHint: bodyAscii,
-        minaSignLike: !!minaSignLike,
+        bodyHex,
         update: new Date().toISOString()
       };
 
-      // body 以 base64 形式短存（体积限制）
-      try {
-        if (bodyText && bodyText.length > 0 && bodyText.length <= 8000) {
-          if (typeof $nobyda.base64 !== "undefined") {
-            // no-op placeholder
-          }
-          // QX/JS 环境不保证 Buffer；尽量原样截断保存
-          minaSnap.bodyB64 = bodyText.length <= 2048 ? bodyText : bodyText.slice(0, 2048);
-        }
-      } catch (e) {}
+      // 环形缓冲：最近 12 条（按 bodyLen+hex 去重）
+      pushMinaRing(minaSnap);
+      $nobyda.write(JSON.stringify(compactMina(minaSnap)), "BYD_MinaLast");
 
-      $nobyda.write(JSON.stringify(minaSnap), "BYD_MinaLast");
-      if (minaSignLike) {
-        $nobyda.write(JSON.stringify(minaSnap), "BYD_MinaSign");
-        const tip =
-          `已捕获疑似签到 mina 请求\n` +
-          `op: ${(opType || apiName || "-").slice(0, 120)}\n` +
-          `product: ${productId || "-"}\n` +
-          `bodyLen: ${bodyText.length}\n` +
-          `hint: ${bodyAscii.slice(0, 80) || "(binary)"}\n` +
-          "请把此通知原文发我，继续做回放适配";
-        console.log("[BYD] " + tip);
-        $nobyda.notify("比亚迪 mina 签到线索", (opType || apiName || host).slice(0, 40), tip);
-      } else {
-        console.log("[BYD] mina 普通网关: " + (opType || apiName || "(no op)") + " — 仅诊断/快照，不入库签到 cookie");
-      }
+      const diagMina =
+        new Date().toISOString() +
+        ` | MINA | op=${(minaSnap.opType || "-").slice(0, 80)} | product=${(productId || "-").slice(0, 28)}` +
+        ` | bodyLen=${bodyText.length} | hex=${bodyHex}` +
+        ` | keys=${headerKeys.slice(0, 120)}`;
+      console.log("[BYD mina] " + diagMina);
+      appendDiag(diagMina);
+
+      // 仅低频提示，避免首页刷屏
+      maybeNotifyMinaHint(minaSnap);
       $nobyda.done({});
       return;
     }
@@ -715,6 +730,139 @@ function GetCookie() {
     $nobyda.notify("比亚迪抓包失败", "", String(e.message || e));
   }
   $nobyda.done({});
+}
+
+
+
+function compactMina(snap) {
+  // 持久化时保留回放必需字段
+  return {
+    type: "mina",
+    host: snap.host,
+    url: snap.url,
+    method: snap.method,
+    opType: snap.opType,
+    productId: snap.productId,
+    headers: snap.headers,
+    body: snap.body,
+    bodyLen: snap.bodyLen,
+    bodyHex: snap.bodyHex,
+    headerKeys: snap.headerKeys,
+    update: snap.update
+  };
+}
+
+function toHexPreview(str, n) {
+  try {
+    const s = String(str || "");
+    let out = "";
+    const max = Math.min(s.length, n || 16);
+    for (let i = 0; i < max; i++) {
+      const c = s.charCodeAt(i) & 0xff;
+      out += (c < 16 ? "0" : "") + c.toString(16);
+    }
+    return out;
+  } catch (e) {
+    return "";
+  }
+}
+
+function pushMinaRing(snap) {
+  try {
+    let arr = [];
+    try {
+      arr = JSON.parse($nobyda.read("BYD_MinaRing") || "[]");
+      if (!Array.isArray(arr)) arr = [];
+    } catch (e) {
+      arr = [];
+    }
+    const item = compactMina(snap);
+    // 去重：相同 bodyLen+hex 只更新时间
+    const key = (item.bodyLen || 0) + ":" + (item.bodyHex || "");
+    let found = false;
+    arr = arr.map((x) => {
+      const k = (x.bodyLen || 0) + ":" + (x.bodyHex || "");
+      if (k === key) {
+        found = true;
+        return item;
+      }
+      return x;
+    });
+    if (!found) arr.unshift(item);
+    $nobyda.write(JSON.stringify(arr.slice(0, 12)), "BYD_MinaRing");
+  } catch (e) {}
+}
+
+function maybeNotifyMinaHint(snap) {
+  try {
+    const now = Date.now();
+    const last = Number($nobyda.read("BYD_MinaHintAt") || 0);
+    if (now - last < 60000) return; // 60s 节流
+    $nobyda.write(String(now), "BYD_MinaHintAt");
+    const tip =
+      "已抓到 mina 加密网关包（op 固定、body 加密属正常）\n" +
+      `最近 bodyLen=${snap.bodyLen}\n` +
+      "请：打开签到页并点一次签到 → 脚本设 MarkMinaAsSign=true 再跑一次标记 → 改回 false 后定时签到\n" +
+      "也可把此刻 QX 日志中 [BYD mina] 的 hex/bodyLen 发我";
+    if (Notify) $nobyda.notify("比亚迪 mina 抓包中", "等你点签到后标记", tip);
+  } catch (e) {}
+}
+
+function markLastMinaAsSign() {
+  let last = null;
+  try {
+    last = JSON.parse($nobyda.read("BYD_MinaLast") || "null");
+  } catch (e) {
+    last = null;
+  }
+  if (!last || !last.body || !last.url) {
+    // 尝试环形缓冲最新一条
+    try {
+      const ring = JSON.parse($nobyda.read("BYD_MinaRing") || "[]");
+      if (Array.isArray(ring) && ring[0]) last = ring[0];
+    } catch (e) {}
+  }
+  if (!last || !last.body || !last.url) {
+    return (
+      "标记失败：还没有 mina 抓包。\n" +
+      "请先打开比亚迪 App 进入签到页点一次签到，确认日志有 [BYD mina] bodyLen>0，再 MarkMinaAsSign=true 运行"
+    );
+  }
+
+  const item = normalizeCookie(
+    Object.assign({}, last, {
+      type: "mina",
+      name: "mina签到(手动标记)",
+      signLike: true,
+      _manual: true
+    })
+  );
+  if (!item) return "标记失败：normalize 失败";
+
+  $nobyda.write(JSON.stringify(item), "BYD_Cookie");
+  $nobyda.write(JSON.stringify(item), "BYD_MinaSign");
+
+  let list = [];
+  try {
+    list = JSON.parse($nobyda.read("BYD_Cookies") || "[]");
+    if (!Array.isArray(list)) list = [];
+  } catch (e) {
+    list = [];
+  }
+  // 去掉旧 mina
+  list = list.filter((x) => !(x && x.type === "mina"));
+  list.unshift(item);
+  list = list.slice(0, 10);
+  $nobyda.write(JSON.stringify(list), "BYD_Cookies");
+
+  return (
+    "已标记最近 mina 请求为签到凭证 ✅\n" +
+    `op: ${item.opType || "-"}\n` +
+    `bodyLen: ${String(item.body || "").length}\n` +
+    `hex: ${toHexPreview(item.body, 16)}\n` +
+    "请立刻把 MarkMinaAsSign 改回 false，再手动运行一次任务做回放验证\n" +
+    "说明：mPaaS 包含时间戳/签名，回放可能失败；若失败把响应原文发我继续适配"
+  );
 }
 
 

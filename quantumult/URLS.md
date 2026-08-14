@@ -184,3 +184,22 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_di
 2. 打开 App → **我的/积分/签到/福利** 页，点一次「签到」
 3. 日志应出现 URL 含 `club` 或 `Sign.signIn`，且 `signLike=1`
 4. 再运行定时任务
+
+
+### mina body 已加密且 op 固定（capture-v7）
+
+现状（你日志已确认）：
+- `bodyLen>0`：body 抓包成功
+- `op=com.app.dynasty.srv` 固定 + `bodyHint` 乱码：网关内业务名不可见，属 mPaaS 正常现象
+- 无法仅靠关键字自动判定“哪一条是签到”
+
+操作：
+1. 强制更新到 capture-v7
+2. 打开 App → 我的 → 每日签到 → **点一次签到**
+3. 立刻运行任务：本地脚本设 `MarkMinaAsSign = true`（只跑这一次）
+4. 看到「已标记最近 mina 请求为签到凭证」后，把 `MarkMinaAsSign` **改回 false**
+5. 再手动运行任务做回放验证
+6. 把签到成功/失败通知与响应原文发我（若失败，继续适配）
+
+说明：mPaaS 请求常含时间戳/签名，**原样回放可能失败**；但先验证回放能否被服务端接受是必须一步。
+
