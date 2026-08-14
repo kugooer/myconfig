@@ -86,6 +86,16 @@ var AutoSignAfterLearn = false;
 var PurgeBadLearnedEndpoints = true;
 // 是否尝试移动云盘签到（ycloud startSignIn；抓包 2026-08-13 证实有效）
 var EnableCloudSign = true;
+// 是否执行 App「签到领奖」(qwhdhub/domark)
+var EnableAppSign = true;
+/**
+ * 定时任务模式（可被 QX/Surge 任务 argument 覆盖）：
+ *  - "app"   : 仅中国移动 App 签到领奖
+ *  - "cloud" : 仅移动云盘
+ *  - "all"   : 两者都跑（兼容旧单任务）
+ * 任务配置示例：argument=app / argument=cloud
+ */
+var DefaultCronTaskMode = "all";
 // 打开移动云盘后：是否允许云盘自动签到链路（含通知）
 var AutoCloudSignOnAuth = true;
 // 打开云盘（getUser）时：优先用已缓存 jwt 直接 startSignIn（无需进签到页）
@@ -160,24 +170,72 @@ function ReadCookie() {
   // 每次 cron 自洁幽灵号（CDN 图链截出来的 11 位）
   purgeGhostAccounts();
 
-  // cron / 手动运行：仅跑「可签」账号，避免 165/133 等幽灵号刷屏
-  const list = loadAccounts().filter(isRunnableAccount);
+  // cron / 手动：按任务模式过滤（app | cloud | all）
+  const cronMode = resolveTaskMode({ reason: "cron" });
+  const list = loadAccounts().filter(a => isRunnableAccount(a, cronMode));
   if (!list.length) {
-    $nobyda.notify("中国移动", "", "无可用账号。请先登录中国移动 App（签到领奖）或打开移动云盘（云盘签到）。");
+    const hint = cronMode === "cloud"
+      ? "无云盘凭证。请打开一次移动云盘（建议进签到页缓存 jwt）。"
+      : cronMode === "app"
+        ? "无 App 登录会话。请先登录中国移动 App 并打开「签到领奖」页。"
+        : "无可用账号。请登录中国移动 App 或打开移动云盘。";
+    $nobyda.notify(cronMode === "cloud" ? "移动云盘" : "中国移动", "", hint);
     return $nobyda.done();
   }
 
   (async () => {
-    console.log("cron runnable accounts =>", list.length, list.map(a => maskPhone(a.phone || a.uid || "?")).join(", "));
+    clog("cron mode=" + cronMode + " accounts=" + list.length + " " +
+      list.map(a => maskPhone(a.phone || a.uid || "?")).join(", "));
     for (let i = 0; i < list.length; i++) {
-      await all(list[i], { reason: "cron" });
+      await all(list[i], { reason: "cron", mode: cronMode });
       if (i < list.length - 1) await wait(AccountGapMs);
     }
     $nobyda.done();
   })().catch(e => {
-    $nobyda.notify("中国移动", "执行异常", String(e));
+    $nobyda.notify(cronMode === "cloud" ? "移动云盘" : "中国移动", "执行异常", String(e));
     $nobyda.done();
   });
+}
+
+/**
+ * 解析定时/触发任务模式：app | cloud | all
+ * 优先级：opts.mode > $argument > 持久化 CMCC_TaskMode > DefaultCronTaskMode
+ * 登录/学习触发默认 app（不顺带跑云盘）
+ */
+function resolveTaskMode(opts) {
+  if (opts && opts.mode) return normalizeTaskMode(opts.mode);
+  if (opts && (opts.reason === "login-trigger" || opts.reason === "learn-trigger")) return "app";
+  let arg = "";
+  try {
+    if (typeof $argument !== "undefined" && $argument != null && String($argument) !== "") {
+      arg = String($argument);
+    }
+  } catch (e) {}
+  // 兼容 argument=app&xxx / mode=cloud / 纯 cloud
+  if (arg) {
+    const m =
+      matchOne(arg, /(?:^|[?&])mode=([a-zA-Z]+)/i) ||
+      matchOne(arg, /(?:^|[?&])task=([a-zA-Z]+)/i) ||
+      matchOne(arg, /^(app|cloud|all)$/i) ||
+      arg;
+    const n = normalizeTaskMode(m);
+    if (n) return n;
+  }
+  try {
+    const pref = $nobyda.read("CMCC_TaskMode");
+    const n = normalizeTaskMode(pref);
+    if (n) return n;
+  } catch (e) {}
+  return normalizeTaskMode(DefaultCronTaskMode) || "all";
+}
+
+function normalizeTaskMode(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "";
+  if (s === "app" || s === "qwhd" || s === "mark" || s === "mobile") return "app";
+  if (s === "cloud" || s === "mcloud" || s === "yun" || s === "yunpan") return "cloud";
+  if (s === "all" || s === "both" || s === "full") return "all";
+  return "";
 }
 
 async function all(account, opts) {
@@ -190,31 +248,40 @@ async function all(account, opts) {
   merge = {};
   $nobyda.time();
 
-  const tag = maskPhone(ACCOUNT.phone || ACCOUNT.uid || "未知");
-  console.log(`\n==== 账号 ${tag} / 原因 ${opts && opts.reason || "manual"} ====`);
+  const mode = resolveTaskMode(opts);
+  const runApp = (mode === "app" || mode === "all") && EnableAppSign;
+  const runCloud = (mode === "cloud" || mode === "all") && EnableCloudSign;
 
-  // 主路径：签到领奖(qwhdhub)；辅路径：移动云盘 ycloud / 已学习动作端点
-  // 有 App 会话才跑 Qwhd；纯云盘账号只跑云盘
+  const tagBase = maskPhone(ACCOUNT.phone || ACCOUNT.uid || "未知");
+  const tag = mode === "cloud" ? (tagBase + "·云盘") : mode === "app" ? (tagBase + "·签到领奖") : tagBase;
+  console.log(`\n==== 账号 ${tagBase} / 原因 ${opts && opts.reason || "manual"} / mode ${mode} ====`);
+
+  // App 路径：签到领奖(qwhdhub) + 可选 learned 端点
   const hasAppSession = !!(ACCOUNT.jsessionid || (ACCOUNT.cookie && /JSESSIONID=/i.test(ACCOUNT.cookie)));
-  if (hasAppSession) {
+  if (runApp && hasAppSession) {
     await LiveQwhdSign(0);
     const again = reloadAccount(ACCOUNT);
     if (again) ACCOUNT = again;
+  } else if (runApp) {
+    merge.QwhdSign = { notify: "跳过签到领奖：无 App 登录会话(JSESSIONID)" };
   } else {
     merge.QwhdSign = { notify: "" };
   }
 
   const jobs = [];
-  if (EnableCloudSign && (ACCOUNT.cloudAuthorization || ACCOUNT.cloudSsoToken || ACCOUNT.cloudJwt)) {
+  if (runCloud && (ACCOUNT.cloudAuthorization || ACCOUNT.cloudSsoToken || ACCOUNT.cloudJwt)) {
     jobs.push(LiveCloudSign(0));
-  } else if (EnableCloudSign) {
-    merge.CloudSign = { notify: hasAppSession ? "跳过云盘：无云盘凭证（打开一次移动云盘即可捕获）" : "跳过云盘：无云盘凭证" };
+  } else if (runCloud) {
+    merge.CloudSign = { notify: "跳过云盘：无云盘凭证（打开一次移动云盘即可捕获）" };
   } else {
     merge.CloudSign = { notify: "" };
   }
-  // 已有 Qwhd 主路径成功时，不必再靠 learned 端点补枪
-  if (hasAppSession && !(merge.QwhdSign && merge.QwhdSign.success)) jobs.push(LiveEndpointSign(0));
-  else merge.AppSign = { notify: "" };
+  // learned 仅在 App 模式且主路径未成功时补枪
+  if (runApp && hasAppSession && !(merge.QwhdSign && merge.QwhdSign.success)) {
+    jobs.push(LiveEndpointSign(0));
+  } else {
+    merge.AppSign = { notify: "" };
+  }
   if (jobs.length) await Promise.all(jobs);
 
   await notify(tag);
@@ -2262,7 +2329,11 @@ function notify(tag) {
         if (it.notify) lines.push(it.notify);
         if (it.bean) lines.push(`奖励: ${it.bean}`);
       });
-      const title = `中国移动 · ${tag || "签到"}`;
+      const t = String(tag || "");
+      // 双任务拆分：纯云盘标题用「移动云盘」，避免和 App 任务混在一起
+      const isCloudOnly = /·云盘$/.test(t) && !(merge.QwhdSign && merge.QwhdSign.notify);
+      const brand = isCloudOnly ? "移动云盘" : "中国移动";
+      const title = `${brand} · ${t || "签到"}`;
       // 主路径成功时，subtitle 强调主结果，避免辅路径失败主导观感
       const mainOk = !!(merge.QwhdSign && merge.QwhdSign.success);
       const cloudOk = !!(merge.CloudSign && merge.CloudSign.success);
@@ -2602,12 +2673,17 @@ function isValidPhone(v) {
 }
 
 // 可执行签到的账号：App 会话（签到领奖）或云盘凭证（ycloud 签到）
-function isRunnableAccount(a) {
+function isRunnableAccount(a, mode) {
   if (!a) return false;
-  if (a.phone && !isValidPhone(a.phone) && !a.uid && !a.jsessionid && !a.cloudAuthorization && !a.cloudSsoToken && !a.cloudJwt) return false;
-  if (a.jsessionid || (a.cookie && /JSESSIONID=/i.test(a.cookie))) return true;
-  // 纯云盘账号：打开移动云盘后可独立跑云盘签到
-  if (EnableCloudSign && (a.cloudAuthorization || a.cloudSsoToken || a.cloudJwt) && isValidPhone(a.phone)) return true;
+  const m = normalizeTaskMode(mode) || "all";
+  const hasApp = !!(a.jsessionid || (a.cookie && /JSESSIONID=/i.test(a.cookie)));
+  const hasCloud = !!(EnableCloudSign && (a.cloudAuthorization || a.cloudSsoToken || a.cloudJwt) && isValidPhone(a.phone));
+  if (a.phone && !isValidPhone(a.phone) && !a.uid && !hasApp && !hasCloud) return false;
+  if (m === "app") return hasApp && EnableAppSign;
+  if (m === "cloud") return hasCloud;
+  // all
+  if (hasApp && EnableAppSign) return true;
+  if (hasCloud) return true;
   return false;
 }
 
