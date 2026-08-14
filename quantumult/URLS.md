@@ -100,150 +100,66 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
 ```
 
-### 挂载后操作（capture-v5）
+### 挂载后操作（capture-v5 ~ v8.1）
 
 1. 开启 MITM，信任证书；**重写资源右上角强制更新**
 2. hostname 应含：`dilinkappserver-cn.byd.auto`、`dilinkappserver.byd.auto`、`mina.byd.com`  
    **不要**加 车况 super 域名（无效）
 3. **彻底杀掉比亚迪进程**后打开主 App（不是桌面小组件）
 4. 我的 → **每日签到 / 积分商城 / 福利**，点一次签到
-5. 成功通知：`比亚迪签到凭证新增/更新成功`，日志 `signLike=1` 且 URL 含 `club`/`Sign.signIn`
-6. 再手动运行定时任务；凭证失效后重复第 4 步
+5. 现网主链路多为 `mina.byd.com` mPaaS：点签后可用 `MarkMinaAsSign=true` 标记最近网关包，再改回 false 回放
+6. 对照 App 积分；把 capture/回放日志发维护者继续迭代
 
-若打开签到页「没有任何反应」且日志无新的 `[BYD capture]`（诊断时间戳仍是旧车况）：
-- rewrite/MitM 未命中主 App 流量，或 dilink 证书固定导致看不到包
-- 请更新 v5 后重进签到页，把**最新**日志发我
+更多 mina 排障（bodyBytes / MarkMinaAsSign / 防重放）见本文件历史段落与 rewrite `#desc`。
+
+---
+
+## 三、无忧行(JegoTrip) 签到
+
+更新说明（2026-08-14 / capture-v1-token+AES-userSign）：
+
+- 抓包定位：`app.jegotrip.com.cn` 任务中心 H5
+- `querySign`（明文）→ 选下一天 `signConfigId`（`isSign=2` 中 `completeNumber` 最小）
+- `userSign`：明文 `{"signConfigId":id}`，AES-ECB 包装为 `{sec,body}`
+- 密钥：`online_jego_h5` / `93EFE107DDE6DE51`（missioncenter 前端）
+- 抓包对照：两账号分别到账 **+8**、**+6** 无忧币（`getUserTripCoins` 记录「签到」）
+
+### 推荐（QX 重写资源）
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/JegoTrip_DailyBonus.conf
+```
+
+### 脚本本体
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/JegoTrip_DailyBonus.js
+```
+
+### 定时任务
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/JegoTrip_DailyBonus.task
+```
+
+或手动：
+
+```text
+15 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/JegoTrip_DailyBonus.js, tag=无忧行签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
+```
+
+### 挂载后操作
+
+1. QX：重写 → 引用上述 conf → **右上角强制更新**；开启 MitM 并信任证书  
+2. hostname 仅：`app.jegotrip.com.cn`, `app3.jegotrip.com.cn`（勿整域 `*.jegotrip.com.cn`）  
+3. 打开无忧行 → **任务中心/签到页**（每个要签的账号各进一次）  
+4. 通知「凭证新增/已保存」后，手动运行「无忧行签到」任务验证  
+5. 多账号按 token 去重保存在 `JegoTrip_Cookies`  
+6. token 过期会提示重新进签到页；勿分享 token
 
 ---
 
 ## 合规说明
 
 本仓库仅托管**自建签到 / 抓包缓存凭证 / 定时任务**类配置。  
-**不提供**百度网盘等会员 SVIP / 倍速 / 清晰度解锁脚本。
-
-
-### 未获取到签到凭证（排障）
-
-报错 `未获取到签到凭证` 表示定时任务正常，但 **还没有成功抓到 `request`**。
-
-按顺序确认：
-1. 更新并启用重写：`quantumult/rewrite/BYD_DailyBonus.conf`（右上角强制更新）
-2. QX：`MitM → HTTPS 解密` 开启，已安装/信任证书
-3. hostname 含：
-   - `dilinkappserver-cn.byd.auto`
-   - `dilinkappserver.byd.auto`
-   - `mina.byd.com`（诊断用）
-4. 清空旧脏凭证：`BYD_Cookie` / `BYD_Cookies` / `BYD_CaptureDiag`（或 `DeleteCookie=true` 跑一次）
-5. 主 App → **我的 → 每日签到**，点一次签到（不是小组件刷新）
-6. 成功通知：`比亚迪签到凭证新增/更新成功`
-7. 再手动运行任务验证
-
-若仍失败：查看 QX 日志中的 `[BYD capture]`：
-- 时间戳仍是旧的车况 `vehicleRealTime`：主 App 签到流量没进来
-- 出现 `host=mina.byd.com`：主 App 网关可达，继续进签到页找 `dilinkappserver`
-- 出现 `host=dilinkappserver... /club/` 且 `signLike=1`：应已入库
-- 出现「未确认签到 URL」通知：把完整 URL 发我放宽规则
-- `signLike=1` 但「无 request」：把该 URL 发我继续适配
-
-
-### 分流直连（推荐，防网络错误）
-
-```text
-https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/filter_byd_direct.snippet
-```
-
-### 挂载后 App 提示「网络错误」
-
-原因通常是 **MITM 范围过大** 或 **脚本拦截了非签到接口**，App 证书校验/关键链路失败。
-
-处理：
-1. 更新 rewrite 到最新 capture-v5（不 MitM 车况 super 域）
-2. 关闭地图/埋点等无关 MITM；`mina.byd.com` 仅用于诊断，若导致异常可临时去掉
-3. 策略里把 `*.byd.auto`、`*.bydauto.com.cn` 设为 **DIRECT**（仍可对 rewrite 命中域名解密）
-4. 若仍报网络错误：先禁用该重写资源，确认 App 恢复，再只启用最新 conf
-5. 抓凭证时：保持 rewrite 开启 → 进入签到页点一次 → 出现「凭证成功」通知后，可临时关闭 rewrite 只留定时任务
-
-
-
-### 日志只有 mina.byd.com + op=com.app.dynasty.srv（capture-v6）
-
-说明：主 App 已进入 **王朝 mPaaS 网关**，旧 `dilinkappserver/club/Sign.signIn` 路径可能已不再触发。
-
-1. 强制更新 rewrite 到 capture-v6（mina 使用 **script-request-body**，不要 header-only）
-2. 打开主 App → **我的 → 每日签到/签到抽盲盒**，点一次签到
-3. 日志应出现 `[BYD mina]`，关注 `op=`、`bodyLen`、`signLike`、`bodyHint`
-4. 若弹出「比亚迪 mina 签到线索」：把通知全文发我，继续做回放
-5. 若 bodyLen 仍为 0：确认资源已更新为 body 规则
-
-### 日志里大量 vehicleRealTime / getStatusNow 且 signLike=0
-
-这些是**车况/小组件接口**，`request` 字段不能用于积分签到。
-
-正确姿势：
-1. 更新 rewrite 到最新（已排除车况 super 域名）
-2. 打开 App → **我的/积分/签到/福利** 页，点一次「签到」
-3. 日志应出现 URL 含 `club` 或 `Sign.signIn`，且 `signLike=1`
-4. 再运行定时任务
-
-
-### mina body 已加密且 op 固定（capture-v7）
-
-现状（你日志已确认）：
-- `bodyLen>0`：body 抓包成功
-- `op=com.app.dynasty.srv` 固定 + `bodyHint` 乱码：网关内业务名不可见，属 mPaaS 正常现象
-- 无法仅靠关键字自动判定“哪一条是签到”
-
-操作：
-1. 强制更新到 capture-v7
-2. 打开 App → 我的 → 每日签到 → **点一次签到**
-3. 立刻运行任务：本地脚本设 `MarkMinaAsSign = true`（只跑这一次）
-4. 看到「已标记最近 mina 请求为签到凭证」后，把 `MarkMinaAsSign` **改回 false**
-5. 再手动运行任务做回放验证
-6. 把签到成功/失败通知与响应原文发我（若失败，继续适配）
-
-说明：mPaaS 请求常含时间戳/签名，**原样回放可能失败**；但先验证回放能否被服务端接受是必须一步。
-
-### mina 回放「响应非 JSON」/ 需二进制回放（capture-v8）
-
-现象（v7 已验证）：
-- `MarkMinaAsSign` 可标记成功，`bodyLen` 正常
-- 回放提示「响应非 JSON」：mina/mPaaS 返回常是**二进制**，不能按 JSON 判失败
-- 若 body hex 里大量 `fd`：说明 body 曾被当作 UTF-8 字符串损坏
-
-v8 改动：
-1. 抓包优先 `bodyBytes` → base64（`bodyB64`）持久化
-2. 回放用 `bodyBytes`，避免 string 损坏
-3. 响应输出 `http` / `respHex` / `respLen`，并写入 `BYD_LastReplay`
-4. 标记时优先 `com.app.dynasty.srv`，自动跳过 `switches` 类 RPC
-
-操作：
-1. **重写资源强制更新**到 capture-v8
-2. （建议）任务里 `DeleteCookie=true` 跑一次清旧凭证，再改回 false  
-   或至少清空 `BYD_Cookie` / `BYD_Cookies` / `BYD_MinaSign` / `BYD_MinaLast` / `BYD_MinaRing`
-3. 彻底杀掉比亚迪 App → 重新打开 → **我的 → 每日签到 → 点一次签到**
-4. 日志应出现：`[BYD mina] ... bodyLen=... src=bodyBytes`（`src=text` 也能用，但 bodyBytes 更稳）
-5. 本地脚本设 `MarkMinaAsSign = true` 跑一次 → 通知含 **`hasB64: 1`**
-6. **立刻改回** `MarkMinaAsSign = false`
-7. 再手动运行任务回放
-8. 把通知/日志里的 **`http` / `respHex` / `hasB64` / `BYD_LastReplay`** 发我
-
-结果解读：
-- `hasB64: 0`：本机 QX 未给出 bodyBytes，只能用 text 路径；把完整 [BYD mina] 日志发我
-- `mina回放已送达(HTTP 2xx)` + 二进制：请求已被服务端接受形态，**请对照 App 积分是否变化**；是否真正签到成功需结合积分/二次点签到验证
-- `HTTP 4xx/5xx` 或 respLen=0：可能是签名/时效/防重放，继续发元数据做判定
-
-说明：mPaaS 常含时间戳与网关签名，**不能保证长期纯回放稳定**；v8 先解决“二进制损坏 + 误判非 JSON”这两个确定问题。
-
-### 进签到页可标记但「今天点不了签到」（capture-v8.1）
-
-若当天已签过，只能进入签到页：
-
-1. v8 已验证：`src=bodyBytes`、`hasB64=1`、回放 `HTTP 200` + 二进制响应 —— **链路技术可行**
-2. 但「仅进页」产生的 `com.app.dynasty.srv` 更可能是查询/状态包，**不是签到写操作**
-3. v8.1 标记策略改为优先 **最新** `dynasty.srv`（不再按 body 最大）
-4. **请明天真实可点签到时**：点签到 → 立刻 `MarkMinaAsSign=true` → 改回 false → 回放  
-   并对照 **积分是否变化 / 是否提示已签到**
-5. 把新一次标记通知中的 `capturedAt` / `bodyLen` / `hex` 与回放 `http/respHex` 发我
-
-说明：若服务端对同一 payload 防重放，则「首次点签到成功 + 脚本二次回放失败」仍可能出现；那时需评估是否有可复用的日更凭证，而不是无限原样回放。
-
+**不提供**会员 SVIP / 倍速 / 清晰度解锁等破解脚本。

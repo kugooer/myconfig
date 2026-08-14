@@ -1,0 +1,4 @@
+# 无忧行 每日签到
+# 先挂 rewrite/JegoTrip_DailyBonus.conf，登录 App 后打开任务中心/签到页抓取 token
+
+15 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/JegoTrip_DailyBonus.js, tag=无忧行签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
