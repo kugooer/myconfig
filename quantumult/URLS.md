@@ -114,3 +114,22 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 
 本仓库仅托管**自建签到 / 抓包缓存凭证 / 定时任务**类配置。  
 **不提供**百度网盘等会员 SVIP / 倍速 / 清晰度解锁脚本。
+
+
+### 未获取到签到凭证（排障）
+
+报错 `未获取到签到凭证` 表示定时任务正常，但 **还没有成功抓到 `request`**。
+
+按顺序确认：
+1. 更新并启用重写：`quantumult/rewrite/BYD_DailyBonus.conf`
+2. QX：`MitM → HTTPS 解密` 开启，已安装/信任证书
+3. hostname 包含：
+   - `dilinkappserver-cn.byd.auto`
+   - `dilinksuperappserver-cn.byd.auto`
+4. 不要只跑定时任务：必须先打开比亚迪 App → **积分商城/签到**，必要时**点一次签到**
+5. 成功时应弹通知：`比亚迪签到凭证新增/更新成功`
+6. 再手动运行任务验证
+
+若仍失败：查看 QX 日志中的 `[BYD capture]` 行，或失败通知里的「最近抓包诊断」。
+- 诊断为「无」：rewrite/MitM 未命中 dilink
+- 有 URL 无 request：需要根据真实接口再适配

@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14
+  更新时间: 2026.08.14 (capture-v2)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -103,7 +103,8 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
 
     const cookies = ReadCookies();
     if (!cookies.length) {
-      throw new Error("未获取到签到凭证，请先在代理工具开启 MitM，登录比亚迪 App 后打开签到页 ‼️");
+      const tip = buildNoCookieTip();
+      throw new Error(tip);
     }
 
     for (let i = 0; i < cookies.length; i++) {
@@ -425,51 +426,120 @@ async function notify(index, cookieItem) {
   if (Notify) $nobyda.notify(title, subtitle, body);
 }
 
+function buildNoCookieTip() {
+  const diag = $nobyda.read("BYD_CaptureDiag") || "";
+  let tip =
+    "未获取到签到凭证 ‼️\n" +
+    "请按顺序检查:\n" +
+    "1) 重写资源已启用并更新到最新\n" +
+    "2) MITM 已开 HTTPS 解密，信任证书\n" +
+    "3) hostname 含 dilinkappserver-cn.byd.auto / dilinksuperappserver-cn.byd.auto\n" +
+    "4) 打开比亚迪 App → 积分商城/签到页（必要时点一次签到）\n" +
+    "5) 看到「凭证新增/更新成功」后再跑定时任务";
+  if (diag) {
+    tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 500);
+  } else {
+    tip += "\n—— 最近抓包诊断 ——\n无: 说明 rewrite/MitM 可能未命中任何 dilink 请求";
+  }
+  return tip;
+}
+
 function GetCookie() {
   try {
     const req = typeof $request !== "undefined" ? $request : null;
-    if (!req || !req.url) throw new Error("无法读取请求对象");
-
-    if (!/Sign\.signIn|serviceDir=Sign\.signIn|integralMall/i.test(req.url)) {
-      $nobyda.done();
+    if (!req || !req.url) {
+      console.log("[BYD] GetCookie: 无 $request");
+      $nobyda.done({});
       return;
     }
 
-    const host = (req.headers && (req.headers.Host || req.headers.host)) || extractHost(req.url) || HOST;
-    const bodyText = req.body || "";
+    const url = String(req.url || "");
+    const host = (req.headers && (req.headers.Host || req.headers.host)) || extractHost(url) || "";
+    const bodyText = typeof req.body === "string" ? req.body : (req.body ? String(req.body) : "");
+    const method = req.method || "";
+
+    // 记录诊断，便于定时任务失败时提示
+    const isBydHost = /byd\.auto|bydauto\.com|mina\.byd\.com/i.test(url + " " + host);
+    const isSignLike = /Sign\.signIn|serviceDir=Sign|integralMall|[Ss]ign[Ii]n|\/club\/|积分|sign/i.test(url);
+    const diagLine =
+      new Date().toISOString() +
+      ` | ${method} | host=${host || "-"} | bodyLen=${bodyText.length} | signLike=${isSignLike ? 1 : 0} | url=${url.slice(0, 220)}`;
+    console.log("[BYD capture] " + diagLine);
+    appendDiag(diagLine);
+
+    if (!isBydHost) {
+      $nobyda.done({});
+      return;
+    }
+
     let requestVal = "";
     let bodyJson = null;
 
     if (bodyText) {
+      const trimmed = bodyText.trim();
       try {
-        bodyJson = JSON.parse(bodyText);
+        bodyJson = JSON.parse(trimmed);
       } catch (e) {
-        // 可能是 x-www-form-urlencoded
-        const m = bodyText.match(/(?:^|&)request=([^&]+)/);
-        if (m) requestVal = decodeURIComponent(m[1]);
+        const m1 = bodyText.match(/(?:^|[&?])request=([^&]+)/i);
+        if (m1) requestVal = decodeURIComponent(m1[1].replace(/\+/g, " "));
+        // JSON 被截断或夹杂时兜底
+        if (!requestVal) {
+          const m2 = bodyText.match(/"request"\s*:\s*"([0-9A-Fa-f+/=]{32,})"/);
+          if (m2) requestVal = m2[1];
+        }
       }
     }
 
-    if (bodyJson && bodyJson.request) requestVal = String(bodyJson.request);
-    if (!requestVal && bodyText && /^[0-9A-Fa-f]{64,}$/.test(bodyText.trim())) {
+    if (bodyJson) {
+      if (bodyJson.request) requestVal = String(bodyJson.request);
+      else if (bodyJson.data && bodyJson.data.request) requestVal = String(bodyJson.data.request);
+      else if (bodyJson.params && bodyJson.params.request) requestVal = String(bodyJson.params.request);
+    }
+
+    if (!requestVal && bodyText && /^[0-9A-Fa-f+/=]{64,}$/.test(bodyText.trim())) {
       requestVal = bodyText.trim();
     }
 
-    if (!requestVal) throw new Error("未在请求体中找到 request 字段");
+    // 非签到类、且 body 无 request：只记诊断不打扰
+    if (!requestVal) {
+      if (isSignLike) {
+        const msg =
+          "已命中疑似签到请求，但 body 无 request 字段\n" +
+          `url: ${url.slice(0, 180)}\n` +
+          `bodyLen: ${bodyText.length}\n` +
+          "请在 QX 日志查看 [BYD capture] 完整 URL，并把该请求发我适配";
+        console.log("[BYD] " + msg);
+        $nobyda.notify("比亚迪抓包", "未解析到 request", msg);
+      }
+      $nobyda.done({});
+      return;
+    }
 
+    // 有 request 密文：签到页优先保存；其它 dilink 也保存为备选（前缀标记）
     const item = {
       request: requestVal,
-      host: String(host).replace(/:\d+$/, ""),
-      url: req.url,
-      name: "",
+      host: String(host || HOST).replace(/:\d+$/, ""),
+      url: url,
+      name: isSignLike ? "签到页" : " dilink-request",
       headers: sanitizeHeaders(req.headers || {}),
-      update: new Date().toISOString()
+      update: new Date().toISOString(),
+      signLike: !!isSignLike
     };
 
-    // 单账号键
-    $nobyda.write(JSON.stringify(item), "BYD_Cookie");
+    // 若已有明确签到凭证，非签到类 request 不覆盖单账号键
+    const prevRaw = $nobyda.read("BYD_Cookie");
+    let prev = null;
+    try {
+      prev = prevRaw ? JSON.parse(prevRaw) : null;
+    } catch (e) {
+      prev = null;
+    }
 
-    // 多账号列表: 按 request 前缀更新/新增
+    const shouldWritePrimary = isSignLike || !prev || !prev.request || prev.signLike === false;
+    if (shouldWritePrimary) {
+      $nobyda.write(JSON.stringify(item), "BYD_Cookie");
+    }
+
     let list = [];
     try {
       list = JSON.parse($nobyda.read("BYD_Cookies") || "[]");
@@ -486,25 +556,46 @@ function GetCookie() {
       if (o && (o.request || "").slice(0, 32) === key) {
         found = true;
         type = "更新";
-        return item;
+        return Object.assign({}, o, item);
       }
       return o || old;
     });
-    if (!found) list.push(item);
-    // 最多保留 10 个账号
-    list = list.filter(Boolean).slice(-10);
+    if (!found) {
+      // 签到类置顶
+      if (isSignLike) list.unshift(item);
+      else list.push(item);
+    }
+    // 最多保留 10 条
+    list = list.slice(0, 10);
     $nobyda.write(JSON.stringify(list), "BYD_Cookies");
 
-    const tip = `比亚迪签到凭证${type}成功 🎉\nHost: ${item.host}\nrequest: ${requestVal.slice(0, 24)}...`;
-    $nobyda.notify("比亚迪签到", "", tip);
-    console.log("\n" + tip);
+    const tip =
+      `类型: ${type}\n` +
+      `host: ${item.host}\n` +
+      `signLike: ${isSignLike ? "是" : "否"}\n` +
+      `request: ${requestVal.slice(0, 16)}...(${requestVal.length})\n` +
+      (isSignLike ? "可手动运行「比亚迪签到」任务验证" : "已缓存 request，建议再进一次签到页以获得 signIn 凭证");
+    console.log("\n比亚迪凭证" + type + "成功\n" + tip);
+    $nobyda.notify("比亚迪签到凭证" + type + "成功", item.host, tip);
   } catch (e) {
-    $nobyda.notify("比亚迪签到", "", "抓取凭证失败: " + (e.message || e) + " ‼️");
-    console.log(e);
-  } finally {
-    $nobyda.done();
+    console.log("GetCookie 异常: " + (e.stack || e));
+    $nobyda.notify("比亚迪抓包失败", "", String(e.message || e));
   }
+  $nobyda.done({});
 }
+
+function appendDiag(line) {
+  try {
+    const old = $nobyda.read("BYD_CaptureDiag") || "";
+    const lines = String(old)
+      .split(/\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    lines.unshift(String(line));
+    $nobyda.write(lines.slice(0, 8).join("\n"), "BYD_CaptureDiag");
+  } catch (e) {}
+}
+
 
 function sanitizeHeaders(headers) {
   const h = {};
