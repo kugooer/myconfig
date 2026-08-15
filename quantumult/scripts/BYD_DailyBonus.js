@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.14 (capture-v8.1-newest-mina)
+  更新时间: 2026.08.15 (capture-v8.1-tip-fix)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -590,19 +590,24 @@ function buildNoCookieTip() {
   const diag = $nobyda.read("BYD_CaptureDiag") || "";
   let tip =
     "未获取到签到凭证 ‼️\n" +
-    "当前没有可用 Sign/club 凭证（小组件车况 request 无效）。\n" +
-    "请严格按下面步骤：\n" +
-    "1) 重写资源强制更新到 capture-v7\n" +
+    "当前没有可用签到凭证（仅有 mina 抓包不够；需手动标记后才有回放凭证）。\n" +
+    "请严格按下面步骤（capture-v8.1）：\n" +
+    "1) 重写资源强制更新到 capture-v8.1（desc 含 bodyBytes / 最新 dynasty.srv）\n" +
     "2) MitM 开 HTTPS 解密并信任证书；hostname 含 dilinkappserver-cn.byd.auto、mina.byd.com\n" +
     "3) 策略 BYD 域名 DIRECT（保留 rewrite 解密）\n" +
     "4) 彻底杀进程后打开「比亚迪」主 App（非小组件）\n" +
-    "5) 我的 → 每日签到 / 积分商城，点一次签到\n" +
-    "6) 应出现「凭证新增/更新成功」；再跑定时任务\n" +
-    "当前主链路是 mina 加密网关：点签到后将脚本 MarkMinaAsSign=true 跑一次标记，再改回 false 做回放";
+    "5) 我的 → 每日签到，点一次真实签到（今天若按钮灰掉仅能进页，则等可点时再做）\n" +
+    "6) 立刻将脚本 MarkMinaAsSign=true 跑一次；通知应有 hasB64:1 与 capturedAt\n" +
+    "7) 立刻改回 MarkMinaAsSign=false，再手动运行任务回放\n" +
+    "说明：出现 [BYD mina] 只代表抓到了网关包，不会自动当签到凭证；开关类 op（switches/getUnionResource）无效";
   if (diag) {
     tip += "\n—— 最近抓包诊断 ——\n" + String(diag).slice(0, 700);
     if (/vehicleRealTime|getStatusNow|superappserver/i.test(diag) && !/dilinkappserver|\/club\/|Sign\.signIn|mina\.byd/i.test(diag)) {
       tip += "\n—— 解读 ——\n只有车况/小组件流量，没有主 App 签到流量。请进主 App 签到页；若仍无 dilinkappserver 诊断，优先怀疑证书固定/重写未生效。";
+    } else if (/switches\.all|getUnionResource|afterloginPb/i.test(diag) && !/com\.app\.dynasty\.srv/i.test(diag)) {
+      tip += "\n—— 解读 ——\n最近诊断只有首页/开关类 mina 包，没有 dynasty.srv。请进入「每日签到」页并点签到后再 MarkMinaAsSign。";
+    } else if (/com\.app\.dynasty\.srv/i.test(diag)) {
+      tip += "\n—— 解读 ——\n已抓到 dynasty.srv，但尚未标记为签到凭证。点完签到后立刻 MarkMinaAsSign=true 跑一次，确认 hasB64:1。";
     }
   } else {
     tip += "\n—— 最近抓包诊断 ——\n无。说明 rewrite 完全未命中。请强制更新重写并确认 MitM hostname。";
