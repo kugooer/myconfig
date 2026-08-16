@@ -182,3 +182,24 @@ v8.2：
 - 若回放 HTTP 200 但积分不变：说明防重放/包类型不对，仍需在「真实点签」瞬间对照积分
 - 完全无人值守是否可行，取决于服务端是否允许重复回放；当前只能最大化自动化抓取与回放链路
 
+### 打开 App 触发签到（capture-v9，推荐主模式）
+
+目标从「定时回放」改为「打开比亚迪 App 时触发一次签到」。
+
+行为：
+1. MitM 命中 `mina.byd.com .../mgw.htm`
+2. 抓到 `com.app.dynasty.srv`（`src=bodyBytes`）→ 自动暂存凭证
+3. **异步回放签到**（先 `$done` 放行 App 原请求，不拖慢 App）
+4. 默认同日完成后不再刷（`OpenAppSignOncePerDay`）+ 120s 去抖
+
+使用：
+1. 只挂 **rewrite**，任务 cron 可关
+2. 打开主 App → 最好再进「每日签到」页（更容易出 dynasty.srv）
+3. 看通知「比亚迪打开App签到」与日志 `[BYD openSign]`
+4. 以积分是否变化为准
+
+注意：
+- 仅首页 `switches` 不会触发签到
+- 回放的是抓到的最新 dynasty 包；若只是进页查询包，可能 HTTP 200 但积分不变
+- 同日重试：临时 `DeleteCookie=true` 清日标，或清 `BYD_OpenAppSignDate`
+
