@@ -189,7 +189,7 @@ v8.2：
 行为：
 1. MitM 命中 `mina.byd.com .../mgw.htm`
 2. 抓到 `com.app.dynasty.srv`（`src=bodyBytes`）→ 自动暂存凭证
-3. **异步回放签到**（先 `$done` 放行 App 原请求，不拖慢 App）
+3. **同步启动回放**（`$done` 前发起 `$task.fetch`，v9.2 起）
 4. 默认同日完成后不再刷（`OpenAppSignOncePerDay`）+ 120s 去抖
 
 使用：
@@ -199,7 +199,7 @@ v8.2：
 4. 以积分是否变化为准
 
 注意：
-- 仅首页 `switches` 不会触发签到
+- v9 早期：仅首页 `switches` 不会触发；**v9.1+** 已用 switches 作启动信号 + 缓存回放
 - 回放的是抓到的最新 dynasty 包；若只是进页查询包，可能 HTTP 200 但积分不变
 - 同日重试：临时 `DeleteCookie=true` 清日标，或清 `BYD_OpenAppSignDate`
 
@@ -221,3 +221,33 @@ v8.2：
 - 纯缓存回放可能被服务端 Ts/Sign/防重放拒绝；失败后需重新进页刷新
 - 脚本不能替用户“点开”签到页；只能在 MitM 看得到首页流量时动手
 
+
+
+### 打开 App 即 fire（capture-v9.2，修 pending 不 fire）
+
+问题：v9.1 日志只有 `[BYD openSign] pending`，没有 `fire/result`。  
+根因：QX `script-request` 在 `$done({})` 后常终止脚本上下文，`setTimeout(1.2s)` 的 `attemptFire` 不会执行。
+
+v9.2 改动：
+1. 收到首页启动信号后，**同步** `resolve` 缓存 `dynasty` 凭证并 `fire`
+2. **在 `$done` 之前**调用 `$task.fetch`（`BYDSignIn(s=0)` 立即发包）
+3. 取消依赖 done 后的长 `setTimeout` 回放
+4. 旧 MarkMinaAsSign 提示改为低频建仓提示（AutoPromote 为主）
+
+验收日志应依次出现：
+- `[BYD mina] ... switches...` 或 `dynasty.srv`
+- `[BYD openSign] pending mode=home|capture`
+- `[BYD openSign] fire mode=... hasB64=1`
+- `[BYD] mina 回放: ...`
+- `[BYD openSign] request-done via=fire-started`
+- （尽量）`[BYD openSign] result: ...` 与通知「比亚迪打开App签到」
+
+使用：
+1. 重写资源 **强制更新** 到 v9.2
+2. 若本机尚无凭证：一次性进「我的 → 每日签到」建仓（看 `autoPromote hasB64=1`）
+3. 杀进程后只开 App 到首页，不必再进签到页
+4. 若同日已尝试过：清 BoxJs/`BYD_OpenAppSignDate` 或等次日；也可短时关 `OpenAppSignOncePerDay` 测
+
+仍存在的业务边界：
+- 缓存包可能被防重放拒绝（HTTP 200 但积分不变）→ 再进签到页刷新 dynasty
+- 服务端积分以 App 为准；mina 响应常为二进制，脚本只能给「已送达」级判定

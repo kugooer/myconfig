@@ -1,5 +1,5 @@
-# 比亚迪 App 签到（打开 App 触发为主）
-# 主路径：启用 rewrite 后，打开 App/进签到页命中 mina dynasty.srv 即自动签到
+# 比亚迪 App 签到（打开 App 触发为主，capture-v9.2）
+# 主路径：启用 rewrite 后，打开 App 首页即 fire 缓存 dynasty 回放（不必进签到页；首次需建仓）
 # 下列 cron 仅备用（默认可关掉）；不依赖定时也能签
 
 # 10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到备用, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=false
