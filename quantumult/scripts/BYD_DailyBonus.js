@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.15 (capture-v8.1-tip-fix)
+  更新时间: 2026.08.16 (capture-v8.2-auto-promote)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -75,6 +75,10 @@ var DeleteCookie = false; // true = 清除已保存凭证
 var MarkMinaAsSign = false;
 // true = 签到时只回放 mina 网关请求（默认自动识别 type=mina）
 var PreferMinaReplay = true;
+// true = 抓到 dynasty.srv 时自动暂存为签到凭证（进页/点签都会更新；降低每天手动 Mark 成本）
+var AutoPromoteMina = true;
+// 自动暂存时是否弹通知（默认否，避免刷屏；标记结果仍写日志）
+var AutoPromoteNotify = false;
 var out = 0; // 超时(ms)，0 表示不强制超时
 var Notify = true; // 是否推送通知
 
@@ -115,7 +119,15 @@ var DefaultUA = "BYD/9.14.6 (iPhone; iOS 18.0; Scale/3.00)";
       throw new Error(marked);
     }
 
-    const cookies = ReadCookies();
+    let cookies = ReadCookies();
+    if (!cookies.length) {
+      // 兜底：环形缓冲里可能已有今日点签/进页抓到的 dynasty.srv，但用户没 Mark
+      const promoted = promoteBestMinaToCookie(false);
+      if (promoted) {
+        console.log("[BYD] 无本地凭证，已从 mina 缓冲自动提升: " + promoted);
+        cookies = ReadCookies();
+      }
+    }
     if (!cookies.length) {
       const tip = buildNoCookieTip();
       throw new Error(tip);
@@ -717,6 +729,15 @@ function GetCookie() {
       console.log("[BYD mina] " + diagMina);
       appendDiag(diagMina);
 
+      // 业务 RPC 自动暂存为签到凭证（排除 switches 等噪音）
+      if (AutoPromoteMina) {
+        try {
+          autoPromoteMinaIfEligible(minaSnap);
+        } catch (e) {
+          console.log("[BYD] autoPromote err: " + e);
+        }
+      }
+
       // 仅低频提示，避免首页刷屏
       maybeNotifyMinaHint(minaSnap);
       $nobyda.done({});
@@ -1064,12 +1085,90 @@ function maybeNotifyMinaHint(snap) {
   } catch (e) {}
 }
 
+
+function isPromotableMina(snap) {
+  if (!snap || !snap.url || !(snap.body || snap.bodyB64)) return false;
+  const op = String(snap.opType || "");
+  if (/switches\.all\.get|afterloginPb|alipay\.client\.switches|getUnionResource/i.test(op)) return false;
+  // 目前用户环境业务 RPC 统一是 dynasty.srv；保留扩展点
+  if (!/com\.app\.dynasty\.srv/i.test(op)) return false;
+  // 有 b64 更可靠；text 也可暂存但效果可能差
+  return true;
+}
+
+function autoPromoteMinaIfEligible(snap) {
+  if (!isPromotableMina(snap)) return false;
+  const msg = promoteMinaSnap(snap, {
+    name: "mina自动暂存",
+    notify: !!AutoPromoteNotify,
+    manual: false
+  });
+  if (msg) console.log("[BYD autoPromote] " + msg.replace(/\n/g, " | "));
+  return !!msg;
+}
+
+function promoteBestMinaToCookie(fromMark) {
+  const best = pickBestMinaCandidate();
+  if (!isPromotableMina(best)) return "";
+  return promoteMinaSnap(best, {
+    name: fromMark ? "mina签到(手动标记)" : "mina缓冲自动提升",
+    notify: false,
+    manual: !!fromMark
+  });
+}
+
+function promoteMinaSnap(snap, opts) {
+  opts = opts || {};
+  const item = normalizeCookie(
+    Object.assign({}, snap, {
+      type: "mina",
+      name: opts.name || "mina签到",
+      signLike: true,
+      _manual: !!opts.manual
+    })
+  );
+  if (!item) return "";
+  $nobyda.write(JSON.stringify(item), "BYD_Cookie");
+  $nobyda.write(JSON.stringify(item), "BYD_MinaSign");
+  let list = [];
+  try {
+    list = JSON.parse($nobyda.read("BYD_Cookies") || "[]");
+    if (!Array.isArray(list)) list = [];
+  } catch (e) {
+    list = [];
+  }
+  list = list.filter((x) => !(x && x.type === "mina"));
+  list.unshift(item);
+  list = list.slice(0, 10);
+  $nobyda.write(JSON.stringify(list), "BYD_Cookies");
+
+  const brief =
+    "op=" +
+    (item.opType || "-") +
+    " bodyLen=" +
+    (item.bodyLen || 0) +
+    " hasB64=" +
+    (item.bodyB64 ? 1 : 0) +
+    " at=" +
+    (item.update || snap.update || "-");
+  if (opts.notify && Notify) {
+    $nobyda.notify("比亚迪凭证已自动暂存", item.name || "mina", brief + "\n定时任务将回放该包；若积分不变可明天点签后对照");
+  }
+  return brief;
+}
+
 function markLastMinaAsSign() {
   let last = pickBestMinaCandidate();
   if (!last || !(last.body || last.bodyB64) || !last.url) {
     return (
       "标记失败：还没有可用 mina 抓包。\n" +
       "请先打开比亚迪 App 进入签到页点一次签到，确认日志有 [BYD mina] bodyLen>0，再 MarkMinaAsSign=true 运行"
+    );
+  }
+  if (!isPromotableMina(last)) {
+    return (
+      "标记失败：最近包不是可回放的 dynasty.srv（可能是 switches/getUnionResource）。\n" +
+      "请进入每日签到页并点签到后立刻再标记"
     );
   }
 
@@ -1082,22 +1181,7 @@ function markLastMinaAsSign() {
     })
   );
   if (!item) return "标记失败：normalize 失败";
-
-  $nobyda.write(JSON.stringify(item), "BYD_Cookie");
-  $nobyda.write(JSON.stringify(item), "BYD_MinaSign");
-
-  let list = [];
-  try {
-    list = JSON.parse($nobyda.read("BYD_Cookies") || "[]");
-    if (!Array.isArray(list)) list = [];
-  } catch (e) {
-    list = [];
-  }
-  // 去掉旧 mina
-  list = list.filter((x) => !(x && x.type === "mina"));
-  list.unshift(item);
-  list = list.slice(0, 10);
-  $nobyda.write(JSON.stringify(list), "BYD_Cookies");
+  promoteMinaSnap(last, { name: "mina签到(手动标记)", notify: false, manual: true });
 
   return (
     "已标记最近 mina 请求为签到凭证 ✅\n" +
@@ -1111,7 +1195,6 @@ function markLastMinaAsSign() {
     "若回放仍失败：把通知里的 http/respHex/BYD_LastReplay 发我"
   );
 }
-
 
 function appendDiag(line) {
   try {
