@@ -2,14 +2,15 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.16 (capture-v9-open-app-sign)
+  更新时间: 2026.08.16 (capture-v9.1-open-home-cache)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
   说明:
-  1) 主模式：打开比亚迪 App（进入签到相关页出现 mina dynasty.srv）时自动尝试签到
-  2) MitM 抓取 bodyBytes，暂存凭证后异步回放（不阻塞原请求）
-  3) 默认同日只成功尝试有限次；定时任务仅作可选备用
+  1) 目标：仅打开比亚迪 App（不必进签到页）即尝试自动签到
+  2) 打开时首页 mina 流量（如 switches）作为“启动信号”，回放**已缓存**的签到包
+  3) 首次/失效时需进一次签到页抓取 dynasty 凭证；进签到页后 App 本身常会自签
+  4) 默认同日只尝试一次；定时任务可选
 
   注意:
   - 比亚迪签到 body 中的 request 为客户端加密载荷，随登录态变化
@@ -79,8 +80,10 @@ var PreferMinaReplay = true;
 var AutoPromoteMina = true;
 // 自动暂存时是否弹通知（默认否，避免刷屏；标记结果仍写日志）
 var AutoPromoteNotify = false;
-// true = 打开 App 抓到 dynasty.srv 时异步触发一次签到（主模式，推荐）
+// true = 打开 App（首页 mina 启动信号）时异步触发一次签到（主模式）
 var SignOnAppOpen = true;
+// true = 允许用“首页启动信号 + 缓存凭证”签到，不必进签到页
+var SignOnHomeOpen = true;
 // true = 自然日成功/明确完成后不再自动签（防一天内刷屏回放）
 var OpenAppSignOncePerDay = true;
 // 同一时段多条 dynasty 包的去抖（秒）
@@ -755,11 +758,16 @@ function GetCookie() {
       // 仅低频提示，避免首页刷屏
       maybeNotifyMinaHint(minaSnap);
 
-      // 主模式：打开 App 命中 dynasty.srv 后异步签到（先放行原请求，不阻塞 App）
-      // 进页常连发多条 dynasty：先放行+暂存，窗口结束再取最新一条回放
-      if (SignOnAppOpen && isPromotableMina(minaSnap)) {
+      // 主模式：打开 App = 首页 mina 启动信号 → 回放缓存签到包（不必进签到页）
+      // dynasty.srv：用于刷新缓存凭证；switches/afterlogin：仅作打开信号
+      if (SignOnAppOpen) {
         try {
-          scheduleOpenAppSign(minaSnap);
+          if (isPromotableMina(minaSnap)) {
+            // 进签到页才会出现：刷新 CK；若 App 已自签，脚本同日也只尝试一次
+            scheduleOpenAppSign(minaSnap, "capture");
+          } else if (SignOnHomeOpen && isHomeOpenSignal(minaSnap)) {
+            scheduleOpenAppSign(minaSnap, "home");
+          }
         } catch (e) {
           console.log("[BYD] openAppSign schedule err: " + e);
         }
@@ -1139,88 +1147,147 @@ function markOpenAppSignDayDone() {
   $nobyda.write(dayKeyLocal(), "BYD_OpenAppSignDate");
 }
 
-// 用持久化时间戳做“连发包静默窗口”。QX 每个 request 可能是新上下文，不依赖内存 timer 是否跨请求存活。
-function scheduleOpenAppSign(snap) {
-  if (!canTriggerOpenAppSign()) return;
+// 打开 App 首页常见 mina op（不是签到 body，只当启动信号）
+function isHomeOpenSignal(snap) {
+  if (!snap) return false;
+  const op = String(snap.opType || "");
+  return /switches\.all\.get|afterloginPb|alipay\.client\.switches|getUnionResource/i.test(op);
+}
+
+// 解析真正用于回放的签到凭证：优先缓存，不以首页 switches body 当签到包
+function resolveOpenAppSignItem() {
+  const tryParse = (raw) => {
+    if (!raw) return null;
+    try {
+      return normalizeCookie(JSON.parse(raw));
+    } catch (e) {
+      return null;
+    }
+  };
+
+  let item = tryParse($nobyda.read("BYD_MinaSign"));
+  if (item && isValidSignCookie(item) && item.type === "mina") return item;
+
+  item = tryParse($nobyda.read("BYD_Cookie"));
+  if (item && isValidSignCookie(item) && item.type === "mina") return item;
 
   try {
-    promoteMinaSnap(snap, { name: "打开App自动签到", notify: false, manual: false });
+    const list = JSON.parse($nobyda.read("BYD_Cookies") || "[]");
+    if (Array.isArray(list)) {
+      for (let i = 0; i < list.length; i++) {
+        const ck = normalizeCookie(list[i]);
+        if (ck && ck.type === "mina" && isValidSignCookie(ck)) return ck;
+      }
+    }
   } catch (e) {}
+
+  // 环缓里最新 dynasty（可能刚在签到页抓到）
+  const best = pickBestMinaCandidate();
+  if (isPromotableMina(best)) {
+    const ck = normalizeCookie(
+      Object.assign({}, best, {
+        type: "mina",
+        name: "mina缓冲",
+        signLike: true
+      })
+    );
+    if (ck) return ck;
+  }
+  return null;
+}
+
+// mode: "home" | "capture"
+// home = 打开首页信号，只回放缓存，不把当前 snap 当签到 body
+// capture = 抓到 dynasty，先刷新缓存，再回放
+function scheduleOpenAppSign(snap, mode) {
+  mode = mode || "home";
+
+  // 抓到 dynasty 时始终刷新缓存（即便今日已签/已尝试）
+  if (mode === "capture" && isPromotableMina(snap)) {
+    try {
+      promoteMinaSnap(snap, { name: "mina签到凭证", notify: false, manual: false });
+    } catch (e) {}
+  }
+
+  // 今日已完成则不再回放
+  if (!canTriggerOpenAppSign()) return;
 
   const now = Date.now();
   $nobyda.write(String(now), "BYD_OpenAppPendingAt");
+  $nobyda.write(String(mode || "home"), "BYD_OpenAppPendingMode");
   console.log(
-    "[BYD openSign] pending op=" +
-      (snap.opType || "-") +
-      " bodyLen=" +
-      (snap.bodyLen || 0) +
+    "[BYD openSign] pending mode=" +
+      mode +
+      " signalOp=" +
+      ((snap && snap.opType) || "-") +
       " at=" +
       now
   );
 
-  const collectMs = 1800;
+  // 首页 switches 通常很快结束；1.2s 够；capture 连发 dynasty 用 1.8s
+  const collectMs = mode === "capture" ? 1800 : 1200;
   const myPending = now;
+
   const attemptFire = () => {
     try {
       if (!canTriggerOpenAppSign()) return;
       const pendingAt = Number($nobyda.read("BYD_OpenAppPendingAt") || 0);
-      // 还有更新的包：让更晚的 schedule 负责
       if (pendingAt > myPending) {
-        console.log("[BYD openSign] newer packet exists, yield");
+        console.log("[BYD openSign] newer signal, yield");
         return;
       }
-      // 静默窗口未结束（保护 setTimeout 漂移）
       if (Date.now() - pendingAt < collectMs - 50) {
         console.log("[BYD openSign] still collecting");
         return;
       }
-      const best = pickBestMinaCandidate();
-      if (!isPromotableMina(best)) {
-        console.log("[BYD openSign] no candidate");
+
+      const item = resolveOpenAppSignItem();
+      if (!item) {
+        console.log("[BYD openSign] no cached sign cookie");
+        if (Notify) {
+          $nobyda.notify(
+            "比亚迪打开App签到",
+            "缺少签到凭证",
+            "打开首页已检测到，但本地还没有可回放的签到包。\n请「一次性」进入：我的 → 每日签到（让 App 自签即可），脚本会缓存 dynasty 凭证；\n之后一般只需打开 App，无需再进签到页。\n若长期只开首页从不进签到页，将无法建立首次凭证。"
+          );
+        }
+        // 不记 day done，便于用户进页抓到后再触发
         return;
       }
-      // 日锁抢占，防多个 timer 同时 fire
-      const lock = Number($nobyda.read("BYD_OpenAppSignLock") || 0);
-      const now2 = Date.now();
-      if (lock && now2 - lock < Math.max(collectMs, 3000)) {
-        // 若 lock 是本次窗口内且已触发过 fire 标记
-        const fired = $nobyda.read("BYD_OpenAppFiredAt") || "";
-        if (fired === dayKeyLocal() + ":" + String(pendingAt)) {
-          console.log("[BYD openSign] already fired this burst");
-          return;
-        }
+
+      const firedKey = dayKeyLocal() + ":" + String(pendingAt);
+      if ($nobyda.read("BYD_OpenAppFiredAt") === firedKey) {
+        console.log("[BYD openSign] already fired this burst");
+        return;
       }
-      $nobyda.write(dayKeyLocal() + ":" + String(pendingAt), "BYD_OpenAppFiredAt");
+      $nobyda.write(firedKey, "BYD_OpenAppFiredAt");
       markOpenAppSignLock();
-      triggerOpenAppSign(best);
+      triggerOpenAppSign(item);
     } catch (e) {
       console.log("[BYD openSign] attemptFire err: " + e);
     }
   };
 
-  if (typeof setTimeout !== "undefined") {
-    setTimeout(attemptFire, collectMs);
-  } else {
-    attemptFire();
-  }
+  if (typeof setTimeout !== "undefined") setTimeout(attemptFire, collectMs);
+  else attemptFire();
 }
 
-function triggerOpenAppSign(snap) {
-  const item = normalizeCookie(
-    Object.assign({}, snap, {
-      type: "mina",
-      name: "打开App自动签到",
-      signLike: true,
-      _manual: false
-    })
-  );
-  if (!item) {
-    console.log("[BYD openSign] normalize failed");
+function triggerOpenAppSign(itemOrSnap) {
+  const item =
+    itemOrSnap && itemOrSnap.type === "mina" && itemOrSnap.bodyB64
+      ? itemOrSnap
+      : normalizeCookie(
+          Object.assign({}, itemOrSnap || {}, {
+            type: "mina",
+            name: (itemOrSnap && itemOrSnap.name) || "打开App自动签到",
+            signLike: true,
+            _manual: false
+          })
+        );
+  if (!item || !isValidSignCookie(item)) {
+    console.log("[BYD openSign] invalid item");
     return;
   }
-  try {
-    promoteMinaSnap(snap, { name: "打开App自动签到", notify: false, manual: false });
-  } catch (e) {}
 
   console.log(
     "[BYD openSign] fire op=" +
@@ -1229,8 +1296,8 @@ function triggerOpenAppSign(snap) {
       (item.bodyLen || 0) +
       " hasB64=" +
       (item.bodyB64 ? 1 : 0) +
-      " at=" +
-      (item.update || snap.update || "-")
+      " name=" +
+      (item.name || "-")
   );
 
   const run = () => {
@@ -1244,7 +1311,7 @@ function triggerOpenAppSign(snap) {
         const title = "比亚迪打开App签到";
         const msg = st.notify || "无明细";
         console.log("[BYD openSign] result: " + msg);
-        if (Notify) $nobyda.notify(title, item.name || "", msg);
+        if (Notify) $nobyda.notify(title, item.name || "缓存回放", msg);
       })
       .catch((e) => {
         console.log("[BYD openSign] exception: " + e);
