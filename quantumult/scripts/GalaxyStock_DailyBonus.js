@@ -2,26 +2,29 @@
 
   银河证券（中国银河证券 App）每日签到
 
-  更新时间: 2026-08-17 (capture-v1.0)
+  更新时间: 2026-08-17 (capture-v1.1)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
+
+  v1.1 修复（2026-08-17 09:50 用户日志）:
+  - QX 通知 API 改为 $notify()（$notification 是 Surge/Loon 专属，QX 报 undefined）
+  - 打开App自动签到改为「命中即同步 fire + 立即 done」：
+    不再依赖 setTimeout（QX 在 $done 后会终止脚本上下文，$done 后/依赖定时器
+    的回放会被杀——BYD capture-v9.1/9.2 已验证）。$task.fetch 在 $done 之前
+    同步发起，fetch 回调（写 AutoDate + 通知）仍会执行。
+    「打开后 1~3 秒签到」由链路天然承担：打开 App → 进智能VIP页 → H5 发请求，
+    命中时已距打开 1~3 秒；脚本命中即签，不再额外等待。
+  - 并发命中用持久化 lock 去抖（GS_OpenSignLock 120s）
+  - 同日只自动签一次（GS_AutoDate）
+  - 异步 IIFE 的 finally 不再对 isRequest 分支重复 done
 
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
     body: {}  (Content-Type: application/json)
     响应: {"ret":{"error":"0","msg":"操作成功"},"data":1}  → 成功
-  - 凭证: 请求头 Cookie 中的 SESSION=xxx（打开 App 后 H5 自动请求 vip 系列接口时携带）
-  - 触发: App 内 H5 (cdns.chinastock.com.cn) 自动请求
-    /h5_gateway/smart-trade/vip/activityStatus|customerFreeRight|checkIn ... 即可抓到 SESSION
-
-  行为:
-  1) MitM 命中 mall.chinastock.com.cn/h5_gateway/smart-trade/vip/* → 提取 SESSION 持久化
-  2) 打开 App 自动签到: 抓到 SESSION 后延时 1~3 秒自动调用 checkIn（同日仅一次，5 分钟去抖）
-  3) 定时任务兜底: 读已存 SESSION 直接签到
-
-  注意:
-  - 仅在登录状态下 SESSION 有效; 重登后需重新打开 App 任意页刷新凭证
-  - 禁止用于会员解锁类用途
+  - 凭证: 请求头 Cookie 中的 SESSION=xxx（进入「智能VIP/VIP中心」H5 页面时携带）
+  - 触发: 仅打开 App 首页不请求 mall.chinastock.com.cn；
+    需进入 smartTrade-Vip H5（智能VIP中心）页面，H5 自动请求 vip 系列接口
 
 *************************
 
@@ -38,15 +41,13 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/Galax
 
 *************************/
 
-var LogDetails = false;
 var Notify = true;
-// 打开 App 后自动签到（主模式）
+// 打开 App（进智能VIP/VIP中心页）后自动签到（主模式）
 var AutoSignOnOpen = true;
-// 打开 App 后等待 1~3 秒再签到（毫秒）
-var AutoDelayMin = 1000;
-var AutoDelayMax = 3000;
-// 同日打开 App 只自动签一次（配合 5 分钟去抖，避免并发命中重复签到）
+// 同日打开 App 只自动签一次
 var OpenAppOncePerDay = true;
+// 并发去抖窗口（毫秒）：App 同时发多个 vip 请求时只签一次
+var OpenSignLockMs = 120 * 1000;
 // 签到成功后的奖励提示（可自行修改）
 var RewardTip = "今天签到完成，奖励抽中智能VIP 1天特权。VIP到期日：2027-09-19";
 
@@ -56,29 +57,27 @@ var HOST = "mall.chinastock.com.cn";
 var SIGN_PATH = "/h5_gateway/smart-trade/vip/checkIn";
 var DefaultUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148/ChinaStockApp theme/light lang/zh-CN";
 
+// isRequest 分支自行管理 $done，finally 不重复 done
+var isRequestMode = false;
+
 (async () => {
   try {
     if ($nobyda.isRequest) {
-      // —— MitM 命中：抓 SESSION + 打开 App 自动签到 ——
-      const needDelay = GetCookie();
-      if (needDelay) {
-        const delay = AutoDelayMin + Math.floor(Math.random() * (AutoDelayMax - AutoDelayMin));
-        console.log("[GS] 打开App自动签到: " + delay + "ms 后发起");
-        setTimeout(() => {
-          $nobyda.write(String(Date.now()), PREFIX + "_AutoTime"); // 先打去抖标记
-          doCheckIn(needDelay, "open"); // 发起签到（不阻塞 done）
-          $nobyda.done();
-        }, delay);
-      } else {
-        $nobyda.done();
+      isRequestMode = true;
+      const session = GetCookie();
+      if (session) {
+        // 打开App自动签到：命中即同步 fire（$done 前发起 $task.fetch，避免被 QX 终止）
+        console.log("[GS] 打开App自动签到 fire");
+        doCheckIn(session, "open");
       }
+      $nobyda.done(); // 立即放行 App 原请求
       return;
     }
 
     // —— 定时任务 / 手动运行：读凭证直接签到 ——
     const session = $nobyda.read(PREFIX + "_Session");
     if (!session || !session.trim()) {
-      throw new Error("未抓到 SESSION 凭证：请先打开银河证券 App 任意页面（MitM 生效后自动抓取）");
+      throw new Error("未抓到 SESSION 凭证：请打开银河证券 App 进入智能VIP/VIP中心页面");
     }
     if (OpenAppOncePerDay && $nobyda.read(PREFIX + "_AutoDate") === dayStr()) {
       console.log("[GS] 今日已通过打开App自动签到，跳过定时任务");
@@ -91,13 +90,13 @@ var DefaultUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWeb
     console.log("\n" + (e.stack || e));
   } finally {
     $nobyda.time();
-    $nobyda.done();
+    if (!isRequestMode) $nobyda.done();
   }
 })();
 
 /**
  * 抓取 SESSION cookie（isRequest 分支）
- * @returns {string|false} 需要自动签到时返回 SESSION，否则 false
+ * @returns {string|false} 需要自动签到时返回 SESSION（并已写去抖 lock），否则 false
  */
 function GetCookie() {
   const hd = ($request && $request.headers) || {};
@@ -121,12 +120,14 @@ function GetCookie() {
     console.log("[GS] 今日已自动签到，跳过");
     return false;
   }
-  // 5 分钟去抖：避免 App 并发请求/多次命中重复签到
-  const last = parseInt($nobyda.read(PREFIX + "_AutoTime") || "0", 10);
-  if (Date.now() - last < 5 * 60 * 1000) {
-    console.log("[GS] 去抖窗口内（5min），跳过自动签到");
+  // 持久化 lock 去抖：App 并发多个 vip 请求时只签一次
+  const lock = parseInt($nobyda.read(PREFIX + "_OpenSignLock") || "0", 10);
+  if (Date.now() - lock < OpenSignLockMs) {
+    console.log("[GS] 去抖窗口内（" + (OpenSignLockMs / 1000) + "s），跳过自动签到");
     return false;
   }
+  // 同步写 lock（fire 前，保证并发命中互斥）
+  $nobyda.write(String(Date.now()), PREFIX + "_OpenSignLock");
   return session;
 }
 
@@ -206,9 +207,9 @@ function nobyda() {
     const m = title + (subtitle ? " - " + subtitle : "") + (message ? "\n" + message : "");
     console.log("[GS] notify: " + m);
     if (Notify === false) return;
-    if (isQuanX) $notification.post(title, subtitle || "", message || "");
-    if (isSurge || isLoon) $notification.post(title, subtitle || "", message || "");
-    if (isNode) console.log("[GS] notify: " + m);
+    if (isQuanX) $notify(title, subtitle || "", message || ""); // QX: $notify()
+    if (isSurge) $notification.post(title, subtitle || "", message || ""); // Surge
+    if (isLoon) $notification.post(title, subtitle || "", message || ""); // Loon
   };
 
   const write = (value, key) => {
