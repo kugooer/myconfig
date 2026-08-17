@@ -162,13 +162,18 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/JegoTrip
 
 ## 四、银河证券 App 签到
 
-更新说明（2026-08-17 / capture-v1.1）：
+更新说明（2026-08-17 / capture-v1.3）：
 - 抓包定位：H5 网关 `mall.chinastock.com.cn/h5_gateway/smart-trade/vip/*`
 - 凭证：请求头 `Cookie: SESSION=...`（进入「智能VIP/VIP中心」H5 页面时携带）
 - 签到接口：`POST /h5_gateway/smart-trade/vip/checkIn`，body `{}`
   - 响应 `{"ret":{"error":"0","msg":"操作成功"},"data":1}` → 签到成功
 - **主模式**：打开 App 进入「智能VIP/VIP中心」页 → 命中即自动签到并通知
-  （v1.0 曾用 setTimeout 延迟 1~3s，QX 会杀定时器导致不回放；v1.1 改为命中即同步 fire）
+  - v1.0 用 setTimeout 延迟 1~3s：QX 在 `$done` 后杀定时器 → 改为命中即同步 fire
+  - v1.1 修复通知 API（QX 用 `$notify()`）+ 并发去抖
+  - v1.2 改「等待 fetch 完成再 done」：fire-and-forget 的 `return` 后 QX 终止上下文，
+    Promise 恒 pending → 回调不执行、无结果通知
+  - **v1.3 核心修复**：主流程 `await` 保持脚本存活（`Promise.race` 2.5s 超时兜底），
+    `$task.fetch` 回调必然执行 → 签到结果通知可靠
 - 并发去抖：`GS_OpenSignLock` 120s；同日一次：`GS_AutoDate`
 - 定时任务（9:30）作为兜底，错过打开 App 时补签
 
@@ -202,7 +207,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/GalaxySt
 
 1. 开启 MITM，信任证书；重写资源强制更新
 2. hostname 仅：`mall.chinastock.com.cn`（勿整域 `*.chinastock.com.cn`，避免拖垮 App）
-3. 打开银河证券 App → 任意页面（H5 会自动请求 vip 接口），看通知「SESSION 凭证已更新」
+3. 打开银河证券 App → **进入「智能VIP/VIP中心」页**（仅首页不请求 mall 域，MitM 不命中），看通知「SESSION 凭证已更新」
 4. 之后每次打开 App，延时 1~3 秒自动签到并通知「今天签到完成…」
 5. SESSION 失效（重登/过期）会提示，重新打开 App 即可刷新
 6. 奖励文案默认「智能VIP 1天特权 / VIP到期日 2027-09-19」，可在脚本顶部 `RewardTip` 修改

@@ -2,7 +2,7 @@
 
   银河证券（中国银河证券 App）每日签到
 
-  更新时间: 2026-08-17 (capture-v1.1)
+  更新时间: 2026-08-17 (capture-v1.3)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -24,6 +24,13 @@
   - 改为「等待签到完成（最多 2.5s 超时兜底）再 $done 放行原请求」：
     保证 fetch 回调在 $done 前执行完，签到结果通知 100% 可靠
     银河 checkIn 响应快(<500ms)，对被拦截的 H5 请求影响极小
+
+  v1.3 修复（2026-08-17 10:02 用户日志）:
+  - v1.2 等待 Promise 仍无 checkIn HTTP：脚本主流程 return 后 QX 终止异步上下文，
+    $task.fetch 回调不执行、Promise 恒 pending → 等不到
+  - 改为 isRequest 分支 **await** doCheckIn（Promise.race 含 2.5s 超时兜底）：
+    脚本主流程保持存活直到签到完成，回调必然执行、结果通知可靠
+  - 新增超时/完成路径日志，便于区分「fetch 正常」与「回调未执行」
 
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
@@ -75,18 +82,13 @@ var isRequestMode = false;
       isRequestMode = true;
       const session = GetCookie();
       if (session) {
-        // 打开App自动签到：fire 并等待完成（最多 OpenSignWaitMs 超时兜底），
-        // 确保 $task.fetch 回调在 $done 之前执行完 → 结果通知可靠
+        // 打开App自动签到：**await** 等待签到完成（最多 OpenSignWaitMs 超时兜底）。
+        // 关键：主流程 await 保持脚本存活，$task.fetch 回调必然执行（v1.2 的
+        // fire-and-forget 在 return 后被 QX 终止上下文、Promise 恒 pending → 等不到）
         console.log("[GS] 打开App自动签到 fire");
-        const p = doCheckIn(session, "open");
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          $nobyda.done();
-        };
-        p.then(finish).catch(finish);
-        setTimeout(finish, OpenSignWaitMs); // 超时兜底：不阻塞原请求过久
+        await raceTimeout(doCheckIn(session, "open"), OpenSignWaitMs);
+        console.log("[GS] 打开App自动签到流程结束，放行原请求");
+        $nobyda.done();
         return;
       }
       $nobyda.done();
@@ -196,6 +198,22 @@ function doCheckIn(session, mode) {
       }
     });
   });
+}
+
+/**
+ * Promise 超时兜底：ms 内未 settle 则 resolve（不阻塞原请求过久）
+ * 超时仅影响「放行时机」，fetch 仍可能在后台完成（结果通知尽力而为）
+ */
+function raceTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      setTimeout(() => {
+        console.log("[GS] 等待签到完成超时（" + ms + "ms），直接放行原请求");
+        resolve();
+      }, ms);
+    })
+  ]);
 }
 
 function dayStr() {
