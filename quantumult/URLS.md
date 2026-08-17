@@ -162,12 +162,14 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/JegoTrip
 
 ## 四、银河证券 App 签到
 
-更新说明（2026-08-17 / capture-v1.0）：
+更新说明（2026-08-17 / capture-v1.1）：
 - 抓包定位：H5 网关 `mall.chinastock.com.cn/h5_gateway/smart-trade/vip/*`
-- 凭证：请求头 `Cookie: SESSION=...`（打开 App 后 H5 自动请求 vip 接口时携带）
+- 凭证：请求头 `Cookie: SESSION=...`（进入「智能VIP/VIP中心」H5 页面时携带）
 - 签到接口：`POST /h5_gateway/smart-trade/vip/checkIn`，body `{}`
   - 响应 `{"ret":{"error":"0","msg":"操作成功"},"data":1}` → 签到成功
-- **主模式**：打开 App 后延时 1~3 秒自动签到并通知（同日一次 + 5min 去抖）
+- **主模式**：打开 App 进入「智能VIP/VIP中心」页 → 命中即自动签到并通知
+  （v1.0 曾用 setTimeout 延迟 1~3s，QX 会杀定时器导致不回放；v1.1 改为命中即同步 fire）
+- 并发去抖：`GS_OpenSignLock` 120s；同日一次：`GS_AutoDate`
 - 定时任务（9:30）作为兜底，错过打开 App 时补签
 
 ### 推荐（QX 重写资源）
