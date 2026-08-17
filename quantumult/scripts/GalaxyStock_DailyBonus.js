@@ -2,7 +2,7 @@
 
   银河证券（中国银河证券 App）每日签到
 
-  更新时间: 2026-08-17 (capture-v1.3)
+  更新时间: 2026-08-17 (capture-v1.4)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -31,6 +31,13 @@
   - 改为 isRequest 分支 **await** doCheckIn（Promise.race 含 2.5s 超时兜底）：
     脚本主流程保持存活直到签到完成，回调必然执行、结果通知可靠
   - 新增超时/完成路径日志，便于区分「fetch 正常」与「回调未执行」
+
+  v1.4 扩展（2026-08-17 用户需求: 登录后自动触发，不进VIP页）:
+  - 触发面从 vip/* 扩展到整个 mall 网关 h5_gateway/*：
+    若 H5 登录页/登录后初始化也走 mall 网关域，登录完成即触发签到
+  - 新增「命中」日志（打印 URL），用于确认登录链路是否触发脚本
+  - 签到判定不变：仅当请求头带 SESSION 且同日未签/去抖外才签到；无 SESSION 直接放行
+  - 定时任务保留为可选兜底；用户每日登录模式不依赖它
 
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
@@ -80,6 +87,8 @@ var isRequestMode = false;
   try {
     if ($nobyda.isRequest) {
       isRequestMode = true;
+      // 命中日志：确认登录/进页等动作是否触发脚本（无 SESSION 的请求也会打印）
+      console.log("[GS] 命中: " + ($request && $request.url || "?"));
       const session = GetCookie();
       if (session) {
         // 打开App自动签到：**await** 等待签到完成（最多 OpenSignWaitMs 超时兜底）。
