@@ -162,25 +162,22 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/JegoTrip
 
 ## 四、银河证券 App 签到
 
-更新说明（2026-08-17 / capture-v1.4）：
+更新说明（2026-08-17 / capture-v1.6）：
 - 抓包定位：H5 网关 `mall.chinastock.com.cn/h5_gateway/smart-trade/vip/*`
 - 凭证：请求头 `Cookie: SESSION=...`（进入「智能VIP/VIP中心」H5 页面时携带）
 - 签到接口：`POST /h5_gateway/smart-trade/vip/checkIn`，body `{}`
   - 响应 `{"ret":{"error":"0","msg":"操作成功"},"data":1}` → 签到成功
-- **v1.4 触发面扩展**：rewrite 规则从 `smart-trade/vip/*` 扩到整个
-  `mall.chinastock.com.cn/h5_gateway/*`——若登录流程（H5 登录页/登录后初始化）
-  也走 mall 网关域，**登录完成即自动触发签到**（无需专门进 VIP 页）
-  - 脚本判定不变：请求头带 SESSION 且同日未签才签到，无 SESSION 直接放行
-  - 新增「命中」日志（`[GS] 命中: <url>`），用于确认登录链路是否触发
-- **主模式**：登录/打开 App（任何命中 mall 网关的请求）→ 带 SESSION 即自动签到并通知
-  - v1.0 用 setTimeout 延迟 1~3s：QX 在 `$done` 后杀定时器 → 改为命中即同步 fire
-  - v1.1 修复通知 API（QX 用 `$notify()`）+ 并发去抖
-  - v1.2 改「等待 fetch 完成再 done」：fire-and-forget 的 `return` 后 QX 终止上下文，
-    Promise 恒 pending → 回调不执行、无结果通知
-  - **v1.3 核心修复**：主流程 `await` 保持脚本存活（`Promise.race` 2.5s 超时兜底），
+- **触发方式（结论）**：**必须进入「智能VIP/VIP中心」H5 页面**才能触发。
+  已实测排除「登录后自动触发」：
+  - v1.4 扩触发面至整个 mall 网关：登录后无任何命中（登录不走 mall 域）
+  - v1.5 全域诊断 `*.chinastock.com.cn`：面容解锁/登录/启动链路只有 CDN 图片
+    （infoanaly/cdns 的 jpg）与原生 API，**全域无 SESSION** → QX 重写层无登录触发点
+  - v1.6 收窄回 mall 域，恢复 v1.3 可靠链路（进页即自动签）
+- **主模式**：打开 App → 进入「智能VIP/VIP中心」页 → 自动签到并通知
+  - v1.3 核心修复：主流程 `await` 保持脚本存活（`Promise.race` 2.5s 超时兜底），
     `$task.fetch` 回调必然执行 → 签到结果通知可靠
 - 并发去抖：`GS_OpenSignLock` 120s；同日一次：`GS_AutoDate`
-- 定时任务（9:30）保留为**可选兜底**（每日登录模式可忽略不挂载）
+- 定时任务（9:30）为可选兜底（每日登录模式可忽略不挂载）
 
 ### 推荐（QX 重写资源）
 
