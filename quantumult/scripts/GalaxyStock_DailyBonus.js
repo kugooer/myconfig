@@ -18,6 +18,13 @@
   - 同日只自动签一次（GS_AutoDate）
   - 异步 IIFE 的 finally 不再对 isRequest 分支重复 done
 
+  v1.2 修复（2026-08-17 09:58 用户日志）:
+  - fire 后无 checkIn HTTP 日志/无结果通知：QX 在 $done 后常终止脚本上下文，
+    $task.fetch 回调可能不执行（BYD result 通知「尽量」同因）
+  - 改为「等待签到完成（最多 2.5s 超时兜底）再 $done 放行原请求」：
+    保证 fetch 回调在 $done 前执行完，签到结果通知 100% 可靠
+    银河 checkIn 响应快(<500ms)，对被拦截的 H5 请求影响极小
+
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
     body: {}  (Content-Type: application/json)
@@ -48,6 +55,8 @@ var AutoSignOnOpen = true;
 var OpenAppOncePerDay = true;
 // 并发去抖窗口（毫秒）：App 同时发多个 vip 请求时只签一次
 var OpenSignLockMs = 120 * 1000;
+// 打开App自动签到：等待签到完成的超时上限（毫秒），超时则直接放行原请求
+var OpenSignWaitMs = 2500;
 // 签到成功后的奖励提示（可自行修改）
 var RewardTip = "今天签到完成，奖励抽中智能VIP 1天特权。VIP到期日：2027-09-19";
 
@@ -66,11 +75,21 @@ var isRequestMode = false;
       isRequestMode = true;
       const session = GetCookie();
       if (session) {
-        // 打开App自动签到：命中即同步 fire（$done 前发起 $task.fetch，避免被 QX 终止）
+        // 打开App自动签到：fire 并等待完成（最多 OpenSignWaitMs 超时兜底），
+        // 确保 $task.fetch 回调在 $done 之前执行完 → 结果通知可靠
         console.log("[GS] 打开App自动签到 fire");
-        doCheckIn(session, "open");
+        const p = doCheckIn(session, "open");
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          $nobyda.done();
+        };
+        p.then(finish).catch(finish);
+        setTimeout(finish, OpenSignWaitMs); // 超时兜底：不阻塞原请求过久
+        return;
       }
-      $nobyda.done(); // 立即放行 App 原请求
+      $nobyda.done();
       return;
     }
 
