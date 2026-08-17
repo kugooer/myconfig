@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.16 (capture-v9.2-open-fire-before-done)
+  更新时间: 2026.08.17 (capture-v9.3-detect-7003-no-replay)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -11,7 +11,16 @@
   2) 打开时首页 mina 流量（如 switches）作为“启动信号”，回放**已缓存**的签到包
   3) 首次/失效时需进一次签到页抓取 dynasty 凭证；进签到页后 App 本身常会自签
   4) 默认同日只尝试一次；定时任务可选
-  5) v9.2：在 $done 前同步启动 $task.fetch 回放（修复 QX 请求脚本 pending 不 fire）
+  5) v9.3：识别 mPaaS Result-Status:7003(验签时间戳校验失败)；缓存回放已证明不可行，默认关闭
+  6) v9.3 主模式：检测用户进入签到页(dynasty.srv) → App自签 → 脚本确认+通知+记当日完成
+
+  核心限制(2026-08-17确认):
+  - mina.byd.com mPaaS 网关校验请求 Ts/Sign 时间戳，缓存回放必然返回
+    Result-Status:7003(验签时间戳校验失败) + HTTP200 空 body
+  - 签到 body 为客户端加密(含时间戳)，无法离线重生成
+  - 结论:「打开App不进签到页即签到」在 QX 层面不可实现
+  - 脚本价值变为: 检测进页→确认签到完成→通知; 主页提醒未签
+  - 自动化替代方案: iOS 快捷指令(App URL scheme + 自动打开签到页)
 
   注意:
   - 比亚迪签到 body 中的 request 为客户端加密载荷，随登录态变化
@@ -394,6 +403,68 @@ function BYDSignIn(s, cookieItem) {
             );
           } catch (e) {}
 
+          // v9.3: 检测 mPaaS 网关 Result-Status 错误码（响应头里，body为空）
+          const rsHeaders = (response && response.headers) || {};
+          const resultStatus = String(
+            rsHeaders["Result-Status"] || rsHeaders["result-status"] || ""
+          ).trim();
+          if (isMina && resultStatus) {
+            const memoRaw = String(rsHeaders["Memo"] || rsHeaders["memo"] || "");
+            const tipsRaw = String(rsHeaders["Tips"] || rsHeaders["tips"] || "");
+            let memo = "";
+            let tips = "";
+            try {
+              memo = decodeURIComponent(memoRaw);
+            } catch (e) {
+              memo = memoRaw;
+            }
+            try {
+              tips = decodeURIComponent(tipsRaw);
+            } catch (e) {
+              tips = tipsRaw;
+            }
+            if (resultStatus === "7003") {
+              // 验签时间戳校验失败：缓存回放不可行的铁证
+              merge.BYDSign.notify =
+                "比亚迪签到: 缓存回放失败 (mPaaS 7003 验签时间戳校验失败)\n" +
+                "Memo: " + memo + "\n" +
+                "Tips: " + tips + "\n" +
+                "结论: mPaaS 网关校验 Ts/Sign 时效，缓存回放不可行。\n" +
+                "请直接进入签到页让 App 自签（脚本会检测并确认）。";
+              merge.BYDSign.fail = 1;
+              merge.BYDSign.meta = "mina-7003-timestamp";
+              console.log("\n比亚迪 mina 回放 7003 时间戳校验失败 " + details);
+              console.log("Memo: " + memo + " | Tips: " + tips);
+              // 写入诊断存储
+              try {
+                $nobyda.write(
+                  JSON.stringify({
+                    at: new Date().toISOString(),
+                    resultStatus: resultStatus,
+                    memo: memo,
+                    tips: tips,
+                    capturedBodyLen: cookieItem ? cookieItem.bodyLen : 0,
+                    capturedAt: cookieItem ? cookieItem.capturedAt || "" : ""
+                  }),
+                  "BYD_Replay7003"
+                );
+              } catch (e) {}
+              // 7003 = 回放不可行，标记当日不要再尝试回放
+              try { markOpenAppSignDayDone(); } catch (e) {}
+              // 跳过后续 JSON 解析（body 为空）；finally 中 resolve() 仍会执行
+              return;
+            }
+            // 其他 mPaaS 网关错误码
+            merge.BYDSign.notify =
+              "比亚迪签到: mina 回放网关错误 Result-Status=" + resultStatus + "\n" +
+              "Memo: " + memo + "\n" +
+              "Tips: " + tips;
+            merge.BYDSign.fail = 1;
+            merge.BYDSign.meta = "mina-gw-" + resultStatus;
+            console.log("\n比亚迪 mina 网关错误 " + resultStatus + " " + details);
+            return;
+          }
+
           const cc = safeJSON(data);
 
           // 兼容多种返回结构
@@ -766,9 +837,10 @@ function GetCookie() {
       // 仅低频提示，避免首页刷屏
       maybeNotifyMinaHint(minaSnap);
 
-      // 主模式：打开 App = 首页 mina 启动信号 → 回放缓存签到包（不必进签到页）
-      // dynasty.srv：用于刷新缓存凭证；switches/afterlogin：仅作打开信号
-      // 关键：QX 的 script-request 在 $done 后常会杀定时器；必须在 $done 前启动 $task.fetch
+      // v9.3 主模式（缓存回放已被 7003 证伪）:
+      // - 进签到页(dynasty.srv) → App 自签 → 脚本确认+通知+记当日完成
+      // - 打开首页(switches 等) → 若今日未签 → 低频提醒进页
+      // - 不再回放缓存（mPaaS 网关校验 Ts/Sign 时间戳，回放必 7003）
       let openSignPromise = null;
       if (SignOnAppOpen) {
         try {
@@ -1127,21 +1199,9 @@ function pushMinaRing(snap) {
 }
 
 function maybeNotifyMinaHint(snap) {
-  try {
-    // v9.2：AutoPromote + 打开 App 回放为主；默认不弹旧 Mark 文案，避免误导
-    // 仅在尚无任何签到凭证，且抓到 dynasty 时低频提示一次建仓
-    if (!isPromotableMina(snap)) return;
-    if (resolveOpenAppSignItem()) return;
-    const now = Date.now();
-    const last = Number($nobyda.read("BYD_MinaHintAt") || 0);
-    if (now - last < 12 * 60 * 60 * 1000) return; // 12h 节流
-    $nobyda.write(String(now), "BYD_MinaHintAt");
-    const tip =
-      "已抓到 dynasty 业务包并会自动暂存。\n" +
-      "日常：只开比亚迪 App 首页即可尝试自动签到（不必再进签到页）。\n" +
-      "若通知缺凭证：一次性进入「我的 → 每日签到」建仓后即可。";
-    if (Notify) $nobyda.notify("比亚迪 mina", "凭证建仓提示", tip);
-  } catch (e) {}
+  // v9.3：缓存回放已被 7003 证伪，此函数不再发建仓引导
+  // dynasty 抓包确认由 scheduleOpenAppSign("capture") 完成
+  return;
 }
 
 // QX request 脚本：先启动网络任务，再在完成/超时后 $done，避免 pending 永不 fire
@@ -1259,70 +1319,63 @@ function resolveOpenAppSignItem() {
 }
 
 // mode: "home" | "capture"
-// home = 打开首页信号，只回放缓存，不把当前 snap 当签到 body
-// capture = 抓到 dynasty，先刷新缓存，再回放
-// 返回 Promise|null：调用方在 $done 前 await/接住，保证 QX 请求脚本内 $task.fetch 能跑完
+// v9.3 策略（缓存回放已被 7003 证伪，改为检测+提醒+确认）:
+// home = 打开首页信号：若今日未签，低频提醒进入签到页（不回放）
+// capture = 进入签到页(dynasty.srv)：App 自签，脚本确认+通知+记当日完成
+// 返回 Promise|null（恒 null，保留接口兼容）
 function scheduleOpenAppSign(snap, mode) {
   mode = mode || "home";
-
-  // 抓到 dynasty 时始终刷新缓存（即便今日已签/已尝试）
-  if (mode === "capture" && isPromotableMina(snap)) {
-    try {
-      promoteMinaSnap(snap, { name: "mina签到凭证", notify: false, manual: false });
-    } catch (e) {}
-  }
-
-  // 今日已完成则不再回放
-  if (!canTriggerOpenAppSign()) return null;
-
   const now = Date.now();
   const debounceMs = Math.max(5, Number(OpenAppSignDebounceSec) || 120) * 1000;
-  const lockAt = Number($nobyda.read("BYD_OpenAppSignLock") || 0);
-  if (lockAt && now - lockAt < debounceMs) {
+
+  if (mode === "capture") {
+    // 抓到 dynasty = 用户在签到页，App 正在自签
+    // 刷新缓存（保留建仓能力，便于手动回放诊断与未来方案）
+    if (isPromotableMina(snap)) {
+      try {
+        promoteMinaSnap(snap, { name: "mina签到凭证", notify: false, manual: false });
+      } catch (e) {}
+    }
+    if (!canTriggerOpenAppSign()) return null; // 今日已记完成
+    const lockAt = Number($nobyda.read("BYD_CaptureConfirmLock") || 0);
+    if (lockAt && now - lockAt < 15000) return null; // 15s 内进页 burst 只确认一次
+    $nobyda.write(String(now), "BYD_CaptureConfirmLock");
+    markOpenAppSignDayDone();
     console.log(
-      "[BYD openSign] skip: debounce lock ageMs=" + (now - lockAt) + " mode=" + mode
+      "[BYD openSign] capture confirm: 用户进入签到页 signalOp=" +
+        ((snap && snap.opType) || "-") + " App 自签 ✓"
     );
+    if (Notify) {
+      $nobyda.notify(
+        "比亚迪签到",
+        "签到已完成 (App自动)",
+        "检测到进入签到页，App 已自动完成今日签到 ✓\n脚本已记录，今日不再提醒。"
+      );
+    }
     return null;
   }
 
-  $nobyda.write(String(now), "BYD_OpenAppPendingAt");
-  $nobyda.write(String(mode || "home"), "BYD_OpenAppPendingMode");
-  console.log(
-    "[BYD openSign] pending mode=" +
-      mode +
-      " signalOp=" +
-      ((snap && snap.opType) || "-") +
-      " at=" +
-      now
-  );
-
-  const item = resolveOpenAppSignItem();
-  if (!item) {
-    console.log("[BYD openSign] no cached sign cookie");
-    try {
-      const lastTip = Number($nobyda.read("BYD_OpenAppNoCkTipAt") || 0);
-      if (Notify && now - lastTip > 6 * 60 * 60 * 1000) {
-        $nobyda.write(String(now), "BYD_OpenAppNoCkTipAt");
-        $nobyda.notify(
-          "比亚迪打开App签到",
-          "缺少签到凭证",
-          "打开首页已检测到，但本地还没有可回放的签到包。\n请「一次性」进入：我的 → 每日签到（让 App 自签即可），脚本会缓存 dynasty 凭证；\n之后一般只需打开 App，无需再进签到页。"
-        );
-      }
-    } catch (e) {}
-    // 不记 day done，便于用户进页抓到后再触发
-    return null;
-  }
-
-  const firedKey = dayKeyLocal() + ":" + String(now);
-  if ($nobyda.read("BYD_OpenAppFiredAt") === firedKey) {
-    console.log("[BYD openSign] already fired this burst");
-    return null;
-  }
-  $nobyda.write(firedKey, "BYD_OpenAppFiredAt");
+  // home 模式：今日未签 → 低频提醒（不回放，7003 必败）
+  if (!canTriggerOpenAppSign()) return null;
+  const lockAt = Number($nobyda.read("BYD_OpenAppSignLock") || 0);
+  if (lockAt && now - lockAt < debounceMs) return null;
   markOpenAppSignLock();
-  // v9.2：同步 fire，不再 setTimeout(1.2s)；调用方负责延后 $done
-  return triggerOpenAppSign(item, mode);
+  console.log(
+    "[BYD openSign] home open: 今日尚未签到 signalOp=" + ((snap && snap.opType) || "-")
+  );
+  try {
+    const lastTip = Number($nobyda.read("BYD_HomeRemindTipAt") || 0);
+    if (Notify && now - lastTip > 3 * 60 * 60 * 1000) {
+      $nobyda.write(String(now), "BYD_HomeRemindTipAt");
+      $nobyda.notify(
+        "比亚迪签到提醒",
+        "今日尚未签到",
+        "进入「我的 → 每日签到」即可（进页自动签）。\n" +
+          "说明: mPaaS 网关校验时间戳(7003)，脚本无法在不进页时替你签到。"
+      );
+    }
+  } catch (e) {}
+  return null;
 }
 
 function triggerOpenAppSign(itemOrSnap, mode) {

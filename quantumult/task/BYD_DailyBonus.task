@@ -1,5 +1,6 @@
-# 比亚迪 App 签到（打开 App 触发为主，capture-v9.2）
-# 主路径：启用 rewrite 后，打开 App 首页即 fire 缓存 dynasty 回放（不必进签到页；首次需建仓）
-# 下列 cron 仅备用（默认可关掉）；不依赖定时也能签
+# 比亚迪 App 签到（capture-v9.3：检测确认模式）
+# 主路径：rewrite 检测进入签到页 → App 自签 → 脚本确认+通知+记当日完成
+# 打开 App 首页未签时低频提醒；mPaaS 时间戳校验(7003)导致缓存回放不可行
+# 下列 cron 仅备用（手动跑可诊断 7003/凭证状态）
 
 # 10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYD_DailyBonus.js, tag=比亚迪签到备用, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=false

@@ -223,7 +223,32 @@ v8.2：
 
 
 
-### 打开 App 即 fire（capture-v9.2，修 pending 不 fire）
+
+### 最终结论：缓存回放不可行，v9.3 转为检测确认模式
+
+**铁证（QX 抓包）**：脚本回放 mina 请求时，服务端返回
+
+```
+HTTP/1.1 200 OK
+Content-Length: 0
+Result-Status: 7003
+Memo: 验签时间戳校验失败
+Tips: 手机时间异常，请到系统时间设置，将其设为最新。
+```
+
+**根因**：`mina.byd.com` mPaaS 网关校验请求头 `Ts`（编码时间戳）与 `Sign`（由 body+时间戳+密钥计算）。缓存包的时间戳过期后必然被拒（HTTP 200 空 body）。签到 body 为客户端加密且含时间戳，无法离线重生成。
+
+**结论：「打开 App 不进签到页即签到」在 Quantumult X 层面不可实现。**
+
+v9.3 策略调整：
+1. 检测到 `dynasty.srv`（= 进入签到页）→ App 自签 → 脚本确认 + 通知「签到已完成」+ 记当日完成
+2. 打开 App 首页且今日未签 → 低频提醒（3 小时最多一次）进页签
+3. 手动跑脚本 → 明确报告 7003 时间戳校验失败（不再显示模糊的 respLen=0）
+4. 保留凭证缓存与回放代码供诊断
+
+**真正的一键签到替代方案**：iOS 快捷指令 —— 打开比亚迪 App 并跳转签到页（App 进页即自动签到）。可在快捷指令中用 App 的 URL scheme 或「打开 App」+ 辅助触控路径实现，配合自动化定时触发。
+
+\n### 打开 App 即 fire（capture-v9.2，修 pending 不 fire）
 
 问题：v9.1 日志只有 `[BYD openSign] pending`，没有 `fire/result`。  
 根因：QX `script-request` 在 `$done({})` 后常终止脚本上下文，`setTimeout(1.2s)` 的 `attemptFire` 不会执行。
