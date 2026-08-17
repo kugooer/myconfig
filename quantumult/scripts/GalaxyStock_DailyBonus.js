@@ -2,7 +2,7 @@
 
   银河证券（中国银河证券 App）每日签到
 
-  更新时间: 2026-08-17 (capture-v1.5-诊断)
+  更新时间: 2026-08-17 (capture-v1.6)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -45,6 +45,12 @@
     URL / SESSION 有无 / Host，定位「登录后自动加载且带 SESSION」的触发域
   - 签到逻辑保留：若命中请求带 SESSION 且同日未签 → 直接签到（诊断期即达目的）
   - 确认触发域后收窄 hostname 回单一域（诊断版性能开销大，勿长期使用）
+
+  v1.6 收窄恢复（2026-08-17 诊断完成）:
+  - v1.5 全域诊断结论: 面容解锁登录/启动链路只有 CDN 图片(infoanaly/cdns)与原生 API，
+    全域无 SESSION → QX 重写层无登录触发点，物理不可行
+  - hostname 收窄回 mall.chinastock.com.cn，恢复 v1.3 可靠链路（进智能VIP页自动签）
+  - 命中日志保留精简版（仅 URL），便于后续排查
 
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
@@ -94,15 +100,8 @@ var isRequestMode = false;
   try {
     if ($nobyda.isRequest) {
       isRequestMode = true;
-      // 命中日志（v1.5 诊断版增强）：URL + SESSION 有无 + Host + UA 摘要
-      // 用于定位「登录后自动加载且带 SESSION」的可触发域
-      const _hd = ($request && $request.headers) || {};
-      const _ck = _hd["Cookie"] || _hd["cookie"] || _hd["COOKIE"] || "";
-      const _hasS = /SESSION=([^;\s]+)/.test(_ck);
-      console.log("[GS] 命中: " + ($request && $request.url || "?") +
-        " | SESSION=" + (_hasS ? "有" : "无") +
-        " | Host=" + (_hd["Host"] || "") +
-        " | UA=" + String(_hd["User-Agent"] || "").slice(0, 40));
+      // 命中日志（精简版）：确认触发动作是否命中脚本
+      console.log("[GS] 命中: " + ($request && $request.url || "?"));
       const session = GetCookie();
       if (session) {
         // 打开App自动签到：**await** 等待签到完成（最多 OpenSignWaitMs 超时兜底）。
