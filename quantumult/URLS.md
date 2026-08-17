@@ -160,6 +160,53 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/JegoTrip
 
 ---
 
+## 四、银河证券 App 签到
+
+更新说明（2026-08-17 / capture-v1.0）：
+- 抓包定位：H5 网关 `mall.chinastock.com.cn/h5_gateway/smart-trade/vip/*`
+- 凭证：请求头 `Cookie: SESSION=...`（打开 App 后 H5 自动请求 vip 接口时携带）
+- 签到接口：`POST /h5_gateway/smart-trade/vip/checkIn`，body `{}`
+  - 响应 `{"ret":{"error":"0","msg":"操作成功"},"data":1}` → 签到成功
+- **主模式**：打开 App 后延时 1~3 秒自动签到并通知（同日一次 + 5min 去抖）
+- 定时任务（9:30）作为兜底，错过打开 App 时补签
+
+### 推荐（QX 重写资源）
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/GalaxyStock_DailyBonus.conf
+```
+
+路径：`重写 → 引用 → 资源路径` 粘贴上址 → 右上角更新。
+
+### 脚本本体
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/GalaxyStock_DailyBonus.js
+```
+
+### 定时任务（兜底，可选）
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/GalaxyStock_DailyBonus.task
+```
+
+或手动：
+
+```text
+30 9 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/GalaxyStock_DailyBonus.js, tag=银河证券签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
+```
+
+### 挂载后操作
+
+1. 开启 MITM，信任证书；重写资源强制更新
+2. hostname 仅：`mall.chinastock.com.cn`（勿整域 `*.chinastock.com.cn`，避免拖垮 App）
+3. 打开银河证券 App → 任意页面（H5 会自动请求 vip 接口），看通知「SESSION 凭证已更新」
+4. 之后每次打开 App，延时 1~3 秒自动签到并通知「今天签到完成…」
+5. SESSION 失效（重登/过期）会提示，重新打开 App 即可刷新
+6. 奖励文案默认「智能VIP 1天特权 / VIP到期日 2027-09-19」，可在脚本顶部 `RewardTip` 修改
+
+---
+
 ## 合规说明
 
 本仓库仅托管**自建签到 / 抓包缓存凭证 / 定时任务**类配置。  

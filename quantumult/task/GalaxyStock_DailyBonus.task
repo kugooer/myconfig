@@ -1,0 +1,4 @@
+# 银河证券 每日签到（兜底任务；主模式为打开App自动签到）
+# 首次使用：先挂 rewrite/GalaxyStock_DailyBonus.conf，打开 App 任意页抓取 SESSION
+
+30 9 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/GalaxyStock_DailyBonus.js, tag=银河证券签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
