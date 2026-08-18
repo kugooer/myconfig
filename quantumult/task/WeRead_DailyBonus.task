@@ -1,0 +1,5 @@
+# 微信读书 每日签到
+# 先挂 rewrite/WeRead_DailyBonus.conf，登录微信读书后打开「会员日」页面抓取 vid/skey
+# skey 短时效：脚本会在失效时自动重放 /login 续期并写回，无需重抓
+
+10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_DailyBonus.js, tag=微信读书签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true

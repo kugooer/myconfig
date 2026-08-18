@@ -216,6 +216,55 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/GalaxySt
 
 ---
 
+## 五、微信读书签到
+
+更新说明（2026-08-18 / capture-v1）：
+- 抓包定位：`weread.qq.com/membership-promotions/*` 会员日活动（路线 A 明文 JSON）
+- 链路：`membershipPromotions`（GET，取今日期号 `issue`）→ `receive`（POST `{"issue":...}` 领取）
+  → `balance`（POST，余额校验）
+- 认证：请求头 `vid` + `skey`；**skey 短时效**（实测约 1 小时内失效，返回 `401 errCode=-2012`）
+- **自动续期**：脚本捕获 `i.weread.qq.com/login` 原始 body，失效时整套重放
+  → 即使返回 `errcode=-2013`（微信授权过期）服务端仍下发新 `accessToken`（= 新 skey）
+  → `refreshToken` 不过期即可无限续期，无需重抓
+- 实测当日奖励 2 书币 = `receive` 返回 `money:200`
+
+### 推荐（QX 重写资源）
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/WeRead_DailyBonus.conf
+```
+
+路径：`重写 → 引用 → 资源路径` 粘贴上址 → 右上角更新。
+
+### 脚本本体
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_DailyBonus.js
+```
+
+### 定时任务
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_DailyBonus.task
+```
+
+或手动：
+
+```text
+10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_DailyBonus.js, tag=微信读书签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
+```
+
+### 挂载后操作
+
+1. QX：重写 → 引用上述 conf → **右上角强制更新**；开启 MitM 并信任证书
+2. hostname 仅：`weread.qq.com`, `i.weread.qq.com`（勿整域 `*.qq.com`）
+3. 打开微信读书 → **「会员日」页面**（触发 membership-promotions 请求）
+4. 通知「凭证已保存」后，手动运行「微信读书签到」任务验证
+5. skey 失效时脚本自动重放 login 续期并写回（`WeRead_LoginBody` 存 login body）
+6. 多账号按 vid 去重保存在 `WeRead_Cookies`；勿分享 vid/skey/login body
+
+---
+
 ## 合规说明
 
 本仓库仅托管**自建签到 / 抓包缓存凭证 / 定时任务**类配置。  
