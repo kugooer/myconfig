@@ -218,10 +218,13 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/GalaxySt
 
 ## 五、微信读书签到
 
-更新说明（2026-08-18 / capture-v1.1）：
+更新说明（2026-08-18 / capture-v1.2）：
 - 抓包定位：`weread.qq.com/membership-promotions/*` 会员日活动（路线 A 明文 JSON）
 - 链路：`membershipPromotions`（GET，取今日期号 `issue`）→ `receive`（POST `{"issue":...}` 领取）
   → `balance`（POST，余额校验）
+- **凭证抓取放宽（v1.2）**：打开 App 首页即触发抓凭证 —— 启动接口
+  `i.weread.qq.com/pay/balance` + `user/profile`（均带全局会话级 `vid+skey`，非会员日专属）；
+  `membership-promotions` 保底保留
 - **奖励类型兼容（v1.1）**：书币（`type=money`，分转枚）、天数（`days/day/duration/expireDays/validDays`）、
   礼品（`type=gift`）、带 `name/desc` 的奖励均正常展示；成功判定放宽，不会因类型不同误报失败
 - 认证：请求头 `vid` + `skey`；**skey 短时效**（实测约 1 小时内失效，返回 `401 errCode=-2012`）
@@ -260,7 +263,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_D
 
 1. QX：重写 → 引用上述 conf → **右上角强制更新**；开启 MitM 并信任证书
 2. hostname 仅：`weread.qq.com`, `i.weread.qq.com`（勿整域 `*.qq.com`）
-3. 打开微信读书 → **「会员日」页面**（触发 membership-promotions 请求）
+3. 打开微信读书 App（**首页即可**，启动接口自动抓凭证；无需进会员日页）
 4. 通知「凭证已保存」后，手动运行「微信读书签到」任务验证
 5. skey 失效时脚本自动重放 login 续期并写回（`WeRead_LoginBody` 存 login body）
 6. 多账号按 vid 去重保存在 `WeRead_Cookies`；勿分享 vid/skey/login body

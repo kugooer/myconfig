@@ -2,10 +2,12 @@
 
   微信读书(WeRead) 每日签到脚本
 
-  更新时间: 2026-08-18 (capture-v1.1)
+  更新时间: 2026-08-18 (capture-v1.2)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
+  v1.2: 凭证抓取放宽 —— 打开 App 首页即触发（pay/balance、user/profile 启动接口），
+        不再要求必须进入「会员日」页面；membership-promotions 保底保留
   v1.1: 奖励类型兼容 —— 书币(money) / 天数(days/day/duration/expireDays/validDays) / 礼品(gift) /
         带 name/desc 的奖励均正常展示；成功判定放宽，不会因类型不同误报失败
 
@@ -21,10 +23,10 @@
     → signature 绑定 timestamp 无法重算，只能整套重放；refreshToken 不过期即可无限续期
 
   用法:
-  1) 挂 rewrite，登录微信读书 → 打开「会员日」页面（触发 membership-promotions 请求）
+  1) 挂 rewrite，登录微信读书 → 打开 App（首页启动接口即自动抓凭证；会员日页面亦可）
   2) 通知「凭证已保存」后，手动/定时跑 task
   3) skey 失效时脚本自动重放 login 续期并写回，无需重抓
-  4) 多账号: 多设备或切号进会员日页面，脚本按 vid 去重累计
+  4) 多账号: 多设备或切号打开 App，脚本按 vid 去重累计
 
 *************************/
 
@@ -56,7 +58,7 @@ var merge = {};
       [PREFIX + "_Cookie", PREFIX + "_Cookies", PREFIX + "_LoginBody", PREFIX + "_CaptureDiag"].forEach((s) => {
         $nobyda.write("", s);
       });
-      throw new Error("已清除微信读书签到凭证，请重新打开 App 会员日页面抓取 ‼️");
+      throw new Error("已清除微信读书签到凭证，请重新打开微信读书 App 抓取 ‼️");
     }
 
     if ($nobyda.isRequest) {
@@ -353,7 +355,7 @@ function buildNoCookieTip() {
     "未获取到微信读书凭证\n" +
     "1) 更新并启用 rewrite: WeRead_DailyBonus.conf\n" +
     "2) 信任 MitM 证书（hostname 含 weread.qq.com / i.weread.qq.com）\n" +
-    "3) 打开微信读书 → 「会员日」页面\n" +
+    "3) 打开微信读书 App（首页启动接口自动抓凭证，无需进会员日页）\n" +
     "4) 看到「凭证已保存」后再跑定时任务"
   );
 }
@@ -389,8 +391,15 @@ function GetCookie() {
       return;
     }
 
-    // 会员日活动：抓 vid/skey（route A 签名路径）
-    if (!/weread\.qq\.com\/membership-promotions\//i.test(url)) {
+    // 凭证抓取（route A 签名路径）:
+    // 白名单 = 启动接口 pay/balance + user/profile（打开 App 首页即触发）
+    //        + membership-promotions（会员日页，保底）
+    // 均为全局会话级凭证（vid+skey），非会员日专属
+    if (
+      !/i\.weread\.qq\.com\/(pay\/balance|user\/profile)(\?|$)|weread\.qq\.com\/membership-promotions\//i.test(
+        url
+      )
+    ) {
       $nobyda.done({});
       return;
     }
