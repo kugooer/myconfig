@@ -218,10 +218,12 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/GalaxySt
 
 ## 五、微信读书签到
 
-更新说明（2026-08-18 / capture-v1）：
+更新说明（2026-08-18 / capture-v1.1）：
 - 抓包定位：`weread.qq.com/membership-promotions/*` 会员日活动（路线 A 明文 JSON）
 - 链路：`membershipPromotions`（GET，取今日期号 `issue`）→ `receive`（POST `{"issue":...}` 领取）
   → `balance`（POST，余额校验）
+- **奖励类型兼容（v1.1）**：书币（`type=money`，分转枚）、天数（`days/day/duration/expireDays/validDays`）、
+  礼品（`type=gift`）、带 `name/desc` 的奖励均正常展示；成功判定放宽，不会因类型不同误报失败
 - 认证：请求头 `vid` + `skey`；**skey 短时效**（实测约 1 小时内失效，返回 `401 errCode=-2012`）
 - **自动续期**：脚本捕获 `i.weread.qq.com/login` 原始 body，失效时整套重放
   → 即使返回 `errcode=-2013`（微信授权过期）服务端仍下发新 `accessToken`（= 新 skey）

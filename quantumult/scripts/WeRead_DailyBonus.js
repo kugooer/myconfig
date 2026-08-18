@@ -2,9 +2,12 @@
 
   微信读书(WeRead) 每日签到脚本
 
-  更新时间: 2026-08-18 (capture-v1)
+  更新时间: 2026-08-18 (capture-v1.1)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
+
+  v1.1: 奖励类型兼容 —— 书币(money) / 天数(days/day/duration/expireDays/validDays) / 礼品(gift) /
+        带 name/desc 的奖励均正常展示；成功判定放宽，不会因类型不同误报失败
 
   流量结论（抓包 2026-08-17-150112）:
   - 活动查询: GET https://weread.qq.com/membership-promotions/api/membershipPromotions?pf=ios
@@ -217,7 +220,8 @@ function doSignIn(cookieItem) {
           rObj = safeJSON(rRaw);
         }
       }
-      if (rObj && (rObj.money != null || rObj.receiveTime || rObj.name)) {
+      // 成功判定兼容多种奖励形态：书币(money) / 天数(days/day/duration/expireDays/validDays) / 礼品(name/receiveTime)
+      if (rObj && (rObj.money != null || rObj.receiveTime || rObj.name || rObj.days != null || rObj.day != null || rObj.duration != null || rObj.expireDays != null || rObj.validDays != null)) {
         const reward = fmtReward(rObj);
         merge.Sign.notify = "微信读书签到: 成功 ✅\n今日奖励: " + (reward || "（已到账）");
         merge.Sign.success = 1;
@@ -306,15 +310,30 @@ function describeResp(obj, raw) {
 }
 
 function fmtReward(obj) {
-  const name = obj.name || "";
-  const type = obj.type || "";
+  if (!obj || typeof obj !== "object") return null;
+  const name = String(obj.name || "").trim();
+  const type = String(obj.type || "");
   const money = obj.money;
+  // 书币（分 -> 枚，去尾零）
   if (type === "money" && money != null) {
     const coins = Number(money) / 100;
-    return (name ? name + " " : "书币 ") + (Number.isInteger(coins) ? coins : coins.toFixed(2)) + " 枚";
+    const coinsStr = Number.isInteger(coins) ? String(coins) : String(Math.round(coins * 100) / 100);
+    return (name ? name + " " : "书币 ") + coinsStr + " 枚";
   }
+  // 礼品盲盒
   if (type === "gift") return name || "实体书盲盒";
+  // 天数类奖励（会员天数/体验卡等，字段名以抓包实测为准，兜底常见命名）
+  const dayKey = ["days", "day", "duration", "expireDays", "validDays", "memberDays", "vipDays"].find(
+    (k) => obj[k] != null
+  );
+  if (dayKey) {
+    const n = Number(obj[dayKey]);
+    if (isFinite(n) && n > 0) return (name ? name + " " : "会员天数 ") + n + " 天";
+  }
   if (name) return name;
+  // 其它描述字段兜底
+  const desc = String(obj.desc || obj.title || obj.rewardName || obj.rewardDesc || "").trim();
+  if (desc) return desc;
   return null;
 }
 
