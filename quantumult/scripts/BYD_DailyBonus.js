@@ -2,7 +2,7 @@
 
   比亚迪 App 每日签到脚本
 
-  更新时间: 2026.08.17 (capture-v9.3-detect-7003-no-replay)
+  更新时间: 2026.08.18 (capture-v9.4-dedup-notify-silent-skip)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -1253,10 +1253,7 @@ function canTriggerOpenAppSign() {
   if (!SignOnAppOpen) return false;
   if (OpenAppSignOncePerDay) {
     const doneDay = $nobyda.read("BYD_OpenAppSignDate") || "";
-    if (doneDay === dayKeyLocal()) {
-      console.log("[BYD openSign] skip: already done today " + doneDay);
-      return false;
-    }
+    if (doneDay === dayKeyLocal()) return false; // v9.4: silent skip
   }
   return true;
 }
@@ -1274,6 +1271,14 @@ function isHomeOpenSignal(snap) {
   if (!snap) return false;
   const op = String(snap.opType || "");
   return /switches\.all\.get|afterloginPb|alipay\.client\.switches|getUnionResource/i.test(op);
+}
+
+// v9.4: 只有 switches 类信号负责发 home 通知；getUnionResource 只置锁不通知
+// 避免 QX 并发双信号各发一条重复通知
+function isSwitchesSignal(snap) {
+  if (!snap) return false;
+  const op = String(snap.opType || "");
+  return /switches|afterloginPb/i.test(op);
 }
 
 // 解析真正用于回放的签到凭证：优先缓存，不以首页 switches body 当签到包
@@ -1356,25 +1361,33 @@ function scheduleOpenAppSign(snap, mode) {
   }
 
   // home 模式：今日未签 → 低频提醒（不回放，7003 必败）
+  // v9.4: 去抖 lock 对所有 home 信号生效；通知只由 switches 类信号发，
+  //        getUnionResource 只置锁不通知，避免并发双信号重复通知
   if (!canTriggerOpenAppSign()) return null;
   const lockAt = Number($nobyda.read("BYD_OpenAppSignLock") || 0);
   if (lockAt && now - lockAt < debounceMs) return null;
   markOpenAppSignLock();
+
+  const isSwitches = isSwitchesSignal(snap);
   console.log(
-    "[BYD openSign] home open: 今日尚未签到 signalOp=" + ((snap && snap.opType) || "-")
+    "[BYD openSign] home open: 今日尚未签到 signalOp=" +
+      ((snap && snap.opType) || "-") + (isSwitches ? "" : " (silent)")
   );
-  try {
-    const lastTip = Number($nobyda.read("BYD_HomeRemindTipAt") || 0);
-    if (Notify && now - lastTip > 3 * 60 * 60 * 1000) {
-      $nobyda.write(String(now), "BYD_HomeRemindTipAt");
-      $nobyda.notify(
-        "比亚迪签到提醒",
-        "今日尚未签到",
-        "进入「我的 → 每日签到」即可（进页自动签）。\n" +
-          "说明: mPaaS 网关校验时间戳(7003)，脚本无法在不进页时替你签到。"
-      );
-    }
-  } catch (e) {}
+
+  if (isSwitches) {
+    try {
+      const lastTip = Number($nobyda.read("BYD_HomeRemindTipAt") || 0);
+      if (Notify && now - lastTip > 3 * 60 * 60 * 1000) {
+        $nobyda.write(String(now), "BYD_HomeRemindTipAt");
+        $nobyda.notify(
+          "比亚迪签到提醒",
+          "今日尚未签到",
+          "进入「我的 → 每日签到」即可（进页自动签）。\n" +
+            "说明: mPaaS 网关校验时间戳(7003)，脚本无法在不进页时替你签到。"
+        );
+      }
+    } catch (e) {}
+  }
   return null;
 }
 
