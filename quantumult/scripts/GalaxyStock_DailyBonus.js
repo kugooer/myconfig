@@ -2,7 +2,7 @@
 
   银河证券（中国银河证券 App）每日签到
 
-  更新时间: 2026-08-17 (capture-v1.6)
+  更新时间: 2026-08-18 (capture-v1.7)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -51,6 +51,13 @@
     全域无 SESSION → QX 重写层无登录触发点，物理不可行
   - hostname 收窄回 mall.chinastock.com.cn，恢复 v1.3 可靠链路（进智能VIP页自动签）
   - 命中日志保留精简版（仅 URL），便于后续排查
+
+  v1.7 修复（2026-08-18 07:39 用户日志）:
+  - 时区 bug：QX JavaScriptCore 运行时时区为 UTC（非设备时区），
+    北京时间 00:00~08:00 期间 new Date().getDate() 返回的是 UTC 日期（前一天）
+    → dayStr() 误判为"昨天" → GS_AutoDate 恒等 → 同日去重失效、签到被跳过
+  - 修复：dayStr() 改为强制东八区（UTC+8）计算，不依赖运行环境时区
+  - 影响：GS_AutoDate 同日去重 + 定时任务跳过判断，均依赖 dayStr()
 
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
@@ -239,9 +246,11 @@ function raceTimeout(promise, ms) {
 }
 
 function dayStr() {
-  const d = new Date();
+  // 强制东八区（北京时间 UTC+8），避免 QX JavaScriptCore 运行时时区为 UTC
+  // 导致北京时间 00:00~08:00 期间 getDate() 返回前一天 → 同日去重失效
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
   const p = (n) => String(n).padStart(2, "0");
-  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+  return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate());
 }
 
 function safeJSON(text) {
