@@ -1,0 +1,7 @@
+# 移动云盘签到（仅云盘，不含 App 签到领奖）
+# Quantumult X → 任务 → 添加资源 / 粘贴下一行
+# 脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js
+# 配套 rewrite：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_CloudSign.conf
+# 首次：打开云盘 → 进一次「签到」页缓存 jwt；之后打开云盘或本定时即可
+
+20 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js, tag=移动云盘签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=cloud, enabled=true

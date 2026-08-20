@@ -1,0 +1,6 @@
+# 中国移动 App · 签到领奖（仅 App，不含云盘）
+# Quantumult X → 任务 → 添加资源 / 粘贴下一行
+# 脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js
+# 配套 rewrite：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_AppSign.conf
+
+10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js, tag=移动App签到领奖, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=app, enabled=true

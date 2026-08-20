@@ -1,10 +1,5 @@
-# 中国移动 · 双任务（App 签到领奖 / 移动云盘）
-# Quantumult X → 任务 → 添加资源 / 粘贴下面两行
-# 依赖同一脚本，用 argument 区分模式：app | cloud | all
-# 脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js
-
-# ① App「签到领奖」— 每天 08:10（需近期登录过，有 JSESSIONID）
-10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js, tag=移动App签到领奖, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=app, enabled=true
-
-# ② 移动云盘签到 — 每天 08:20（需缓存过 jwt：打开云盘签到页一次；之后打开云盘即可刷新）
-20 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_DailyBonus.js, tag=移动云盘签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=cloud, enabled=true
+# 【已弃用合并任务】请分别引用下面两个资源，避免 App/云盘互相夹杂
+# App：  https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_AppSign.task
+# 云盘：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_CloudSign.task
+#
+# 本文件不再下发任何 cron 行（更新后旧「双任务」会被清空，请改挂独立资源）。
