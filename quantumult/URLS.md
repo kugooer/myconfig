@@ -80,6 +80,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_
 1. App：登录/切号；建议首次打开「签到领奖」页
 2. 云盘：首次进「签到」页，控制台出现 `cloud jwt cached ...`
 3. jwt 失效后需再进一次签到页刷新（脚本会提示并清空旧 jwt）
+   - 打开失败（无 jwt / 失效）**默认不弹系统通知**，只打控制台；真成功仍通知（`NotifyCloudOpenFail=false`）
 4. 历史串号：清空 `CookiesCMCC` 与 `CMCC_SignEndpoints` 后重登
 
 ---

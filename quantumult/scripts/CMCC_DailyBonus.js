@@ -107,8 +107,10 @@ var CloudAllowTyrzOnOpen = false;
 var CloudDailyOnce = true;
 // 软跳过（SSO/tyrz 失败）是否弹通知：默认 false
 var NotifyCloudSoftSkip = false;
-// 打开自签失败是否弹一次：默认 true，提示「先缓存 jwt」
-var NotifyCloudOpenFail = true;
+// 打开自签失败（无 jwt / jwt 失效）是否弹系统通知：默认 false（只打控制台）
+// 原因：中国移动 App 切号时常顺带触发云盘 getUser；若 Cloud rewrite 开启会误弹「尚无 jwt」
+// 真成功 / 今日已签到 仍会通知。需要弹失败引导时可改 true
+var NotifyCloudOpenFail = false;
 // 云盘结果通知防抖（ms）
 var CloudAutoDebounceMs = 120000;
 // 打开自签进行中硬锁（ms），防 getUser 连发双签
@@ -713,7 +715,9 @@ async function tryCloudAutoSignOnOpen(seed) {
       cs.notify = "跳过云盘：jwt 已失效，请再打开一次云盘「签到」页刷新";
     }
     clog("cloud open sign fail => " + (cs.notify || cs.error || "unknown"));
-    if (cs.notify && (cs.error || cs.needNewJwt || NotifyCloudOpenFail || NotifyCloudSoftSkip)) {
+    // 打开失败默认只打日志：needNewJwt / 无 jwt 引导 不得绕过 NotifyCloudOpenFail
+    // （App 切号时常顺带 getUser，否则会误弹「移动云盘」通知）
+    if (cs.notify && NotifyCloudOpenFail) {
       const failParsed = {
         ok: false,
         already: false,
