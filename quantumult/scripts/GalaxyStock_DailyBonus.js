@@ -2,7 +2,7 @@
 
   银河证券（中国银河证券 App）每日签到
 
-  更新时间: 2026-08-18 (capture-v1.7)
+  更新时间: 2026-08-22 (capture-v1.8)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -59,6 +59,14 @@
   - 修复：dayStr() 改为强制东八区（UTC+8）计算，不依赖运行环境时区
   - 影响：GS_AutoDate 同日去重 + 定时任务跳过判断，均依赖 dayStr()
 
+  v1.8 修复（2026-08-22 用户反馈: VIP到期日一直显示2027-09-19）:
+  - 根因：RewardTip 硬编码了固定到期日，每次签到奖励1天VIP后到期日会推移，
+    但脚本从不更新 → 通知永远显示同一个日期
+  - 修复：签到成功后动态请求 customerFreeRight 接口获取最新到期日，
+    正则提取 endDate 字段（YYYYMMDD）格式化为 YYYY-MM-DD 拼入通知
+  - 新增 nobyda.get() 适配方法（QX/Surge/Loon/Node）
+  - 获取失败时回退为不含日期的固定文案，不影响签到本身
+
   抓包结论（2026-08-17）:
   - 签到接口: POST https://mall.chinastock.com.cn/h5_gateway/smart-trade/vip/checkIn
     body: {}  (Content-Type: application/json)
@@ -89,15 +97,16 @@ var AutoSignOnOpen = true;
 var OpenAppOncePerDay = true;
 // 并发去抖窗口（毫秒）：App 同时发多个 vip 请求时只签一次
 var OpenSignLockMs = 120 * 1000;
-// 打开App自动签到：等待签到完成的超时上限（毫秒），超时则直接放行原请求
-var OpenSignWaitMs = 2500;
-// 签到成功后的奖励提示（可自行修改）
-var RewardTip = "今天签到完成，奖励抽中智能VIP 1天特权。VIP到期日：2027-09-19";
+// 打开App自动签到：等待签到完成（含获取到期日）的超时上限（毫秒），超时则直接放行原请求
+var OpenSignWaitMs = 3500;
+// 签到成功后的奖励提示（到期日动态获取，此处不含日期）
+var RewardTip = "今天签到完成，奖励抽中智能VIP 1天特权。";
 
 var $nobyda = nobyda();
 var PREFIX = "GS";
 var HOST = "mall.chinastock.com.cn";
 var SIGN_PATH = "/h5_gateway/smart-trade/vip/checkIn";
+var VIP_RIGHT_PATH = "/h5_gateway/smart-trade/vip/customerFreeRight";
 var DefaultUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148/ChinaStockApp theme/light lang/zh-CN";
 
 // isRequest 分支自行管理 $done，finally 不重复 done
@@ -202,15 +211,16 @@ function doCheckIn(session, mode) {
       body: "{}"
     };
     $nobyda.post(options, (error, response, data) => {
+      let checkInSuccess = false;
+      let msg = "";
       try {
         if (error) throw new Error(error);
         const httpStatus = response && (response.statusCode || response.status);
         console.log("[GS] " + mode + " checkIn HTTP " + httpStatus + " resp: " + String(data || "").slice(0, 300));
         const cc = safeJSON(data);
-        let msg = "";
         if (cc && cc.ret) {
           if (String(cc.ret.error) === "0") {
-            msg = RewardTip;
+            checkInSuccess = true;
             // 标记当日完成（仅成功时）
             $nobyda.write(dayStr(), PREFIX + "_AutoDate");
           } else {
@@ -219,11 +229,72 @@ function doCheckIn(session, mode) {
         } else {
           msg = "签到响应异常(HTTP " + httpStatus + ")";
         }
-        if (Notify) $nobyda.notify("银河证券签到", "", msg);
       } catch (eor) {
+        msg = "签到错误: " + (eor.message || eor);
         $nobyda.AnError("银河证券签到", "Sign", eor, response, data);
-      } finally {
+      }
+
+      if (checkInSuccess) {
+        // 签到成功：动态获取最新 VIP 到期日，拼入通知后再 resolve
+        fetchVipEndDate(session).then((endDate) => {
+          let finalMsg = RewardTip;
+          if (endDate) {
+            finalMsg = RewardTip + " VIP到期日：" + endDate;
+          } else {
+            finalMsg = RewardTip + "（VIP到期日获取失败）";
+          }
+          if (Notify) $nobyda.notify("银河证券签到", "", finalMsg);
+          resolve();
+        });
+      } else {
+        if (Notify) $nobyda.notify("银河证券签到", "", msg);
         resolve();
+      }
+    });
+  });
+}
+
+/**
+ * 获取最新 VIP 到期日（签到成功后调用）
+ * 请求 customerFreeRight 接口，正则提取 endDate（YYYYMMDD）转为 YYYY-MM-DD
+ * @param {string} session SESSION cookie 串
+ * @returns {Promise<string|null>} 格式化日期或 null（失败时）
+ */
+function fetchVipEndDate(session) {
+  return new Promise((resolve) => {
+    const options = {
+      url: "https://" + HOST + VIP_RIGHT_PATH,
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        Origin: "https://cdns.chinastock.com.cn",
+        Referer: "https://cdns.chinastock.com.cn/",
+        "User-Agent": DefaultUA,
+        Cookie: session
+      }
+    };
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+    // 1.5s 超时兜底：不阻塞签到结果通知太久
+    setTimeout(() => done(null), 1500);
+
+    $nobyda.get(options, (error, response, data) => {
+      if (error) {
+        console.log("[GS] customerFreeRight 请求失败: " + (error.message || error));
+        done(null);
+        return;
+      }
+      const text = String(data || "");
+      console.log("[GS] customerFreeRight resp: " + text.slice(0, 300));
+      // 正则提取 endDate（YYYYMMDD），不依赖具体 JSON 结构
+      const m = text.match(/"endDate"\s*:\s*"(\d{8})"/);
+      if (m && m[1]) {
+        const d = m[1];
+        const formatted = d.slice(0, 4) + "-" + d.slice(4, 6) + "-" + d.slice(6, 8);
+        console.log("[GS] VIP到期日: " + formatted);
+        done(formatted);
+      } else {
+        console.log("[GS] 未在 customerFreeRight 响应中找到 endDate");
+        done(null);
       }
     });
   });
@@ -356,6 +427,42 @@ function nobyda() {
     }
   };
 
+  const get = (options, callback) => {
+    if (!options.headers) options.headers = {};
+    if (!options.headers["User-Agent"]) options.headers["User-Agent"] = DefaultUA;
+    if (isQuanX) {
+      if (typeof options == "string") options = { url: options };
+      options.method = "GET";
+      $task.fetch(options).then(
+        (response) => {
+          const payload = response && (response.body != null ? response.body : response.bodyBytes);
+          callback(null, adapterStatus(response), payload);
+        },
+        (reason) => callback(reason.error || reason, null, null)
+      );
+    }
+    if (isSurge) {
+      $httpClient.get(options, (error, response, body) => {
+        callback(error, adapterStatus(response), body);
+      });
+    }
+    if (isLoon) {
+      $httpClient.get(options, (error, response, body) => {
+        callback(error, adapterStatus(response), body);
+      });
+    }
+    if (isNode) {
+      try {
+        const request = require("request");
+        request.get(options, (error, response, body) => {
+          callback(error, adapterStatus(response), body);
+        });
+      } catch (e) {
+        callback("node request 库不可用: " + e.message, null, null);
+      }
+    }
+  };
+
   const AnError = (name, keyname, er, resp, body) => {
     return console.log(
       "\n‼️" + name + "发生错误\n‼️名称: " + er.name + "\n‼️描述: " + er.message +
@@ -377,6 +484,6 @@ function nobyda() {
 
   return {
     AnError, isRequest, isSurge, isQuanX, isLoon, isNode,
-    notify, write, read, post, time, done
+    notify, write, read, post, get, time, done
   };
 }
