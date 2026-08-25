@@ -342,6 +342,45 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_F
 
 ---
 
+## 微信读书 我的阅读奖励（每周三、周五）
+
+更新说明（2026-08-25 / capture-v1.0）：
+- 端点：`POST https://i.weread.qq.com/weekly/exchange`，认证用 header `vid`+`skey`（与每日签到同源，复用 `WeRead_Cookies`）
+- 查询(只读)返回三类奖励：`readtimeAwards`(按阅读时长) / `readdayAwards`(按阅读天数) / `readgoalAwards`(阅读目标)
+  - `awardStatus`: 0=未达标 1=可领(领取) 2=已领取
+  - `awardChoices`: `choiceType=1` 体验卡(awardNum=天) / `choiceType=2` 书币(awardNum=枚)
+- 领取规则（用户确认）：书币 `awardNum >= 2` 领书币(choiceType2)，否则领体验卡(choiceType1)
+- 定时：每周三、周五 8:10（`10 8 * * 3,5`）；仅领 `awardStatus==1` 项，已领(状态2)自动跳过，幂等
+- `memberCardExchange`（付费会员卡兑换，用体验卡换 30 天会员）非免费奖励，脚本跳过
+- 复用 `WeRead_Cookies` / `WeRead_LoginBody`（同 conf 同 prefs），无需额外 conf
+
+### 脚本本体
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_WeeklyReward.js
+```
+
+### 定时任务
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_WeeklyReward.task
+```
+
+或手动：
+
+```text
+10 8 * * 3,5 https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_WeeklyReward.js, tag=微信读书我的阅读, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Card.png, enabled=true
+```
+
+### 挂载后操作
+
+1. 复用微信读书签名的 conf（capture-v1.3+，打开 App 首页即抓 header 凭证），无需额外 rewrite
+2. 挂上 `WeRead_WeeklyReward.task`（每周三、周五 8:10 自动）
+3. 脚本只领当前可领项（awardStatus==1），已领自动跳过；阅读时长/天数未达标则当周无奖励
+4. skey 失效：复用 `WeRead_LoginBody` 整套重放 login 续期
+
+---
+
 ## 合规说明
 
 本仓库仅托管**自建签到 / 抓包缓存凭证 / 定时任务**类配置。  
