@@ -293,6 +293,52 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_D
 4. 通知「凭证已保存」后，手动运行「微信读书签到」任务验证
 5. skey 失效时脚本自动重放 login 续期并写回（`WeRead_LoginBody` 存 login body）
 6. 多账号按 vid 去重保存在 `WeRead_Cookies`；勿分享 vid/skey/login body
+7. 同 conf 也覆盖 `flip-card-game/api` 路径抓翻一翻页 Cookie 凭证（翻一翻页仅用 Cookie 认证）
+
+更新说明（2026-08-25 / capture-v1.3）：
+- 双源凭证：header 携带 `vid`+`skey`（启动接口）+ Cookie 携带 `wr_vid`+`wr_skey`（翻一翻页）
+- 白名单新增 `weread.qq.com/flip-card-game/api/`，打开翻一翻页即更新凭证
+- GetCookie 合并两源去重写入 `WeRead_Cookies`，翻一翻脚本可直接复用
+
+---
+
+## 微信读书 翻一翻（每周二）
+
+更新说明（2026-08-25 / capture-v1.0）：
+- 每周二 8:00 刷新 6 次翻卡次数，定时任务每周二 8:10 跑
+- API 明文 GET，明文路径：
+  - 翻牌：`https://weread.qq.com/flip-card-game/api/flipCardFlip?cardIndex=N&giftIndex=N&pf=ios&platform=ios_html`
+  - 接收：`https://weread.qq.com/flip-card-game/api/flipCardReceive?cardIndex=N&giftIndex=N&pf=ios&platform=ios_html`
+- 认证：仅 Cookie（`wr_skey=...; wr_vid=...`），无独立 `vid`/`skey` header —— 需 capture-v1.3+ 的 conf 才能从翻一翻页抓到凭证
+- 翻牌循环：cardIndex 1~6 + giftIndex 0~5；响应 `remainingCount` 驱动循环终止
+- 接收：对 `status != 3 && autoReceive != 1` 的卡调 `flipCardReceive` 领取
+- 奖励类型：`infinite`（1 天体验卡）/ `book`（赠书）/ `coin`（翻币）；状态 `status: 0=未领 3=已领 autoReceive=1=自动领`
+- **复用 `WeRead_Cookies` / `WeRead_LoginBody`**（同 conf 同 prefs），无独立 capture 脚本
+
+### 脚本本体
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_FlipCard.js
+```
+
+### 定时任务
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_FlipCard.task
+```
+
+或手动：
+
+```text
+10 8 * * 2 https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_FlipCard.js, tag=微信读书翻一翻, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Card.png, enabled=true
+```
+
+### 挂载后操作
+
+1. 复用微信读书签到的 conf（capture-v1.3+ 已含 `flip-card-game/api`），无需额外 rewrite
+2. 打开微信读书 App → **「翻一翻」** 页面（Cookie 凭证抓取 + 卡片状态可视化）
+3. 通知「凭证已保存」后即跑定时任务（每周二 8:10 自动）
+4. skey 失效：复用签到脚本的 `WeRead_LoginBody` 整套重放 login 续期
 
 ---
 

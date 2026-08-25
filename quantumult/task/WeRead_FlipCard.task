@@ -1,0 +1,7 @@
+# 微信读书 每周二翻一翻
+# 复用 rewrite/WeRead_DailyBonus.conf (capture-v1.3+，含 flip-card-game/api 抓 Cookie 凭证)
+# 首次需打开「翻一翻」页面让 rewrite 抓一次 Cookie 凭证
+# skey 短时效：脚本会在失效时自动重放 /login 续期并写回，无需重抓
+# 每周二 8:00 刷新 6 次翻卡次数，08:10 跑
+
+10 8 * * 2 https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/WeRead_FlipCard.js, tag=微信读书翻一翻, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Card.png, enabled=true

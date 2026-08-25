@@ -2,10 +2,12 @@
 
   微信读书(WeRead) 每日签到脚本
 
-  更新时间: 2026-08-18 (capture-v1.2)
+  更新时间: 2026-08-25 (capture-v1.3)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
+  v1.3: 双源凭证抓取 — header 携带 vid/skey（启动接口）+ Cookie 携带 wr_skey/wr_vid（翻一翻页），
+        白名单新增 flip-card-game/api，GetCookie 合并两源去重
   v1.2: 凭证抓取放宽 —— 打开 App 首页即触发（pay/balance、user/profile 启动接口），
         不再要求必须进入「会员日」页面；membership-promotions 保底保留
   v1.1: 奖励类型兼容 —— 书币(money) / 天数(days/day/duration/expireDays/validDays) / 礼品(gift) /
@@ -377,8 +379,16 @@ function GetCookie() {
       return;
     }
     const headers = req.headers || {};
-    const vid = String(headers.vid || headers.Vid || "").trim();
-    const skey = String(headers.skey || headers.Skey || "").trim();
+    // 双源凭证：header 中的 vid/skey（启动接口用），Cookie 中的 wr_vid/wr_skey（翻一翻页仅用 Cookie 认证）
+    let vid = String(headers.vid || headers.Vid || "").trim();
+    let skey = String(headers.skey || headers.Skey || "").trim();
+    if (!vid || !skey) {
+      const rawCookie = String(headers.Cookie || headers.cookie || "");
+      const cookieVid = (rawCookie.match(/(?:^|[;\s])wr_vid=([^;]+)/i) || [])[1];
+      const cookieSkey = (rawCookie.match(/(?:^|[;\s])wr_skey=([^;]+)/i) || [])[1];
+      if (cookieVid) vid = String(cookieVid).trim();
+      if (cookieSkey) skey = String(cookieSkey).trim();
+    }
     const hostRaw = String(headers.Host || headers.host || "").replace(/:\d+$/, "");
 
     // 登录续期接口：抓原始 body 供自动续期重放（signature 绑定 timestamp，只能整套重放）
@@ -391,12 +401,13 @@ function GetCookie() {
       return;
     }
 
-    // 凭证抓取（route A 签名路径）:
-    // 白名单 = 启动接口 pay/balance + user/profile（打开 App 首页即触发）
+    // 凭证抓取（双源，header + Cookie）:
+    // 白名单 = 启动接口 pay/balance + user/profile（打开 App 首页即触发，header 携带 vid+skey）
     //        + membership-promotions（会员日页，保底）
-    // 均为全局会话级凭证（vid+skey），非会员日专属
+    //        + flip-card-game/api（翻一翻页，仅 Cookie 携带 wr_skey+wr_vid）
+    // 均为全局会话级凭证，非会员日专属
     if (
-      !/i\.weread\.qq\.com\/(pay\/balance|user\/profile)(\?|$)|weread\.qq\.com\/membership-promotions\//i.test(
+      !/i\.weread\.qq\.com\/(pay\/balance|user\/profile)(\?|$)|weread\.qq\.com\/(membership-promotions\/|flip-card-game\/api\/)/i.test(
         url
       )
     ) {
