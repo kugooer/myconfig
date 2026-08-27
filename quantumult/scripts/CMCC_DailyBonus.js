@@ -42,8 +42,10 @@ var DeleteCookie = false;
 var out = 15000; // 单请求超时(ms)
 // 登录成功后是否立刻自动签到（核心开关）
 var AutoSignAfterLogin = true;
-// 登录后延迟多久开始签到，给 H5/云盘子请求一点落库时间
-var SignDelayMs = 1800;
+// 登录成功后延迟多久再开始签到（用户要求 3-5 秒；默认 3500ms）
+// 注意：该延迟在 fingerprintLogin 的 rewrite-response 内同步等待，QX 对改写脚本有执行时长限制；
+// 若日志出现「Exception timeout」，请下调此值，或改由定时任务（argument=app）兜底——每日锁可防重复签
+var SignDelayMs = 3500;
 // 并发账号间隔
 var AccountGapMs = 600;
 
@@ -105,6 +107,8 @@ var AutoCloudLiveSignOnOpen = true;
 var CloudAllowTyrzOnOpen = false;
 // 每日每号只自签成功一次（打开多次 / rewrite 并发 / 签到页观测 都共享此锁）
 var CloudDailyOnce = true;
+// 每日每号 App「签到领奖」只成功一次（登录触发 / 定时任务 共享此锁，避免重复签到）
+var AppDailyOnce = true;
 // 软跳过（SSO/tyrz 失败）是否弹通知：默认 false
 var NotifyCloudSoftSkip = false;
 // 打开自签失败（无 jwt / jwt 失效）是否弹系统通知：默认 false（只打控制台）
@@ -153,7 +157,8 @@ function ReadCookie() {
     $nobyda.write("", "CMCC_CloudSignedDayMap");
     $nobyda.write("", "CMCC_CloudSignedDay");
     $nobyda.write("", "CMCC_CloudOpenInflight");
-    $nobyda.notify("中国移动", "", "已清空 CookiesCMCC / CookieCMCC / CMCC_SignEndpoints / 云盘防抖与每日锁");
+    $nobyda.write("", "CMCC_AppSignedDayMap");
+    $nobyda.notify("中国移动", "", "已清空 CookiesCMCC / CookieCMCC / CMCC_SignEndpoints / 云盘与 App 防抖与每日锁");
     return $nobyda.done();
   }
 
@@ -347,8 +352,9 @@ async function GetCookie() {
 
     if (AutoSignAfterLogin) {
       // 关键：必须在 finishRequest/$done 之前尽量跑完，但 rewrite-response 有硬超时。
-      // 策略：短延迟 + 主路径优先；超时会被 QX 杀掉（见日志 Exception timeout）。
-      const delay = Math.min(SignDelayMs || 0, 900);
+      // 策略：延迟等待（用户要求 3-5 秒）+ 主路径优先；超时会被 QX 杀掉（见日志 Exception timeout）。
+      // 延迟上限放宽到 5000ms，超出截断以防改写超时把整次签到拖垮。
+      const delay = Math.min(SignDelayMs || 0, 5000);
       if (delay > 0) await wait(delay);
       const latest = reloadAccount(saved) || saved;
       await all(latest, { reason: "login-trigger" });
@@ -790,6 +796,54 @@ function markCloudDoneToday(phone, parsed) {
         source: "cloud-day-mark"
       }, true);
     }
+  } catch (e) {}
+}
+
+/********************* App 每日锁（防重复签到） *********************/
+function appYmd() {
+  const d = new Date();
+  const p = n => (n < 10 ? "0" : "") + n;
+  return "" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
+}
+
+function readAppDayMap() {
+  try {
+    const raw = $nobyda.read("CMCC_AppSignedDayMap") || "";
+    if (!raw) return {};
+    const j = JSON.parse(raw);
+    return j && typeof j === "object" ? j : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function isAppDoneToday(phone) {
+  if (!isValidPhone(phone)) return false;
+  try {
+    const map = readAppDayMap();
+    if (map[phone] === appYmd()) return true;
+  } catch (e) {}
+  return false;
+}
+
+function markAppDoneToday(phone, parsed) {
+  if (!isValidPhone(phone)) return;
+  try {
+    const ymd = appYmd();
+    const map = readAppDayMap();
+    map[phone] = ymd;
+    // 只保留近 30 个号，防键膨胀
+    const keys = Object.keys(map);
+    if (keys.length > 30) {
+      keys.slice(0, keys.length - 30).forEach(k => { delete map[k]; });
+    }
+    $nobyda.write(JSON.stringify(map), "CMCC_AppSignedDayMap");
+    upsertAccount({
+      phone: phone,
+      appLastSignYmd: ymd,
+      updatedAt: Date.now(),
+      source: "app-day-mark"
+    }, true);
   } catch (e) {}
 }
 
@@ -1533,6 +1587,13 @@ function LiveQwhdSign(s) {
 
         const headers = buildQwhdApiHeaders(pageUrl);
 
+        // 1.5) 每日锁：已签到过的号当天不再打接口（与定时任务 / 多次登录触发共享）
+        if (AppDailyOnce && isValidPhone(ACCOUNT.phone) && isAppDoneToday(ACCOUNT.phone)) {
+          merge.QwhdSign.success = 1;
+          merge.QwhdSign.notify = "签到领奖: 今日已签到（本地每日锁）";
+          return resolve();
+        }
+
         // 2) markstatus：看今日是否已签（data.markstatus[].date/status）
         const statusUrl = "https://wx.10086.cn/qwhdhub/api/mark/mark31/markstatus";
         const st = await httpRaw("POST", statusUrl, headers, "{}").catch(e => ({ error: String(e), status: 0, body: "" }));
@@ -1556,6 +1617,7 @@ function LiveQwhdSign(s) {
         if (already) {
           merge.QwhdSign.success = 1;
           merge.QwhdSign.notify = "签到领奖: 今日已签到";
+          if (AppDailyOnce && isValidPhone(ACCOUNT.phone)) markAppDoneToday(ACCOUNT.phone, { ok: true });
           // 仍可尝试领取可领任务奖
           if (AutoClaimTaskAward) {
             const award = await claimTaskAwardsFromStatus(st2 && st2.body, headers);
@@ -1576,6 +1638,7 @@ function LiveQwhdSign(s) {
           merge.QwhdSign.success = 1;
           const alreadyMsg = /已签|重复|ALREADY|SIGNED/i.test(text);
           merge.QwhdSign.notify = alreadyMsg ? "签到领奖: 今日已签" : "签到领奖: 签到成功";
+          if (AppDailyOnce && isValidPhone(ACCOUNT.phone)) markAppDoneToday(ACCOUNT.phone, { ok: true, points: null });
           // 抓包成功样例: status=PRIZE_NO_CONFIG, msg=未配置对应奖品, success=true
           if (/PRIZE_NO_CONFIG|未配置对应奖品/i.test(text)) {
             merge.QwhdSign.notify += "（当日奖品未配置，任务进度已记）";
