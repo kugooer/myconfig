@@ -42,10 +42,11 @@ var DeleteCookie = false;
 var out = 15000; // 单请求超时(ms)
 // 登录成功后是否立刻自动签到（核心开关）
 var AutoSignAfterLogin = true;
-// 登录成功后延迟多久再开始签到（用户要求 3-5 秒；默认 3500ms）
-// 注意：该延迟在 fingerprintLogin 的 rewrite-response 内同步等待，QX 对改写脚本有执行时长限制；
-// 若日志出现「Exception timeout」，请下调此值，或改由定时任务（argument=app）兜底——每日锁可防重复签
-var SignDelayMs = 3500;
+// 登录成功后延迟多久再开始签到（方案 B：默认 800ms，规避 QX 10s 改写超时）
+// 说明：该延迟在 fingerprintLogin 的 rewrite-response 内同步等待，QX 对改写脚本有执行时长限制；
+// 3500ms 会吃掉太多预算导致慢账号（并发流量）超 10s 被杀（Exception JS timeout）；
+// 降到 800ms 留足主签到链时间。仍建议开启 argument=app 定时任务兜底——每日锁可防重复签。
+var SignDelayMs = 800;
 // 并发账号间隔
 var AccountGapMs = 600;
 
