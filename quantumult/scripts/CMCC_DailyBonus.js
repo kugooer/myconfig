@@ -344,12 +344,7 @@ async function GetCookie() {
     };
 
     const saved = upsertAccount(acc);
-    const label = maskPhone(saved.phone || saved.uid || "账号");
-    $nobyda.notify(
-      "中国移动",
-      "登录会话已更新",
-      label + (saved.phone ? "" : "（指纹登录密文，无明文手机号属正常；H5 仍可签）")
-    );
+    // 注：登录成功不再发通知（用户要求）；签到结果通知在 all()/domark 路径保留。
 
     if (AutoSignAfterLogin) {
       // 关键：必须在 finishRequest/$done 之前尽量跑完，但 rewrite-response 有硬超时。
