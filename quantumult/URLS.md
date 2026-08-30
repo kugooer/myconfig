@@ -386,6 +386,50 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_W
 
 ---
 
+## 泰康在线（微信小程序）每日领金币
+
+更新说明（2026-08-30 / capture-v1.0）：
+
+- 入口：微信小程序「泰康在线」`wx9e3e7020c4a10356`（page 395）
+- 4 个奖励动作（全 POST，响应明文 JSON）：
+  - 登录签到 5 金币 → `POST /activity_execute/rest/membergoldbean/sign`
+  - 每日打卡 1000 步 15 金币 → `POST /promotion/activity_execute/rest/springOuting/draw`（`drawSource=dailyOneK`）
+  - 每日打卡 5000 步 30 金币 → `POST /promotion/activity_execute/rest/springOuting/draw`（`drawSource=dailyFiveK`）
+  - 每日打卡 10000 步 50 金币 → `POST /promotion/activity_execute/rest/springOuting/draw`（`drawSource=dailyTenK`）
+- **路线 B frozen payload 重放**：所有请求体走 `{"enc":true,"encData":"<hex>"}` 包装，密钥嵌在微信小程序 JS 内、无法从抓包还原。脚本内已固化 4 个 encData + Authorization + Signature，无需 MitM
+- draw 系列额外带 `Authorization`（会话级，长效）和 `Signature`（per-request 绑定 body）。直接重放 body+headers 原样即可
+
+### 推荐（QX 任务资源）
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/Taikang_DailyBonus.task
+```
+
+### 脚本本体
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/Taikang_DailyBonus.js
+```
+
+### 定时任务
+
+```text
+0 9 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/Taikang_DailyBonus.js, tag=泰康在线领金币, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Coin.png, enabled=true
+```
+
+### 挂载后操作
+
+1. QX：任务 → 引用上述 task → **强制更新**；无需 MitM / 证书
+2. 直接运行任务（4 段奖励一次性领取），通知展示「X/4 成功 · 本次 +N 金币」与账户余额
+3. **frozen payload 失效处理**：当 4 项全部失败（业务错误 `error_code≠0` 或网络错误），说明服务端对 encData 引入时间戳/防重放：
+   - 重新打开微信小程序「泰康在线」→ 进入「每日签到福利」页
+   - 用抓包工具（Stream / 圈 httpcanary）抓 4 个对应接口（`sign` + 3 个 `draw`）
+   - 替换脚本 `Payloads` 数组中对应 `body` / `headers`（参考 2026-08-30 抓包格式：`Authorization` 仅一项会变；`Signature` 每条都不同）
+   - 4 段 encData 整体替换后 commit & push
+4. 每日 09:00 定时跑，账户余额变化以小程序为准
+
+---
+
 ## 合规说明
 
 本仓库仅托管**自建签到 / 抓包缓存凭证 / 定时任务**类配置。  

@@ -1,0 +1,6 @@
+# 泰康在线 每日领金币
+# 入口：微信小程序「泰康在线」(wx9e3e7020c4a10356)
+# 路线 B frozen payload 重放：脚本内已固化 4 个 encData + 头部，无需 MitM
+# 若服务端对 encData 引入时间戳/防重放导致全部失败，重新打开小程序「每日签到福利」页抓包替换 Payloads
+
+0 9 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/Taikang_DailyBonus.js, tag=泰康在线领金币, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Coin.png, enabled=true
