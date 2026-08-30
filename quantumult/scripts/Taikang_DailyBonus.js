@@ -20,6 +20,18 @@
   - 响应字段: signAmount/glodbean 表示本次奖励，amount/totalGoldbeanAmount
     表示当前账户金币总额；error_code=="0" 视为成功
 
+  凭证有效期（2026-08-30 解码 tkol-api/member/login 返回的 JWT 得出）:
+  - accessToken  exp = 2026-09-06 15:32:59（抓包后约 7 天）
+  - refreshToken exp = 2026-09-29 15:32:59（抓包后约 30 天）
+  - 结论: frozen payload 预计可用到 2026-09-06 前后。到期后 4 项会一起失败，
+    届时需重新抓包替换 Payloads
+
+  已知业务码:
+  - 200004200003 = 今日已签到（视为成功，已列入 DONE_CODES）
+  - 200001000001 = 网络有点拥挤，请稍后重试。可能是「今日已领取」的泛化文案，
+    也可能是 payload 失效。判定方法：次日首跑（尚未手动领取时）若仍出现此码，
+    即为 payload 失效，需重新抓包；若不再出现，说明当时确为「已领取」
+
   用法:
   1) 挂 task；首次运行直接用脚本内默认 frozen payload
   2) 若服务端对 encData 引入时间戳/防重放导致过期，重新打开小程序走到
@@ -120,6 +132,15 @@ var Payloads = [
   }
 ];
 
+// 已知「今日已完成」业务码 → 视为成功，不报警
+// 扩展点：若后续拿到打卡「已领取」的业务码，直接在此 Map 增补即可
+var DONE_CODES = {
+  "200004200003": "今日已签到"
+};
+// 瞬时错误（如 200001000001「网络有点拥挤，请稍后重试」）重试次数与间隔
+var RetryTimes = 2;
+var RetryDelayMs = 1500;
+
 var merge = {};
 
 (async () => {
@@ -146,78 +167,110 @@ var merge = {};
   }
 })();
 
-function doAction(p, index) {
-  merge["act" + index] = { name: p.name, expectCoin: p.expectCoin, expectSource: p.expectSource };
+// 单次请求：只负责发包，判定交给 classify()
+function fetchOnce(p) {
   return new Promise((resolve) => {
-    const url = "https://" + HOST + p.path;
     const options = {
-      url,
+      url: "https://" + HOST + p.path,
       method: "POST",
       headers: p.headers,
       body: p.body
     };
     if (out) options.timeout = out;
     $nobyda.post(options, function (error, response, data) {
-      const slot = merge["act" + index];
-      try {
-        if (error) {
-          slot.ok = false;
-          slot.msg = "网络错误: " + error;
-          console.log("[" + p.name + "] " + slot.msg);
-          return resolve();
-        }
-        const status = response && (response.statusCode || response.status);
-        const obj = safeJSON(data);
-        if (!obj) {
-          slot.ok = false;
-          slot.msg = "响应非 JSON（HTTP " + status + "）";
-          console.log("[" + p.name + "] " + slot.msg + "\n" + String(data || "").slice(0, 200));
-          $nobyda.write(summarizeForDiag(p, status, data, null), PREFIX + "_LastReplay_" + index);
-          return resolve();
-        }
-        const code = String(obj.error_code || "");
-        if (code !== "0") {
-          slot.ok = false;
-          slot.msg = "业务错误 " + code + " " + (obj.error_message || "");
-          console.log("[" + p.name + "] " + slot.msg);
-          $nobyda.write(summarizeForDiag(p, status, data, obj), PREFIX + "_LastReplay_" + index);
-          return resolve();
-        }
-        const data2 = obj.data || {};
-        // sign 系列: signAmount；draw 系列: glodbean
-        const gotCoin = Number(data2.signAmount || data2.glodbean || 0);
-        const gotSource = data2.drawSource || p.expectSource || "";
-        slot.ok = true;
-        slot.coin = gotCoin;
-        slot.source = gotSource;
-        slot.total = Number(data2.amount || data2.totalGoldbeanAmount || 0);
-        slot.todayIsSub = data2.todayIsSub || "";
-        console.log(
-          "[" + p.name + "] ✅ +" + gotCoin + " 金币 (source=" + gotSource + ", total=" + slot.total + ", todayIsSub=" + slot.todayIsSub + ")"
-        );
-        $nobyda.write(summarizeForDiag(p, status, data, obj), PREFIX + "_LastReplay_" + index);
-      } catch (e) {
-        slot.ok = false;
-        slot.msg = "处理异常: " + (e.message || e);
-        console.log("[" + p.name + "] " + slot.msg);
-      }
-      resolve();
+      resolve({
+        error: error || null,
+        status: response ? response.statusCode || response.status : 0,
+        data: data
+      });
     });
   });
 }
 
-function summarizeForDiag(p, status, raw, obj) {
-  return JSON.stringify({
-    at: new Date().toISOString(),
-    name: p.name,
-    path: p.path,
-    status: status,
-    code: obj && obj.error_code,
-    msg: obj && obj.error_message,
-    coin: obj && obj.data && (obj.data.signAmount || obj.data.glodbean),
-    total: obj && obj.data && (obj.data.amount || obj.data.totalGoldbeanAmount),
-    head: String(raw || "").slice(0, 200)
-  });
+// 结果判定：settled=true 表示终态（成功 / 今日已完成），不再重试
+function classify(p, r) {
+  if (r.error) return { ok: false, msg: "网络错误: " + r.error };
+  const obj = safeJSON(r.data);
+  if (!obj) return { ok: false, msg: "响应非 JSON (HTTP " + r.status + ")" };
+  const code = String(obj.error_code || "");
+  if (code === "0") {
+    const d = obj.data || {};
+    const coin = Number(d.signAmount != null ? d.signAmount : d.glodbean || 0);
+    return {
+      ok: true,
+      settled: true,
+      code: "0",
+      coin: coin,
+      source: d.drawSource || p.expectSource || "",
+      total: Number(d.amount || d.totalGoldbeanAmount || 0),
+      todayIsSub: d.todayIsSub || "",
+      msg: "+" + coin + " 金币"
+    };
+  }
+  if (DONE_CODES[code]) {
+    return { ok: true, done: true, settled: true, code: code, msg: DONE_CODES[code] };
+  }
+  return {
+    ok: false,
+    code: code,
+    msg: "业务错误 " + code + " " + (obj.error_message || "")
+  };
+}
+
+async function doAction(p, index) {
+  const slot = { name: p.name, expectCoin: p.expectCoin, expectSource: p.expectSource };
+  merge["act" + index] = slot;
+  let lastResult = null;
+  let lastParsed = null;
+  for (let round = 0; round <= RetryTimes; round++) {
+    if (round > 0) await sleep(RetryDelayMs);
+    const r = await fetchOnce(p);
+    lastResult = r;
+    lastParsed = classify(p, r);
+    if (lastParsed.settled) break;
+    if (round < RetryTimes) {
+      console.log("[" + p.name + "] 第 " + (round + 1) + " 次未成功（" + lastParsed.msg + "），" + RetryDelayMs + "ms 后重试");
+    }
+  }
+  Object.assign(slot, lastParsed || { ok: false, msg: "无响应" });
+  // 完整原始响应落盘，供排障（QX: 通用设置 → 持久化 → Taikang_LastReplay_N）
+  saveDiag(p, index, lastResult, lastParsed);
+  logResult(p, slot);
+}
+
+function logResult(p, slot) {
+  if (slot.ok && !slot.done) {
+    console.log(
+      "[" + p.name + "] ✅ 领取成功 +" + slot.coin + " (source=" + slot.source + ", total=" + slot.total + ", todayIsSub=" + slot.todayIsSub + ")"
+    );
+  } else if (slot.done) {
+    console.log("[" + p.name + "] ✅ 今日已完成，无需重复 (" + slot.msg + ")");
+  } else {
+    console.log("[" + p.name + "] ❌ " + slot.msg);
+  }
+}
+
+function saveDiag(p, index, r, parsed) {
+  try {
+    $nobyda.write(
+      JSON.stringify({
+        at: new Date().toISOString(),
+        name: p.name,
+        path: p.path,
+        http: r && r.status,
+        code: parsed && parsed.code,
+        msg: parsed && parsed.msg,
+        coin: parsed && parsed.coin,
+        total: parsed && parsed.total,
+        raw: String((r && r.data) || "").slice(0, 400)
+      }),
+      PREFIX + "_LastReplay_" + index
+    );
+  } catch (e) {}
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function safeJSON(text) {
@@ -239,35 +292,50 @@ function safeJSON(text) {
 
 async function notifyDone() {
   const lines = [];
-  let totalCoin = 0;
-  let okCount = 0;
+  let gotCoin = 0; // 本次真正领到的
+  let gotCount = 0; // 本次领取成功数
+  let doneCount = 0; // 今日此前已完成数
   let failCount = 0;
-  for (let i = 1; i <= 4; i++) {
+  for (let i = 1; i <= Payloads.length; i++) {
     const slot = merge["act" + i];
     if (!slot) continue;
-    if (slot.ok) {
-      okCount++;
-      totalCoin += Number(slot.coin || 0);
-      lines.push("✅ " + slot.name + " +" + slot.coin + "金币");
+    if (slot.ok && !slot.done) {
+      gotCount++;
+      gotCoin += Number(slot.coin || 0);
+      lines.push("✅ " + slot.name + " +" + slot.coin + " 金币");
+    } else if (slot.done) {
+      doneCount++;
+      lines.push("☑️ " + slot.name + " 今日已完成");
     } else {
       failCount++;
       lines.push("❌ " + slot.name + " " + (slot.msg || "失败"));
     }
   }
-  // 最后一个成功的 total
+  // 账户余额取最后一个拿到 total 的响应
   let lastTotal = 0;
-  for (let i = 4; i >= 1; i--) {
-    if (merge["act" + i] && merge["act" + i].ok) {
-      lastTotal = merge["act" + i].total || 0;
+  for (let i = Payloads.length; i >= 1; i--) {
+    if (merge["act" + i] && merge["act" + i].total) {
+      lastTotal = merge["act" + i].total;
       break;
     }
   }
   const title = "泰康在线领金币";
-  const sub = okCount + "/4 成功 · 本次 +" + totalCoin + " 金币";
-  const msg =
-    lines.join("\n") +
-    (lastTotal ? "\n账户余额: " + lastTotal + " 金币" : "") +
-    (failCount ? "\n\n⚠️ 失败项需重新打开小程序「每日签到福利」页抓包更新 frozen payload" : "");
+  let sub;
+  if (failCount === 0 && gotCount > 0) sub = gotCount + "/" + Payloads.length + " 领取成功 · 本次 +" + gotCoin + " 金币";
+  else if (failCount === 0 && gotCount === 0) sub = "今日已全部领取（" + doneCount + "/" + Payloads.length + "）";
+  else sub = gotCount + " 成功 / " + doneCount + " 已完成 / " + failCount + " 失败";
+
+  let msg = lines.join("\n");
+  if (lastTotal) msg += "\n账户余额: " + lastTotal + " 金币";
+  if (failCount) {
+    msg +=
+      "\n\n⚠️ 有 " +
+      failCount +
+      " 项失败。若「登录签到」也返回鉴权类错误，说明 frozen payload 已过期：" +
+      "重新打开小程序「每日签到福利」页抓包更新 Payloads。" +
+      "\n若签到报「今日已签到」而打卡报业务错误，则打卡码可能是「今日已领取」，" +
+      "把该码补进脚本顶部 DONE_CODES 即可。";
+  }
   if (Notify) $nobyda.notify(title, sub, msg);
   console.log("\n" + title + "\n" + sub + "\n" + msg);
 }
