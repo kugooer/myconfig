@@ -147,7 +147,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 
 ## 三、无忧行(JegoTrip) 签到
 
-更新说明（2026-08-14 / capture-v1.1-quiet-capture）：
+更新说明（2026-08-31 / capture-v1.2-quiet-capture）：
 
 - 抓包定位：`app.jegotrip.com.cn` 任务中心 H5
 - `querySign`（明文）→ 选下一天 `signConfigId`（`isSign=2` 中 `completeNumber` 最小）
@@ -155,6 +155,9 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/BYD_Dail
 - 密钥：`online_jego_h5` / `93EFE107DDE6DE51`（missioncenter 前端）
 - 抓包对照：两账号分别到账 **+8**、**+6** 无忧币（`getUserTripCoins` 记录「签到」）
 - **v1.1**：用户验收双账号「今日已签」正确；抓包路径不再打印「签到用时」；普通 cookie update 静默
+- **v1.2**：移除 `app3.jegotrip.com.cn`。该域名承载无忧行电话/呼叫服务，
+  被 QX 接管后会出现「无法连接到电话服务器」。签到接口实测全部走
+  `app.jegotrip.com.cn`，移除不影响签到
 
 ### 推荐（QX 重写资源）
 
@@ -183,11 +186,21 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/JegoTrip
 ### 挂载后操作
 
 1. QX：重写 → 引用上述 conf → **右上角强制更新**；开启 MitM 并信任证书  
-2. hostname 仅：`app.jegotrip.com.cn`, `app3.jegotrip.com.cn`（勿整域 `*.jegotrip.com.cn`）  
+2. hostname 仅：`app.jegotrip.com.cn`（v1.2 起**不再**包含 `app3.jegotrip.com.cn`；勿整域 `*.jegotrip.com.cn`）  
 3. 打开无忧行 → **任务中心/签到页**（每个要签的账号各进一次）  
 4. 通知「凭证新增/已保存」后，手动运行「无忧行签到」任务验证  
 5. 多账号按 token 去重保存在 `JegoTrip_Cookies`  
 6. token 过期会提示重新进签到页；勿分享 token
+
+### 排障：无忧行电话/呼叫不可用
+
+若开启本重写后无忧行提示「无法连接到电话服务器」：
+
+1. 确认 rewrite 的 `hostname` **只有** `app.jegotrip.com.cn`，不含 `app3.jegotrip.com.cn`
+2. QX：MitM 设置里检查主机名列表，若残留 `app3.jegotrip.com.cn` 需更新重写资源后清理
+3. 分流中为 `app3.jegotrip.com.cn`、`*.jegotrip.com.cn` 电话相关域名加 **DIRECT（直连）** 规则
+4. QX 的 MitM 若开启「解密」会中断非 HTTP(S) 的信令/长连接；直连可绕过接管
+5. 仍异常时，可临时停用本重写做 A/B 验证，确认是否由 MitM 引起
 
 ---
 
