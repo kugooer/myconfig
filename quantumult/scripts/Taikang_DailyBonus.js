@@ -2,9 +2,21 @@
 
   泰康在线（微信小程序 wx9e3e7020c4a10356）每日领金币
 
-  更新时间: 2026-08-30 (capture-v1.1)
+  更新时间: 2026-08-31 (v1.2 逆向签名全自动打卡)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
+
+  v1.2 修复（2026-08-31 逆向自小程序 getSignature）:
+  - 根因：3 个打卡(draw)接口的 Signature 是 per-request、绑定未传输的
+    时间戳/随机数（分钟粒度），服务端做「新鲜度」校验 → frozen Signature 必失效
+    （返回泛化文案 200001000001「网络有点拥挤」掩盖真实「签名无效」）。
+  - 方案：从 Mac 微信沙盒小程序包(wxF 324 版)逆向出签名算法，在脚本内用纯 JS
+    内嵌 MD5 + AES-128-ECB(PKCS7) 实时算出合法 Signature（已与 Node crypto 逐字节
+    对拍一致，并 live 验证服务端接受）。draw 三项改为 dynamicSignature: true。
+  - 登录签到(sign)接口本就不带 Signature，原样保留 frozen payload 即可（+5 金币）。
+  - 代价：Signature 用 prd 环境常量，会随小程序版本升级(包体/key 变更)失效，
+    届时需重新从新包逆向；但 encData/Authorization 仍走 frozen payload，
+    预计可用至 accessToken 过期(~2026-09-06)，之后 4 项一起需重新抓包。
 
   v1.1 修复（2026-08-30 15:46 用户首跑日志）:
   - 「今日已签到」(200004200003) 原判为失败，现列入 DONE_CODES 视为成功
@@ -36,9 +48,15 @@
 
   已知业务码:
   - 200004200003 = 今日已签到（视为成功，已列入 DONE_CODES）
-  - 200001000001 = 网络有点拥挤，请稍后重试。可能是「今日已领取」的泛化文案，
-    也可能是 payload 失效。判定方法：次日首跑（尚未手动领取时）若仍出现此码，
-    即为 payload 失效，需重新抓包；若不再出现，说明当时确为「已领取」
+  - 200001000001 = 网络有点拥挤，请稍后重试。
+    ★ 已定性（2026-08-31 09:32 次日首跑 + 手动补打卡抓包比对）：
+      该码是「打卡接口 Signature 校验失败」的泛化文案，并非「已领取」。
+      证据：手动打卡成功的请求与脚本 frozen 值逐项比对 → Authorization 完全相同、
+      encData(请求体) 逐字节相同，唯独 Signature 后 48 字节不同（前 48 字节固定）。
+      说明 draw 接口的 Signature 是 per-request、绑定一个未在请求中传输的
+      时间戳/随机数，服务端做「新鲜度」校验 → frozen Signature 必失效。
+      ⇒ 结论：3 个打卡接口无法通过 frozen payload 原样重放自动化，
+         不要把它补进 DONE_CODES（那会掩盖真正的失败）。
 
   用法:
   1) 挂 task；首次运行直接用脚本内默认 frozen payload
@@ -71,6 +89,103 @@ var Referer = "https://servicewechat.com/" + WX_APPID + "/" + WX_PAGE + "/page-f
 var DefaultUA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 26_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.76(0x18004c2c) NetType/WIFI Language/zh_CN";
 
+// ================= 纯 JS MD5 + AES-128-ECB(PKCS7) =================
+// 用于 QX/JSContext 环境（无 crypto 模块）。已用 Node crypto 严格对拍逐字节一致。
+// 用途：实时计算 draw 接口的 per-request Signature（详见下方 tkGetSignature）。
+// ---- MD5 ----
+function MD5(str){
+  var bytes=[];
+  var s0=(typeof unescape==='function')?unescape(encodeURIComponent(str)):str;
+  for(var i=0;i<s0.length;i++) bytes.push(s0.charCodeAt(i)&0xff);
+  var n=bytes.length;
+  bytes.push(0x80);
+  while(bytes.length%64!==56) bytes.push(0);
+  var bitLen=n*8;
+  for(var k=0;k<4;k++) bytes.push((bitLen>>>(k*8))&0xff);
+  var hi=Math.floor(bitLen/0x100000000);
+  for(var k=0;k<4;k++) bytes.push((hi>>>(k*8))&0xff);
+  function rol(x,s){x=x>>>0;return ((x<<s)|(x>>>(32-s)))>>>0;}
+  function F(x,y,z){return (x&y)|(~x&z);}
+  function G(x,y,z){return (x&z)|(y&~z);}
+  function H(x,y,z){return x^y^z;}
+  function I(x,y,z){return y^(x|~z);}
+  function step(a,b,c,d,x,s,ac,fn){var t=((a+fn(b,c,d)+x+ac)>>>0);return (rol(t,s)+b)>>>0;}
+  function toInt(off){return (bytes[off]|(bytes[off+1]<<8)|(bytes[off+2]<<16)|(bytes[off+3]<<24))>>>0;}
+  var h=[0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476];
+  var T1=[0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821];
+  var T2=[0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a];
+  var T3=[0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665];
+  var T4=[0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391];
+  for(var off=0;off<bytes.length;off+=64){
+    var M=[];for(var i2=0;i2<16;i2++) M[i2]=toInt(off+i2*4);
+    var A=h[0],B=h[1],C=h[2],D=h[3];
+    A=step(A,B,C,D,M[0],7,T1[0],F);D=step(D,A,B,C,M[1],12,T1[1],F);C=step(C,D,A,B,M[2],17,T1[2],F);B=step(B,C,D,A,M[3],22,T1[3],F);
+    A=step(A,B,C,D,M[4],7,T1[4],F);D=step(D,A,B,C,M[5],12,T1[5],F);C=step(C,D,A,B,M[6],17,T1[6],F);B=step(B,C,D,A,M[7],22,T1[7],F);
+    A=step(A,B,C,D,M[8],7,T1[8],F);D=step(D,A,B,C,M[9],12,T1[9],F);C=step(C,D,A,B,M[10],17,T1[10],F);B=step(B,C,D,A,M[11],22,T1[11],F);
+    A=step(A,B,C,D,M[12],7,T1[12],F);D=step(D,A,B,C,M[13],12,T1[13],F);C=step(C,D,A,B,M[14],17,T1[14],F);B=step(B,C,D,A,M[15],22,T1[15],F);
+    A=step(A,B,C,D,M[1],5,T2[0],G);D=step(D,A,B,C,M[6],9,T2[1],G);C=step(C,D,A,B,M[11],14,T2[2],G);B=step(B,C,D,A,M[0],20,T2[3],G);
+    A=step(A,B,C,D,M[5],5,T2[4],G);D=step(D,A,B,C,M[10],9,T2[5],G);C=step(C,D,A,B,M[15],14,T2[6],G);B=step(B,C,D,A,M[4],20,T2[7],G);
+    A=step(A,B,C,D,M[9],5,T2[8],G);D=step(D,A,B,C,M[14],9,T2[9],G);C=step(C,D,A,B,M[3],14,T2[10],G);B=step(B,C,D,A,M[8],20,T2[11],G);
+    A=step(A,B,C,D,M[13],5,T2[12],G);D=step(D,A,B,C,M[2],9,T2[13],G);C=step(C,D,A,B,M[7],14,T2[14],G);B=step(B,C,D,A,M[12],20,T2[15],G);
+    A=step(A,B,C,D,M[5],4,T3[0],H);D=step(D,A,B,C,M[8],11,T3[1],H);C=step(C,D,A,B,M[11],16,T3[2],H);B=step(B,C,D,A,M[14],23,T3[3],H);
+    A=step(A,B,C,D,M[1],4,T3[4],H);D=step(D,A,B,C,M[4],11,T3[5],H);C=step(C,D,A,B,M[7],16,T3[6],H);B=step(B,C,D,A,M[10],23,T3[7],H);
+    A=step(A,B,C,D,M[13],4,T3[8],H);D=step(D,A,B,C,M[0],11,T3[9],H);C=step(C,D,A,B,M[3],16,T3[10],H);B=step(B,C,D,A,M[6],23,T3[11],H);
+    A=step(A,B,C,D,M[9],4,T3[12],H);D=step(D,A,B,C,M[12],11,T3[13],H);C=step(C,D,A,B,M[15],16,T3[14],H);B=step(B,C,D,A,M[2],23,T3[15],H);
+    A=step(A,B,C,D,M[0],6,T4[0],I);D=step(D,A,B,C,M[7],10,T4[1],I);C=step(C,D,A,B,M[14],15,T4[2],I);B=step(B,C,D,A,M[5],21,T4[3],I);
+    A=step(A,B,C,D,M[12],6,T4[4],I);D=step(D,A,B,C,M[3],10,T4[5],I);C=step(C,D,A,B,M[10],15,T4[6],I);B=step(B,C,D,A,M[1],21,T4[7],I);
+    A=step(A,B,C,D,M[8],6,T4[8],I);D=step(D,A,B,C,M[15],10,T4[9],I);C=step(C,D,A,B,M[6],15,T4[10],I);B=step(B,C,D,A,M[13],21,T4[11],I);
+    A=step(A,B,C,D,M[4],6,T4[12],I);D=step(D,A,B,C,M[11],10,T4[13],I);C=step(C,D,A,B,M[2],15,T4[14],I);B=step(B,C,D,A,M[9],21,T4[15],I);
+    h[0]=(h[0]+A)>>>0;h[1]=(h[1]+B)>>>0;h[2]=(h[2]+C)>>>0;h[3]=(h[3]+D)>>>0;
+  }
+  function hx(v){var s="";for(var i=0;i<4;i++){var b=(v>>>(i*8))&0xff;s+=("0"+b.toString(16)).slice(-2);}return s;}
+  return hx(h[0])+hx(h[1])+hx(h[2])+hx(h[3]);
+}
+// ---- AES-128-ECB (FIPS-197) ----
+var AES_SBOX=[99,124,119,123,242,107,111,197,48,1,103,43,254,215,171,118,202,130,201,125,250,89,71,240,173,212,162,175,156,164,114,192,183,253,147,38,54,63,247,204,52,165,229,241,113,216,49,21,4,199,35,195,24,150,5,154,7,18,128,226,235,39,178,117,9,131,44,26,27,110,90,160,82,59,214,179,41,227,47,132,83,209,0,237,32,252,177,91,106,203,190,57,74,76,88,207,208,239,170,251,67,77,51,133,69,249,2,127,80,60,159,168,81,163,64,143,146,157,56,245,188,182,218,33,16,255,243,210,205,12,19,236,95,151,68,23,196,167,126,61,100,93,25,115,96,129,79,220,34,42,144,136,70,238,184,20,222,94,11,219,224,50,58,10,73,6,36,92,194,211,172,98,145,149,228,121,231,200,55,109,141,213,78,169,108,86,244,234,101,122,174,8,186,120,37,46,28,166,180,198,232,221,116,31,75,189,139,138,112,62,181,102,72,3,246,14,97,53,87,185,134,193,29,158,225,248,152,17,105,217,142,148,155,30,135,233,206,85,40,223,140,161,137,13,191,230,66,104,65,153,45,15,176,84,187,22];
+var AES_RCON=[0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36];
+function aesKeyExpand(key){var w=[];for(var i=0;i<4;i++)w[i]=(key[4*i]<<24)|(key[4*i+1]<<16)|(key[4*i+2]<<8)|key[4*i+3];for(var i=4;i<44;i++){var temp=w[i-1];if(i%4===0){var b=(temp>>>24)&255,g=(temp>>>16)&255,r=(temp>>>8)&255,lf=temp&255;temp=((AES_SBOX[b]<<24)|(AES_SBOX[g]<<16)|(AES_SBOX[r]<<8)|AES_SBOX[lf]);temp=((temp<<8)|(temp>>>24))^(AES_RCON[(i>>2)-1]<<24);}w[i]=w[i-4]^temp;}return w;}
+function aesStateFromBytes(b){var s=[];for(var c=0;c<4;c++){s[c]=0;for(var r=0;r<4;r++)s[c]|=(b[c*4+r])<<(24-r*8);}return s;}
+function aesStateToBytes(s){var b=[];for(var c=0;c<4;c++){for(var r=0;r<4;r++)b[c*4+r]=(s[c]>>>(24-r*8))&255;}return b;}
+function aesAddRoundKey(s,w,round){var t=[];for(var c=0;c<4;c++)t[c]=s[c]^w[round*4+c];return t;}
+function aesSubBytes(s){var t=[];for(var c=0;c<4;c++){var v=0;for(var r=0;r<4;r++){var byte=(s[c]>>>(24-r*8))&255;v|=AES_SBOX[byte]<<(24-r*8);}t[c]=v;}return t;}
+function aesShiftRows(s){var t=[];for(var c=0;c<4;c++){var v=0;for(var r=0;r<4;r++){var srcCol=(c+r)%4;var byte=(s[srcCol]>>>(24-r*8))&255;v|=byte<<(24-r*8);}t[c]=v;}return t;}
+function aesMul(a,b){var p=0;for(var i=0;i<8;i++){if(b&1)p^=a;b=b>>1;if(b)a=a<<1;if(a&0x100)a^=0x11b;}return p&0xff;}
+function aesMixColumns(s){var t=[];for(var c=0;c<4;c++){var a=[(s[c]>>>24)&255,(s[c]>>>16)&255,(s[c]>>>8)&255,s[c]&255];var r=[aesMul(a[0],2)^aesMul(a[1],3)^a[2]^a[3],a[0]^aesMul(a[1],2)^aesMul(a[2],3)^a[3],a[0]^a[1]^aesMul(a[2],2)^aesMul(a[3],3),aesMul(a[0],3)^a[1]^a[2]^aesMul(a[3],2)];t[c]=(r[0]<<24)|(r[1]<<16)|(r[2]<<8)|r[3];}return t;}
+function aesEncryptBlock(block,key){var w=aesKeyExpand(key);var state=aesStateFromBytes(block);state=aesAddRoundKey(state,w,0);for(var round=1;round<10;round++){state=aesSubBytes(state);state=aesShiftRows(state);state=aesMixColumns(state);state=aesAddRoundKey(state,w,round);}state=aesSubBytes(state);state=aesShiftRows(state);state=aesAddRoundKey(state,w,10);return aesStateToBytes(state);}
+function aes128EcbEncrypt(plainBytes,keyBytes){var pad=16-(plainBytes.length%16);if(pad===0)pad=16;var data=plainBytes.slice();for(var i=0;i<pad;i++)data.push(pad);var out=[];for(var off=0;off<data.length;off+=16){out=out.concat(aesEncryptBlock(data.slice(off,off+16),keyBytes));}return out;}
+// ---- draw 接口 Signature（逆向自小程序 getSignature，prd 环境常量） ----
+// 原小程序：sign = md5(md5(clientId + nonStr + 分钟时间戳 + MD5常量))
+//          Signature = AES-128-ECB( JSON.stringify({clientId,nonStr,timestamp,sign}), key ).toUpperCase()
+var TK_CLIENT_ID = "81b1950d";
+var TK_MD5_CONST = "gc6615f3f5b85f1ec09e";
+var TK_SIG_KEY   = "xdh3OmA5gEMMy0Mz";
+function tkGenNonce(){
+  var r="0123456789abcdef";
+  var t=[];
+  for(var n=0;n<36;n++) t[n]=r.substr(Math.floor(16*Math.random()),1);
+  t[14]="4";
+  t[19]=r.substr((3 & t[19]) | 8, 1);
+  t[8]=t[13]=t[18]=t[23]="-";
+  return t.join("");
+}
+function tkHeadAESEncrypt(keyStr, obj){
+  var keyBuf=Array.prototype.map.call(keyStr, function(c){return c.charCodeAt(0);});
+  var plainStr=JSON.stringify(obj);
+  var plain=[];
+  for(var i=0;i<plainStr.length;i++) plain.push(plainStr.charCodeAt(i)&0xff);
+  var enc=aes128EcbEncrypt(plain, keyBuf);
+  return enc.map(function(b){return ("0"+b.toString(16)).slice(-2);}).join("").toUpperCase();
+}
+function tkGetSignature(){
+  var nonStr=tkGenNonce();
+  var timestamp=Date.now();
+  var X=TK_CLIENT_ID+nonStr+(60000*Math.floor(timestamp/60000))+TK_MD5_CONST;
+  var m1=MD5(X);
+  var sign=MD5(m1);
+  var a={clientId:TK_CLIENT_ID,nonStr:nonStr,timestamp:timestamp,sign:sign};
+  return tkHeadAESEncrypt(TK_SIG_KEY, a);
+}
+
 // === Frozen payloads（2026-08-30 15:33 抓取，完整 request body + 必需 headers） ===
 // 字段：name, expectCoin（用于通知校对）, expectSource（drawSource / sign）, path, headers, body
 var Payloads = [
@@ -92,14 +207,13 @@ var Payloads = [
     expectCoin: 15,
     expectSource: "dailyOneK",
     path: "/promotion/activity_execute/rest/springOuting/draw",
+    dynamicSignature: true,
     headers: {
       "content-type": "application/json",
       "User-Agent": DefaultUA,
       "Referer": Referer,
       Authorization:
-        "D8920E7A3D72DB2F1A3BB6445AB743434D329E2A092D20FAB07FAAEF7548F3E6C6255D3AA32B50945C3C1BC19C7972B9E846722A035DDB45EC0D4CBA5A3B52CEA1BB44D0C05D4934880CBEDFA584FFCE4E14C2E723EE22B69F427A74EC7962E5",
-      Signature:
-        "D0A8E75CABC6CC5C9937A5604A3A722A29639006F675BFB5F96A5D86E5A11460DDD7ABDCBBDADE641BEB6BEDA2F7E58A9621F1E0378B79B8C6F9A0DBF729E0B338D99CC6B02BE177069D30635F209A77210F1A0DB95F3A6075555E1DEBF2C7D1CA0CDEF4851EE10725B93FDA9D6543D04A9911D89F911F0EC72D4F5AD95775A122B559490D85C190558D03E86097D088"
+        "D8920E7A3D72DB2F1A3BB6445AB743434D329E2A092D20FAB07FAAEF7548F3E6C6255D3AA32B50945C3C1BC19C7972B9E846722A035DDB45EC0D4CBA5A3B52CEA1BB44D0C05D4934880CBEDFA584FFCE4E14C2E723EE22B69F427A74EC7962E5"
     },
     body:
       '{"enc":true,"encData":"E3D409147A3678E02E51FD53EBBEEBC45FEF6A153651A7F13309FD281461037714E925C0915945BD27FED35A9FFAAA91B39B55A86DD2591A4650D4ECFC62244CF14F4D4879CDE56F9C243CB3070EED577B627027BE376706F8A1C46CF198C64DDDCA1243715C2269C3000738B35B7DA49571D53AA805BC5E6B304D99ADA86416BD68171206DD5F49766C31FBA583CA651379011452242FE2CE24F5301CD143D7C4894BD2A9651DB907DBE6B82296D206530651C97498E71C04E53F3297CD5162456AD276E40A403FCD474F7D4C12F1540C213FF00D829D0C18AF3E4DEE1BE6212DC01E17E358859CE6F808C9226E6A77A7A84D69F7F8670A6BDD17CF07462800864182D0C02B9800A1A9B36CB2A2F0B7"}'
@@ -109,14 +223,13 @@ var Payloads = [
     expectCoin: 30,
     expectSource: "dailyFiveK",
     path: "/promotion/activity_execute/rest/springOuting/draw",
+    dynamicSignature: true,
     headers: {
       "content-type": "application/json",
       "User-Agent": DefaultUA,
       "Referer": Referer,
       Authorization:
-        "D8920E7A3D72DB2F1A3BB6445AB743434D329E2A092D20FAB07FAAEF7548F3E6C6255D3AA32B50945C3C1BC19C7972B9E846722A035DDB45EC0D4CBA5A3B52CEA1BB44D0C05D4934880CBEDFA584FFCE4E14C2E723EE22B69F427A74EC7962E5",
-      Signature:
-        "D0A8E75CABC6CC5C9937A5604A3A722A29639006F675BFB5F96A5D86E5A114607680930C62C4C956800F05136BE9152BC5FB919BAF4F30F7AF7E344356806041311A68C76364A265DEAC0C4920DD26E770F467103A6A23F831D65A2BB201F10A080F6323CD01B0E5205382DC9D80E45FCB68D71E59CB6AD030D9620DDB6FB613AFB2CDF3F037098EBBB735AFCDF8F909"
+        "D8920E7A3D72DB2F1A3BB6445AB743434D329E2A092D20FAB07FAAEF7548F3E6C6255D3AA32B50945C3C1BC19C7972B9E846722A035DDB45EC0D4CBA5A3B52CEA1BB44D0C05D4934880CBEDFA584FFCE4E14C2E723EE22B69F427A74EC7962E5"
     },
     body:
       '{"enc":true,"encData":"E3D409147A3678E02E51FD53EBBEEBC45FEF6A153651A7F13309FD281461037714E925C0915945BD27FED35A9FFAAA91B39B55A86DD2591A4650D4ECFC62244CF14F4D4879CDE56F9C243CB3070EED577B627027BE376706F8A1C46CF198C64DDDCA1243715C2269C3000738B35B7DA49571D53AA805BC5E6B304D99ADA86416BD68171206DD5F49766C31FBA583CA651379011452242FE2CE24F5301CD143D7C4894BD2A9651DB907DBE6B82296D206530651C97498E71C04E53F3297CD5162456AD276E40A403FCD474F7D4C12F1540C213FF00D829D0C18AF3E4DEE1BE6212DC01E17E358859CE6F808C9226E6A77A7A84D69F7F8670A6BDD17CF07462800A7BF08B526D071E0B3E144D651F8DB8F33B11CAC113EAF7837E2DB388D690DFC"}'
@@ -126,14 +239,13 @@ var Payloads = [
     expectCoin: 50,
     expectSource: "dailyTenK",
     path: "/promotion/activity_execute/rest/springOuting/draw",
+    dynamicSignature: true,
     headers: {
       "content-type": "application/json",
       "User-Agent": DefaultUA,
       "Referer": Referer,
       Authorization:
-        "D8920E7A3D72DB2F1A3BB6445AB743434D329E2A092D20FAB07FAAEF7548F3E6C6255D3AA32B50945C3C1BC19C7972B9E846722A035DDB45EC0D4CBA5A3B52CEA1BB44D0C05D4934880CBEDFA584FFCE4E14C2E723EE22B69F427A74EC7962E5",
-      Signature:
-        "D0A8E75CABC6CC5C9937A5604A3A722A29639006F675BFB5F96A5D86E5A11460C543D44547B243F15C5D3979A82DCC90C3CC2D61907EEB6CDD10F301C1F0B101EA9B20141A9EA9D3144533FE4632DCA943EAF63CE9FCC34C45D4DC773C6B96112A795C5C026B78361B6DF37E6864D11B7312A4AAB950328059EAAA1554D165552F5847EAEABFB20D474771BE25C22443"
+        "D8920E7A3D72DB2F1A3BB6445AB743434D329E2A092D20FAB07FAAEF7548F3E6C6255D3AA32B50945C3C1BC19C7972B9E846722A035DDB45EC0D4CBA5A3B52CEA1BB44D0C05D4934880CBEDFA584FFCE4E14C2E723EE22B69F427A74EC7962E5"
     },
     body:
       '{"enc":true,"encData":"E3D409147A3678E02E51FD53EBBEEBC45FEF6A153651A7F13309FD281461037714E925C0915945BD27FED35A9FFAAA91B39B55A86DD2591A4650D4ECFC62244CF14F4D4879CDE56F9C243CB3070EED577B627027BE376706F8A1C46CF198C64DDDCA1243715C2269C3000738B35B7DA49571D53AA805BC5E6B304D99ADA86416BD68171206DD5F49766C31FBA583CA651379011452242FE2CE24F5301CD143D7C4894BD2A9651DB907DBE6B82296D206530651C97498E71C04E53F3297CD5162456AD276E40A403FCD474F7D4C12F1540C213FF00D829D0C18AF3E4DEE1BE6212DC01E17E358859CE6F808C9226E6A77A7A84D69F7F8670A6BDD17CF074628007800DC83E13F03745A29FD54E42AECE7"}'
@@ -141,7 +253,8 @@ var Payloads = [
 ];
 
 // 已知「今日已完成」业务码 → 视为成功，不报警
-// 扩展点：若后续拿到打卡「已领取」的业务码，直接在此 Map 增补即可
+// 注意：打卡接口的 200001000001 是 Signature 校验失败（非「已领取」），
+// 绝不进 DONE_CODES，否则会掩盖真正的自动化失败
 var DONE_CODES = {
   "200004200003": "今日已签到"
 };
@@ -178,10 +291,13 @@ var merge = {};
 // 单次请求：只负责发包，判定交给 classify()
 function fetchOnce(p) {
   return new Promise((resolve) => {
+    var headers = {};
+    for (var k in p.headers) if (p.headers.hasOwnProperty(k)) headers[k] = p.headers[k];
+    if (p.dynamicSignature) headers.Signature = tkGetSignature();
     const options = {
       url: "https://" + HOST + p.path,
       method: "POST",
-      headers: p.headers,
+      headers: headers,
       body: p.body
     };
     if (out) options.timeout = out;
