@@ -322,7 +322,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_D
 
 ## 微信读书 翻一翻（每周二）
 
-更新说明（2026-08-25 / capture-v1.0）：
+更新说明（2026-08-25 / capture-v1.1）：
 - 每周二 8:00 刷新 6 次翻卡次数，定时任务每周二 8:10 跑
 - API 明文 GET，明文路径：
   - 翻牌：`https://weread.qq.com/flip-card-game/api/flipCardFlip?cardIndex=N&giftIndex=N&pf=ios&platform=ios_html`
@@ -332,6 +332,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_D
 - 接收：对 `status != 3 && autoReceive != 1` 的卡调 `flipCardReceive` 领取
 - 奖励类型：`infinite`（1 天体验卡）/ `book`（赠书）/ `coin`（翻币）；状态 `status: 0=未领 3=已领 autoReceive=1=自动领`
 - **复用 `WeRead_Cookies` / `WeRead_LoginBody`**（同 conf 同 prefs），无独立 capture 脚本
+- capture-v1.1 诊断增强：空响应分三类提示 —「凭证过期(Cookie 失效)」/「本期额度已用完(remainingCount≤0)」/「本期无卡可翻」；成功通知附带真实 `remainingCount`，便于定位根因
 
 ### 脚本本体
 

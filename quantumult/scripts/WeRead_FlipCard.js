@@ -2,7 +2,7 @@
 
   微信读书(WeRead) 每周翻一翻脚本
 
-  更新时间: 2026-08-25 (capture-v1.0)
+  更新时间: 2026-08-25 (capture-v1.1)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -10,6 +10,9 @@
                 WeRead_DailyBonus.js 统一抓取，capture-v1.3 起覆盖
                 flip-card-game/api 路径, 打开翻一翻页即抓 Cookie 凭证)。
                 每周二 8:10 定时翻 6 张卡 + 接收 cardList 奖品。
+  capture-v1.1: 诊断增强。区分「额度用完(remainingCount<=0)」与「凭证过期
+                (Cookie 失效)」两种"无卡可翻"成因，并暴露真实 remainingCount
+                便于下周二运行直接定位根因。
 
   流量结论（抓包 2026-08-24-094839）:
   - 翻牌: GET https://weread.qq.com/flip-card-game/api/flipCardFlip
@@ -110,6 +113,9 @@ async function doFlip(item) {
   merge.Flip = {};
   let totalFlipped = 0;
   let rewards = [];
+  let lastResp = null;
+  let lastRemaining = null;   // 最近一次翻卡响应的剩余次数
+  let authSuspected = false;  // Cookie(wr_skey/wr_vid)疑似失效
   try {
     // 取一次 featuredBook（让服务端感知 + 探查当前周期）
     try {
@@ -120,7 +126,6 @@ async function doFlip(item) {
 
     // 翻 6 张卡
     // giftIndex 与 cardIndex 配对：从 0 开始
-    let lastResp = null;
     for (let i = 1; i <= MAX_FLIPS; i++) {
       const url = API_FLIP + "&cardIndex=" + i + "&giftIndex=" + (i - 1) + "&pf=ios";
       let resp;
@@ -128,13 +133,18 @@ async function doFlip(item) {
         const raw = await httpGet(url, item);
         resp = safeJSON(raw);
       } catch (e) {
+        // 网络/403 大概率 Cookie 失效（翻牌仅 Cookie 认证）
         console.log("[WeRead flip] flip #" + i + " err: " + e.message);
+        authSuspected = true;
         break;
       }
-      if (!resp) {
+      if (!resp || typeof resp !== "object") {
+        // 空响应/非 JSON：Cookie 失效时服务端常返回登录页
         console.log("[WeRead flip] flip #" + i + " empty body, stop");
+        authSuspected = true;
         break;
       }
+      if (typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
       // 会话过期: 尝试续期一次后重试
       if (isSessionExpired(resp)) {
         const renewed = await tryRenew(item);
@@ -142,6 +152,7 @@ async function doFlip(item) {
           try {
             const raw2 = await httpGet(url, item);
             resp = safeJSON(raw2);
+            if (resp && typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
           } catch (e) {
             console.log("[WeRead flip] flip #" + i + " retry err: " + e.message);
             break;
@@ -152,19 +163,42 @@ async function doFlip(item) {
           return;
         }
       }
+      // 额度已用完：不再计数，直接停止
+      if (typeof lastRemaining === "number" && lastRemaining <= 0) {
+        console.log("[WeRead flip] remainingCount=" + lastRemaining + " → 额度已用完，停止翻卡");
+        break;
+      }
       totalFlipped++;
       lastResp = resp;
       const remain = resp.remainingCount;
       if (LogDetails) console.log("[WeRead flip] #" + i + " remaining=" + remain + " cards=" + (resp.cardList || []).length);
-      if (typeof remain === "number" && remain <= 0) break;
     }
 
     // 收集已翻卡 + 接收所有未领卡
     const cardList = (lastResp && lastResp.cardList) || [];
     if (!cardList.length) {
-      // 可能本周还没刷新次数（不是周二），或已翻过
+      // 区分三种情况，避免把「额度用完」与「凭证过期」混为一谈
+      if (authSuspected) {
+        merge.Flip.fail = 1;
+        merge.Flip.notify =
+          "微信读书翻一翻: 凭证过期 ‼️\n" +
+          "Cookie(wr_skey/wr_vid)失效，翻牌接口仅认 Cookie 认证。\n" +
+          "请打开微信读书 App → 「翻一翻」页面重新抓取凭证后再跑";
+        return;
+      }
+      if (typeof lastRemaining === "number" && lastRemaining <= 0) {
+        merge.Flip.success = 1;
+        merge.Flip.notify =
+          "微信读书翻一翻: 本期额度已用完 ✅\n" +
+          "remainingCount=" + lastRemaining + "（每周二 8:00 刷新 6 次）";
+        return;
+      }
+      // 未知空响应（非周二刷新前 / 接口异常）
       merge.Flip.success = 1;
-      merge.Flip.notify = "微信读书翻一翻: 本期无卡可翻（每周二 8:00 刷新 6 次）";
+      merge.Flip.notify =
+        "微信读书翻一翻: 本期无卡可翻（remainingCount=" +
+        (typeof lastRemaining === "number" ? lastRemaining : "未知") +
+        "，每周二 8:00 刷新 6 次）";
       return;
     }
 
@@ -203,9 +237,10 @@ async function doFlip(item) {
 
     merge.Flip.success = 1;
     const rewardText = rewards.length ? rewards.map((g) => "• " + g).join("\n") : "（已翻完，详见 App）";
+    const remainText = typeof lastRemaining === "number" ? "，剩余次数 " + lastRemaining : "";
     merge.Flip.notify =
       "微信读书翻一翻: 成功 ✅\n" +
-      "翻了 " + totalFlipped + " 张，领取 " + received + " 张\n" +
+      "翻了 " + totalFlipped + " 张，领取 " + received + " 张" + remainText + "\n" +
       "本周奖品:\n" + rewardText;
   } catch (e) {
     merge.Flip.fail = 1;
