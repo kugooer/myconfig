@@ -2,7 +2,7 @@
 
   泰康在线（微信小程序 wx9e3e7020c4a10356）每日领金币
 
-  更新时间: 2026-08-31 (v1.2 逆向签名全自动打卡)
+  更新时间: 2026-09-01 (v1.3 打卡步数门槛分类)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -17,6 +17,16 @@
   - 代价：Signature 用 prd 环境常量，会随小程序版本升级(包体/key 变更)失效，
     届时需重新从新包逆向；但 encData/Authorization 仍走 frozen payload，
     预计可用至 accessToken 过期(~2026-09-06)，之后 4 项一起需重新抓包。
+
+  v1.3 修复（2026-09-01 09:32 次日实测）:
+  - 现象：签名打通后打卡改报 200007700012「任务未完成」（不再是签名错 200001000001）。
+  - 定性：活动 springOuting 为 H5 页（不在小程序原生包），客户端不传步数
+    （全包无 werun/getWeRunData/pedometer），步数由服务端从微信运动同步后校验。
+    09:32 已同步步数但仍未完成 → 当日清晨步数未达 1000 门槛，服务端拒发。
+  - 方案：新增 SKIP_CODES，将 200007700012 归为「今日条件未满足」，不计失败、不告警，
+    通知显示 ⏳「任务未完成 · 今日暂不可领」。四分类：成功 / 已完成 / 未达标 / 失败。
+  - 结论：打卡奖励依赖当日实时步数达标，定时任务需改到步数达标后（建议 20:00–22:00）
+    方可领取；未达标日静默跳过属正常，非脚本缺陷。
 
   v1.1 修复（2026-08-30 15:46 用户首跑日志）:
   - 「今日已签到」(200004200003) 原判为失败，现列入 DONE_CODES 视为成功
@@ -57,6 +67,13 @@
       时间戳/随机数，服务端做「新鲜度」校验 → frozen Signature 必失效。
       ⇒ 结论：3 个打卡接口无法通过 frozen payload 原样重放自动化，
          不要把它补进 DONE_CODES（那会掩盖真正的失败）。
+  - 200007700012 = 任务未完成（服务端校验当日步数/任务状态未达标）。
+    ★ 已定性（2026-09-01 09:32 次日实测）：签名打通后出现的业务码。
+      活动 springOuting 为 H5 页（不在小程序原生包），客户端不传步数
+      （全包搜不到 werun/getWeRunData/pedometer），步数由服务端从微信运动
+      同步后校验。09:32 已同步步数但仍报未完成 → 当日清晨步数未达 1000 门槛。
+      ⇒ 该码属「今日条件未满足」，已列入 SKIP_CODES，不计失败、不告警；
+        定时任务需改到当日步数达标之后（建议 20:00–22:00）方可领取成功。
 
   用法:
   1) 挂 task；首次运行直接用脚本内默认 frozen payload
@@ -258,6 +275,13 @@ var Payloads = [
 var DONE_CODES = {
   "200004200003": "今日已签到"
 };
+// 已知「今日条件未满足」业务码 → 视为跳过，不报警、不计入失败
+// 200007700012 = 任务未完成（服务端校验当日步数/任务状态未达标；非签名、非鉴权错误）
+// 该码出现于 v1.2 之后（签名打通），由 H5 活动页 springOuting 的服务端判定，客户端不传步数。
+// 次日或当日步数达标后重试即可领取，故不计入失败、不发告警。
+var SKIP_CODES = {
+  "200007700012": "任务未完成 · 今日暂不可领"
+};
 // 瞬时错误（如 200001000001「网络有点拥挤，请稍后重试」）重试次数与间隔
 var RetryTimes = 2;
 var RetryDelayMs = 1500;
@@ -333,6 +357,9 @@ function classify(p, r) {
   }
   if (DONE_CODES[code]) {
     return { ok: true, done: true, settled: true, code: code, msg: DONE_CODES[code] };
+  }
+  if (SKIP_CODES[code]) {
+    return { ok: false, skip: true, settled: true, code: code, msg: SKIP_CODES[code] };
   }
   return {
     ok: false,
@@ -419,6 +446,7 @@ async function notifyDone() {
   let gotCoin = 0; // 本次真正领到的
   let gotCount = 0; // 本次领取成功数
   let doneCount = 0; // 今日此前已完成数
+  let skipCount = 0; // 今日条件未满足（如步数未达标）
   let failCount = 0;
   for (let i = 1; i <= Payloads.length; i++) {
     const slot = merge["act" + i];
@@ -430,6 +458,9 @@ async function notifyDone() {
     } else if (slot.done) {
       doneCount++;
       lines.push("☑️ " + slot.name + " 今日已完成");
+    } else if (slot.skip) {
+      skipCount++;
+      lines.push("⏳ " + slot.name + " " + (slot.msg || "今日暂不可领"));
     } else {
       failCount++;
       lines.push("❌ " + slot.name + " " + (slot.msg || "失败"));
@@ -446,8 +477,9 @@ async function notifyDone() {
   const title = "泰康在线领金币";
   let sub;
   if (failCount === 0 && gotCount > 0) sub = gotCount + "/" + Payloads.length + " 领取成功 · 本次 +" + gotCoin + " 金币";
+  else if (failCount === 0 && gotCount === 0 && skipCount > 0) sub = "签到已领，" + skipCount + "/" + Payloads.length + " 打卡今日暂不可领";
   else if (failCount === 0 && gotCount === 0) sub = "今日已全部领取（" + doneCount + "/" + Payloads.length + "）";
-  else sub = gotCount + " 成功 / " + doneCount + " 已完成 / " + failCount + " 失败";
+  else sub = gotCount + " 成功 / " + doneCount + " 已完成 / " + skipCount + " 未达标 / " + failCount + " 失败";
 
   let msg = lines.join("\n");
   if (lastTotal) msg += "\n账户余额: " + lastTotal + " 金币";
