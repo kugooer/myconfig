@@ -662,11 +662,12 @@ function isValidBattStatus(batt) {
 }
 
 /**
- * 加载车辆状态：请求失败或响应无效时回退本地缓存；无缓存抛固定脱敏错误。
- * 入参为 runtimeConfig、fm 与缓存文件路径；返回 { status, batt, fetchedAt }。
- * 异常对象可能包含私有 URL，日志只保留固定分类。
+ * 加载车辆状态：请求失败或响应无效时回退本地缓存；缓存不可用重试一次请求，仍失败抛固定脱敏错误。
+ * 入参为 runtimeConfig、fm、缓存文件路径与 retried（内部重试标记）；返回 { status, batt, fetchedAt }。
+ * 网关偶发返回 code=000000 但 data 为空（鉴权失效或抖动），必须契约校验；
+ * v2.0 曾把空 data 写入缓存导致毒化，故缓存内容无效时删除文件并重试自愈。
  */
-async function loadVehicleDataWithCache(runtimeConfig, fm, file) {
+async function loadVehicleDataWithCache(runtimeConfig, fm, file, retried = false) {
   try {
     const status = await getVehRealStatus(runtimeConfig, runtimeConfig.vin);
     // 契约校验：空 data 视为请求失败，进入缓存回退
@@ -686,26 +687,33 @@ async function loadVehicleDataWithCache(runtimeConfig, fm, file) {
       console.log("电池摘要请求失败，忽略");
     }
     const combined = { status: status, batt: batt, fetchedAt: Date.now() };
+    // 仅在通过契约校验后写缓存，防止空数据毒化缓存（v2.0 缺陷）
     fm.writeString(file, JSON.stringify(combined));
     return combined;
   } catch (error) {
     console.log("车辆状态请求失败，尝试读取缓存");
   }
-  if (!fm.fileExists(file)) {
-    throw new Error("车辆状态加载失败");
+  if (fm.fileExists(file)) {
+    let cached = null;
+    try {
+      cached = JSON.parse(fm.readString(file));
+    } catch (e) {
+      cached = null;
+    }
+    if (cached && isValidVehicleStatus(cached.status)) {
+      return cached;
+    }
+    // 缓存缺失或被毒化：删除后重试一次网络请求（自愈）
+    console.log("车辆缓存内容无效，删除并重试请求");
+    try {
+      fm.remove(file);
+    } catch (e) {}
   }
-  let cached;
-  try {
-    cached = JSON.parse(fm.readString(file));
-  } catch (error) {
-    console.log("车辆缓存读取失败");
-    throw new Error("车辆状态加载失败");
+  if (!retried) {
+    return loadVehicleDataWithCache(runtimeConfig, fm, file, true);
   }
-  if (!isValidVehicleStatus(cached.status)) {
-    console.log("车辆缓存内容无效");
-    throw new Error("车辆状态加载失败");
-  }
-  return cached;
+  // 两次请求均无效：多为 Token 失效（网关以 000000+空 data 软失败）或持续抖动
+  throw new Error("车辆状态加载失败，请更新 Token");
 }
 
 /** 判断车辆坐标相对上次缓存是否变化。入参为当前与上一坐标对象；返回布尔值 */
