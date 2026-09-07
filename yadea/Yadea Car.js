@@ -19,15 +19,27 @@
  */
 
 // ============================ 配置区 ============================
+// 以下常量仅作兜底（未使用 iCloud 配置时的默认值）。
+// 推荐在 App 内运行本脚本通过表单配置，配置持久化到 iCloud Drive 跨设备共享。
 
-// Authorization 请求头（抓包获取，含或不含 "Bearer " 前缀均可）
+// Authorization 请求头兜底值（抓包获取，含或不含 "Bearer " 前缀均可）
 const AUTH_TOKEN = "这里替换为你抓包得到的 Authorization 值";
 
-// 车辆 VIN；留空则自动调用 queryBindingBike 取第一辆车
+// 车辆 VIN 兜底值；留空则自动调用 queryBindingBike 取第一辆车
 const VIN = "";
 
-// 高德 Web 服务 Key（可选）；填写后显示停车位置文字与静态地图
+// 高德 Web 服务 Key 兜底值（可选）；填写后中号 Widget 右侧显示高德静态地图与停车位置文字
 const AMAP_API_KEY = "";
+
+// iCloud 运行时配置（表单录入，优先级高于上述常量）
+const RUNTIME_CONFIG = {
+  authToken: normalizeToken(AUTH_TOKEN),
+  vin: VIN,
+  amapApiKey: AMAP_API_KEY
+};
+
+// 中号 Widget 右侧地图面板边长（pt），与 Telsa Car.js 的 MAP_PANEL_SIZE 同类
+const MAP_PANEL_SIZE = 110;
 
 // 雅迪 H5 网关生产配置（取自 H5 前端 JS，公共常量）
 const GATEWAY_APP_ID = "cfb00038ddac4c9ebc85821694bbd3fa";
@@ -36,6 +48,126 @@ const GATEWAY_BASE = "https://tspapph5.yadeaiot.com.cn/prod-wg";
 
 // 时间偏差缓存键（405 校正，与 H5 前端 sessionStorage 行为一致）
 const TS_OFFSET_KEY = "yadea.tsOffset";
+
+// ============================ 配置层（iCloud + 表单） ============================
+
+/** 未编辑的占位符按空值处理。入参为原始字符串；返回规范化 token */
+function normalizeToken(t) {
+  return (t && String(t).indexOf("这里替换") === 0) ? "" : String(t).trim();
+}
+
+/**
+ * 创建 iCloud 配置存储路径集合。
+ * 读写共享同一 FileManager.iCloud() 实例与目录，避免路径不一致。
+ */
+function createICloudConfigStorage() {
+  const fm = FileManager.iCloud();
+  const dir = fm.joinPath(fm.documentsDirectory(), "yadea");
+  return { fm: fm, dir: dir, configPath: fm.joinPath(dir, "config.v1.json") };
+}
+
+/**
+ * 加载 iCloud 运行配置。入参为是否 App 运行上下文；成功返回 { authToken, vin, amapApiKey }。
+ * Widget 上下文只读已缓存到本地的 iCloud 文件，不触发下载；缺失/无效返回 null。
+ * 异常对象可能包含路径或文件内容，日志仅用固定文案。
+ */
+function loadRuntimeConfig(runsInApp) {
+  try {
+    const storage = createICloudConfigStorage();
+    if (!storage.fm.fileExists(storage.configPath)) {
+      if (!runsInApp) return null;
+      try { storage.fm.downloadFileFromiCloud(storage.configPath); } catch (e) {
+        console.log("iCloud 配置下载暂不可用");
+        return null;
+      }
+      if (!storage.fm.fileExists(storage.configPath)) return null;
+    }
+    const json = JSON.parse(storage.fm.readString(storage.configPath));
+    if (!json || json.schemaVersion !== 1) return null;
+    return {
+      authToken: normalizeToken(json.authToken),
+      vin: String(json.vin || "").trim(),
+      amapApiKey: String(json.amapApiKey || "").trim()
+    };
+  } catch (e) {
+    console.log("iCloud 配置读取失败");
+    return null;
+  }
+}
+
+/**
+ * 保存运行配置到 iCloud。入参为已校验的配置对象；成功返回 true。
+ * 写入白名单五字段 envelope，失败静默返回 false 由调用方提示。
+ */
+function saveRuntimeConfig(config) {
+  try {
+    const storage = createICloudConfigStorage();
+    if (!storage.fm.isDirectory(storage.dir)) storage.fm.createDirectory(storage.dir, true);
+    const envelope = {
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      authToken: config.authToken,
+      vin: config.vin,
+      amapApiKey: config.amapApiKey
+    };
+    storage.fm.writeString(storage.configPath, JSON.stringify(envelope));
+    return true;
+  } catch (e) {
+    console.log("iCloud 配置保存失败");
+    return false;
+  }
+}
+
+/** 弹出固定消息框。入参为标题与正文；无返回值 */
+async function presentMessage(title, message) {
+  const alert = new Alert();
+  alert.title = title;
+  alert.message = message;
+  alert.addAction("好");
+  await alert.presentAlert();
+}
+
+/**
+ * 配置表单（App 内运行）：录入抓包 Token、VIN 与高德 Key。
+ * 入参为当前配置（用于预填）；保存成功返回新配置，取消返回 null。
+ * Token 使用安全文本框；校验失败保留原始输入重试，提示不含具体值。
+ */
+async function presentConfigForm(current) {
+  let formValues = {
+    authToken: current ? current.authToken : "",
+    vin: current ? current.vin : "",
+    amapApiKey: current ? current.amapApiKey : ""
+  };
+  while (true) {
+    const form = new Alert();
+    form.title = "雅迪组件配置";
+    form.message = "配置将保存到 iCloud Drive，Widget 直接读取";
+    form.addSecureTextField("Authorization Token（抓包获取）", formValues.authToken);
+    form.addTextField("VIN（留空自动获取）", formValues.vin);
+    form.addTextField("高德 API Key（可选，右侧地图）", formValues.amapApiKey);
+    form.addAction("保存");
+    form.addCancelAction("取消");
+
+    const actionIndex = await form.presentAlert();
+    if (actionIndex !== 0) return null;
+
+    const candidate = {
+      authToken: normalizeToken(form.textFieldValue(0)),
+      vin: form.textFieldValue(1).trim(),
+      amapApiKey: form.textFieldValue(2).trim()
+    };
+    if (!candidate.authToken) {
+      formValues = candidate;
+      await presentMessage("配置无效", "Authorization Token 不能为空");
+      continue;
+    }
+    if (!saveRuntimeConfig(candidate)) {
+      await presentMessage("保存失败", "无法写入 iCloud，请稍后重试");
+      continue;
+    }
+    return candidate;
+  }
+}
 
 // ============================ AES-128-ECB ============================
 // Scriptable 无原生 AES，内嵌纯 JS 实现（已用 NIST 向量与 openssl 交叉验证）
@@ -296,7 +428,7 @@ async function yadeaRequest(path, params, retry = true) {
   req.headers = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "x-www-form-urlencoded;charset=utf-8",
-    "Authorization": AUTH_TOKEN.indexOf("Bearer ") === 0 ? AUTH_TOKEN : "Bearer " + AUTH_TOKEN,
+    "Authorization": RUNTIME_CONFIG.authToken.indexOf("Bearer ") === 0 ? RUNTIME_CONFIG.authToken : "Bearer " + RUNTIME_CONFIG.authToken,
     "gatewayAppId": GATEWAY_APP_ID,
     "gatewayTimestamp": headers.gatewayTimestamp,
     "gatewaySign": headers.gatewaySign,
@@ -338,9 +470,10 @@ function getBattInfo(vin) {
 
 /**
  * 解析本次运行使用的 VIN。入参无；返回字符串。
- * 优先级：脚本内 VIN 配置 > Widget 参数 > 在线车辆列表第一辆。
+ * 优先级：运行配置 VIN > 脚本内 VIN 常量 > Widget 参数 > 在线车辆列表第一辆。
  */
 async function resolveVin() {
+  if (RUNTIME_CONFIG.vin) return RUNTIME_CONFIG.vin;
   if (VIN) return VIN;
   const param = (args.widgetParameter || "").trim();
   if (/^\d+$/.test(param)) return param;
@@ -534,9 +667,10 @@ function renderAccessory(data) {
 }
 
 /**
- * 渲染中号 Widget。入参为 vehicle 数据与车型名；无返回值。
+ * 渲染中号 Widget：左侧信息栏 + 右侧高德静态地图（与 Telsa Car.js 布局一致）。
+ * 入参为 vehicle 数据与车型名；无返回值。
  */
-function renderMedium(data, modelName) {
+function renderMedium(data, displayName) {
   const status = data.status;
   const batt = data.batt || {};
   const soc = status.totalSoc != null ? status.totalSoc : (status.soc1 || 0);
@@ -548,68 +682,95 @@ function renderMedium(data, modelName) {
   widget.setPadding(12, 15, 12, 15);
   // 刷新策略：充电/骑行 30 秒，其余 60 秒
   widget.refreshAfterDate = new Date(Date.now() + (charging || status.rideStatus === 1 ? 30 : 60) * 1000);
+  if (data.latitude != null) {
+    widget.url = `http://maps.apple.com/?ll=${data.latitude},${data.longitude}&q=` + encodeURI(displayName || "车辆位置");
+  }
 
-  // 行1：车型名 + 状态
-  const line1 = widget.addStack();
+  // 双栏布局：左栏信息自适应宽度，右栏固定地图面板
+  const mainStack = widget.addStack();
+  mainStack.layoutHorizontally();
+  const left = mainStack.addStack();
+  left.layoutVertically();
+  mainStack.addSpacer(8);
+  const right = mainStack.addStack();
+  right.layoutVertically();
+  right.size = new Size(MAP_PANEL_SIZE, MAP_PANEL_SIZE);
+
+  // 右栏地图：无 Key/请求失败时用透明占位图，保证左栏布局不中断
+  let mapImage = data.mapImage;
+  if (!mapImage) {
+    const ph = new DrawContext();
+    ph.opaque = false;
+    ph.size = new Size(300, 300);
+    mapImage = ph.getImage();
+  }
+  const mapImg = right.addImage(mapImage);
+  mapImg.imageSize = new Size(MAP_PANEL_SIZE, MAP_PANEL_SIZE);
+  mapImg.cornerRadius = 8;
+  mapImg.applyFillingContentMode();
+  if (data.latitude != null) {
+    mapImg.url = widget.url; // 点击地图跳转 Apple Maps
+  }
+
+  // 左栏行1：车型名 + 状态
+  const line1 = left.addStack();
   line1.centerAlignContent();
-  const name = line1.addText(modelName || ("雅迪 " + status.vin.slice(-6)));
+  const name = line1.addText(displayName || ("雅迪 " + (status.vin || "").slice(-6)));
   name.font = Font.mediumSystemFont(15);
   name.lineLimit = 1;
-  line1.addSpacer(6);
+  name.minimumScaleFactor = 0.7;
   const sym = line1.addImage(SFSymbol.named(state.symbol).image);
   sym.tintColor = state.color;
-  sym.imageSize = new Size(16, 16);
+  sym.imageSize = new Size(14, 14);
   const label = line1.addText(" " + state.label);
   label.font = Font.mediumSystemFont(12);
   label.textColor = state.color;
 
-  widget.addSpacer(6);
+  left.addSpacer(6);
 
   // 行2：电池图形 + 电量 + 剩余续航
-  const line2 = widget.addStack();
+  const line2 = left.addStack();
   line2.centerAlignContent();
-  line2.addImage(drawBattery(soc, charging)).imageSize = new Size(52, 17);
-  line2.addSpacer(6);
+  line2.addImage(drawBattery(soc, charging)).imageSize = new Size(46, 15);
+  line2.addSpacer(5);
   const socText = line2.addText(soc + "%");
-  socText.font = Font.boldSystemFont(22);
+  socText.font = Font.boldSystemFont(21);
   socText.textColor = charging ? Color.green() : Color.white();
-  line2.addSpacer(6);
-  const range = line2.addText("⚡ " + (status.remMileage != null ? status.remMileage : "-") + " km");
-  range.font = Font.mediumSystemFont(14);
+  line2.addSpacer(5);
+  const range = line2.addText("⚡ " + (status.remMileage != null ? status.remMileage : "-") + "km");
+  range.font = Font.mediumSystemFont(13);
   range.textColor = Color.orange();
 
   // 行3：核心数据行
-  widget.addSpacer(6);
-  const line3 = widget.addStack();
+  left.addSpacer(6);
+  const line3 = left.addStack();
   const items = [];
   if (status.totalMileage != null) items.push("总里程 " + status.totalMileage + "km");
   if (batt.soh != null) items.push("SOH " + batt.soh + "%");
   if (status.mosTemp1 != null) items.push("电池 " + status.mosTemp1 + "℃");
   if (status.volt != null) items.push(status.volt + "V");
   const info = line3.addText(items.join(" · "));
-  info.font = Font.mediumSystemFont(11);
+  info.font = Font.mediumSystemFont(10);
   info.textColor = Color.gray();
   info.lineLimit = 1;
 
   // 行4：胎压异常提示（有告警时才显示，避免误导）
   if ((status.leftFrontPressureWarning || 0) > 0 || (status.leftRearPressureWarning || 0) > 0) {
-    widget.addSpacer(4);
-    const warn = widget.addText("⚠️ 胎压异常");
-    warn.font = Font.mediumSystemFont(11);
+    left.addSpacer(4);
+    const warn = left.addText("⚠️ 胎压异常");
+    warn.font = Font.mediumSystemFont(10);
     warn.textColor = Color.yellow();
   }
 
-  // 行5：数据时间 + 位置
-  widget.addSpacer(6);
-  const line5 = widget.addStack();
+  // 左栏行5：数据时间 + 位置（底部对齐）
+  left.addSpacer();
+  const line5 = left.addStack();
   const age = humanizeAge(Date.now() - (data.fetchedAt || status.collectTime || Date.now()));
   const locText = line5.addText(age + "前 · " + (data.geofence || "雅迪智造"));
-  locText.font = Font.mediumSystemFont(11);
+  locText.font = Font.mediumSystemFont(10);
   locText.textColor = Color.gray();
   locText.lineLimit = 1;
-  if (data.latitude != null) {
-    widget.url = `http://maps.apple.com/?ll=${data.latitude},${data.longitude}&q=` + encodeURI(modelName || "车辆位置");
-  }
+  locText.minimumScaleFactor = 0.7;
 
   Script.setWidget(widget);
   widget.presentMedium();
@@ -619,9 +780,9 @@ function renderMedium(data, modelName) {
  * 请求位置描述（高德逆地理，失败返回 null）。入参为 GCJ02 坐标。
  */
 async function reverseGeocode(lat, lng) {
-  if (!AMAP_API_KEY) return null;
+  if (!RUNTIME_CONFIG.amapApiKey) return null;
   try {
-    const url = `https://restapi.amap.com/v3/geocode/regeo?key=${AMAP_API_KEY}&location=${lng},${lat}&extensions=base`;
+    const url = `https://restapi.amap.com/v3/geocode/regeo?key=${RUNTIME_CONFIG.amapApiKey}&location=${lng},${lat}&extensions=base`;
     const req = new Request(url);
     const json = await req.loadJSON();
     const comp = json && json.regeocode && json.regeocode.addressComponent;
@@ -632,6 +793,41 @@ async function reverseGeocode(lat, lng) {
   }
 }
 
+/**
+ * 获取高德静态地图图片（GCJ02 坐标）。入参为 FileManager、vin 与火星坐标。
+ * 车辆移动超过阈值才请求新图，失败回退磁盘旧缓存；仍无图返回 null。
+ * 异常对象可能包含带高德 Key 的完整 URL，仅输出固定文案。
+ */
+async function fetchStaticMap(fm, vin, lat, lng) {
+  const path = cachePath(fm, "map_cache_" + vin + ".jpg");
+  const geoCache = readCache(fm, "map_geo_" + vin + ".json");
+  // 移动阈值约 20m（0.0002 度），避免静止时反复调用高德接口
+  const moved = !geoCache ||
+    Math.abs(geoCache.lat - lat) > 0.0002 ||
+    Math.abs(geoCache.lng - lng) > 0.0002;
+  let image = null;
+  if (!moved && fm.fileExists(path)) {
+    try { image = fm.readImage(path); } catch (e) {}
+  }
+  if (!image && RUNTIME_CONFIG.amapApiKey) {
+    try {
+      const url = `https://restapi.amap.com/v3/staticmap?scale=2` +
+        `&location=${lng},${lat}&zoom=16&size=${MAP_PANEL_SIZE * 2}*${MAP_PANEL_SIZE * 2}` +
+        `&markers=mid,0xFF4444,A:${lng},${lat}&key=${RUNTIME_CONFIG.amapApiKey}`;
+      const req = new Request(url);
+      image = await req.loadImage();
+      fm.writeImage(path, image);
+      writeCache(fm, "map_geo_" + vin + ".json", { lat: lat, lng: lng });
+    } catch (e) {
+      console.log("静态地图加载失败");
+      if (fm.fileExists(path)) {
+        try { image = fm.readImage(path); } catch (e2) {}
+      }
+    }
+  }
+  return image;
+}
+
 // ============================ 主流程 ============================
 
 /**
@@ -639,18 +835,61 @@ async function reverseGeocode(lat, lng) {
  */
 async function main() {
   const fm = FileManager.local();
+
+  // 加载 iCloud 运行配置（优先于脚本内常量；Widget 上下文只读本地已缓存副本）
+  const savedConfig = loadRuntimeConfig(config.runsInApp);
+  if (savedConfig) {
+    RUNTIME_CONFIG.authToken = savedConfig.authToken;
+    RUNTIME_CONFIG.vin = savedConfig.vin;
+    RUNTIME_CONFIG.amapApiKey = savedConfig.amapApiKey;
+  }
+
+  if (config.runsInApp) {
+    // App 模式：提供配置管理与数据查看入口
+    const menu = new Alert();
+    menu.title = "雅迪电动车组件";
+    menu.message = RUNTIME_CONFIG.authToken
+      ? "配置已就绪（保存于 iCloud Drive）"
+      : "首次使用请先填写抓包 Token";
+    menu.addAction("管理配置");
+    menu.addAction("查看当前数据");
+    const choice = await menu.presentAlert();
+    if (choice === 0) {
+      const updated = await presentConfigForm(RUNTIME_CONFIG);
+      if (updated) {
+        RUNTIME_CONFIG.authToken = updated.authToken;
+        RUNTIME_CONFIG.vin = updated.vin;
+        RUNTIME_CONFIG.amapApiKey = updated.amapApiKey;
+      }
+    }
+    if (!RUNTIME_CONFIG.authToken) {
+      await presentMessage("尚未配置", "请通过 管理配置 填写抓包 Token");
+      return;
+    }
+  } else if (!RUNTIME_CONFIG.authToken) {
+    // Widget 模式无配置：提示先在 App 内完成配置
+    const tip = new ListWidget();
+    const text = tip.addText("请先在 App 中运行本脚本完成配置");
+    text.font = Font.mediumSystemFont(12);
+    text.textColor = Color.orange();
+    Script.setWidget(tip);
+    if (config.widgetFamily === "accessoryCircular") tip.presentSmall();
+    else tip.presentMedium();
+    return;
+  }
+
   const vin = await resolveVin();
   const data = await loadVehicleData(fm, vin);
 
-  // 位置处理：缓存位置名，坐标变化时刷新
+  // 位置处理：缓存位置名，坐标变化时刷新；同步准备右侧高德静态地图
   const locCache = readCache(fm, "car_geo_" + vin + ".json");
   const lat = data.status.lat, lng = data.status.lon;
   if (lat != null && lng != null) {
     data.latitude = lat;
     data.longitude = lng;
+    const gcj = wgs2gcj(lat, lng);
     const moved = !locCache || locCache.lat !== lat || locCache.lng !== lng;
     if (moved) {
-      const gcj = wgs2gcj(lat, lng);
       const geofence = await reverseGeocode(gcj.lat, gcj.lng);
       writeCache(fm, "car_geo_" + vin + ".json", {
         lat: lat, lng: lng, geofence: geofence || ""
@@ -659,20 +898,24 @@ async function main() {
     } else {
       data.geofence = locCache.geofence || "";
     }
+    data.mapImage = await fetchStaticMap(fm, vin, gcj.lat, gcj.lng);
   }
 
-  // 车型名缓存（queryBindingBike 失败不影响主流程）
-  let modelName = "";
+  // 车辆显示名：爱车昵称（bikeNickName）优先，其次车型名；接口失败时用缓存兜底
+  let displayName = "";
   const nameCache = readCache(fm, "car_name_" + vin + ".json");
-  if (nameCache && nameCache.modelName) {
-    modelName = nameCache.modelName;
+  if (nameCache && (nameCache.bikeNickName || nameCache.modelName)) {
+    displayName = nameCache.bikeNickName || nameCache.modelName;
   } else {
     try {
       const bikes = await getBindingBikes();
       const mine = bikes.find(b => b.vin === vin) || bikes[0];
       if (mine) {
-        modelName = mine.modelName || "";
-        writeCache(fm, "car_name_" + vin + ".json", { modelName: modelName });
+        writeCache(fm, "car_name_" + vin + ".json", {
+          bikeNickName: mine.bikeNickName || "",
+          modelName: mine.modelName || ""
+        });
+        displayName = mine.bikeNickName || mine.modelName || "";
       }
     } catch (e) {}
   }
@@ -683,7 +926,7 @@ async function main() {
     if (config.widgetFamily === "accessoryCircular") {
       renderAccessory(data);
     } else {
-      renderMedium(data, modelName);
+      renderMedium(data, displayName);
     }
     // present 之后补充刷新时间
     return;
@@ -692,7 +935,7 @@ async function main() {
   // App 内运行：打印完整数据便于调试
   console.log(JSON.stringify(data, null, 2));
   const alert = new Alert();
-  alert.title = modelName || "雅迪电动车";
+  alert.title = displayName || "雅迪电动车";
   alert.message =
     `电量 ${data.status.totalSoc}% · 续航 ${data.status.remMileage}km\n` +
     `总里程 ${data.status.totalMileage}km · SOH ${data.batt ? data.batt.soh : "-"}%\n` +
