@@ -13,7 +13,7 @@
  *
  * @author WorkBuddy
  * @updated 2026-09-07
- * @version 1.5
+ * @version 1.7
  */
 
 const STORE_KEY = "yadea_h5_token";
@@ -54,9 +54,19 @@ try {
     } else {
       const old = storeRead(STORE_KEY);
       if (old === token) {
-        console.log("[YadeaToken] token 未变化，不打扰");
+        // token 未变化：每小时最多把完整 token 重新输出一次到日志，方便随时从日志复制
+        const now = Date.now();
+        const lastLog = Number(storeRead(STORE_KEY + "_log_at") || 0);
+        if (!lastLog || now - lastLog > 3600e3) {
+          console.log("[YadeaToken] 当前token(" + token.length + "字符，每小时刷一次):\n" + token);
+          storeWrite(String(now), STORE_KEY + "_log_at");
+        } else {
+          console.log("[YadeaToken] token 未变化，不打扰");
+        }
       } else {
         storeWrite(token, STORE_KEY);
+        // 变化才弹通知；token 同时打印到日志，通知划掉了也能从 QX 日志复制
+        console.log("[YadeaToken] 新token(" + token.length + "字符):\n" + token);
         // 变化才弹通知；通知点开后详情页可全选复制完整 token
         $notify(
           "雅迪 Token 已捕获" + (old ? "（有更新）" : ""),
