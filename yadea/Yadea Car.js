@@ -22,6 +22,14 @@
  *   - 其他 Widget 场景：中号桌面 Widget（左信息 + 右高德静态地图）
  */
 
+// 脚本版本号：每次变更递增，便于真机日志定位
+// v2.4 诊断日志(vin/token长度)+错误提示检查VIN与Token
+// v2.3 错误提示覆盖VIN场景
+// v2.2 缓存自愈(毒化缓存删除+重试)
+// v2.1 网关空data契约校验
+// v2.0 按 teslamate-widget 规范重构
+const SCRIPT_VERSION = "v2.4";
+
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
 
@@ -1320,6 +1328,7 @@ async function presentNonReadyConfigInApp(configState) {
  * 唯一运行入口：先执行 iCloud 配置门禁，再按运行上下文分发。
  */
 async function main() {
+  console.log("Yadea Widget " + SCRIPT_VERSION);
   const runsInApp = config.runsInApp;
   const configState = loadRuntimeConfig(runsInApp);
 
@@ -1407,7 +1416,7 @@ async function main() {
 
 await main()
   .catch(err => {
-    console.error("雅迪状态获取失败: " + (err && err.message ? err.message : "未知错误"));
+    console.error("雅迪状态获取失败(" + SCRIPT_VERSION + "): " + (err && err.message ? err.message : "未知错误"));
     if (!config.runsInApp) {
       const widget = new ListWidget();
       const text = widget.addText("雅迪\n" + (err && err.message ? err.message : "获取失败"));
