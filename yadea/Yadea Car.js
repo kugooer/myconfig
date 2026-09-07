@@ -648,12 +648,17 @@ function createRuntimeContext() {
 }
 
 /**
- * 校验雅迪网关车辆状态响应的顶层契约。
- * 入参为解析后的对象；结构完整返回 true，错误对象或缺失字段返回 false。
+ * 校验雅迪网关车辆状态 data 对象的契约。
+ * 入参为网关响应的 data 字段（getVehRealStatus 的返回值）；结构完整返回 true。
+ * 网关偶发返回 code=000000 但 data 为空/null，必须校验防止空对象渲染崩溃。
  */
-function isValidVehicleResponse(data) {
-  return !!(data && data.data && typeof data.data.vin === "string" &&
-    data.data.totalSoc != null);
+function isValidVehicleStatus(status) {
+  return !!(status && typeof status.vin === "string" && status.totalSoc != null);
+}
+
+/** 校验电池摘要 data 对象契约（soc 为核心字段）；失败不致命，仅用于过滤空数据 */
+function isValidBattStatus(batt) {
+  return !!(batt && batt.soc != null);
 }
 
 /**
@@ -664,9 +669,19 @@ function isValidVehicleResponse(data) {
 async function loadVehicleDataWithCache(runtimeConfig, fm, file) {
   try {
     const status = await getVehRealStatus(runtimeConfig, runtimeConfig.vin);
+    // 契约校验：空 data 视为请求失败，进入缓存回退
+    if (!isValidVehicleStatus(status)) {
+      console.log("车辆状态响应无效，尝试读取缓存");
+      throw new Error("车辆状态响应无效");
+    }
     let batt = null;
     try {
-      batt = await getBattInfo(runtimeConfig, runtimeConfig.vin);
+      const battData = await getBattInfo(runtimeConfig, runtimeConfig.vin);
+      if (isValidBattStatus(battData)) {
+        batt = battData;
+      } else {
+        console.log("电池摘要响应无效，忽略");
+      }
     } catch (e) {
       console.log("电池摘要请求失败，忽略");
     }
@@ -686,7 +701,7 @@ async function loadVehicleDataWithCache(runtimeConfig, fm, file) {
     console.log("车辆缓存读取失败");
     throw new Error("车辆状态加载失败");
   }
-  if (!isValidVehicleResponse(cached.status)) {
+  if (!isValidVehicleStatus(cached.status)) {
     console.log("车辆缓存内容无效");
     throw new Error("车辆状态加载失败");
   }
