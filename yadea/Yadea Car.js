@@ -23,13 +23,14 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.6 配置新增昵称(显示优先级最高)与坐标转换(默认不转换)；修复 reverseGeocode 三参异常与空结果固化缓存
 // v2.5 显示名仅用昵称(无昵称显示"没有昵称")；VIN 非必填(配置>Widget参数>绑定列表>本地缓存)
 // v2.4 诊断日志(vin/token长度)+错误提示检查VIN与Token
 // v2.3 错误提示覆盖VIN场景
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.5";
+const SCRIPT_VERSION = "v2.6";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -252,8 +253,8 @@ function normalizeConfigValue(value) {
 }
 
 /**
- * 验证业务配置三字段。入参为候选对象；成功返回 { ok: true, value }，失败返回 { ok: false }。
- * Token 必填；VIN 与高德 Key 可选。校验失败不回显具体输入，避免泄露。
+ * 验证业务配置字段。入参为候选对象；成功返回 { ok: true, value }，失败返回 { ok: false }。
+ * Token 必填；VIN/高德 Key/昵称/坐标转换均可选。校验失败不回显具体输入，避免泄露。
  */
 function validateBusinessConfig(candidate) {
   if (!candidate || typeof candidate !== "object") return { ok: false };
@@ -264,7 +265,9 @@ function validateBusinessConfig(candidate) {
     value: {
       authToken: authToken,
       vin: normalizeConfigValue(candidate.vin),
-      amapApiKey: normalizeConfigValue(candidate.amapApiKey)
+      amapApiKey: normalizeConfigValue(candidate.amapApiKey),
+      nickName: normalizeConfigValue(candidate.nickName),
+      coordConvert: normalizeConfigValue(candidate.coordConvert) === "1" ? "1" : ""
     }
   };
 }
@@ -277,7 +280,7 @@ function validateICloudConfigEnvelope(json) {
   if (!json || typeof json !== "object") return { ok: false };
   if (json.schemaVersion !== CONFIG_SCHEMA_VERSION) return { ok: false };
   if (typeof json.updatedAt !== "string" || isNaN(new Date(json.updatedAt).getTime())) return { ok: false };
-  const business = validateBusinessConfig({ authToken: json.authToken, vin: json.vin, amapApiKey: json.amapApiKey });
+  const business = validateBusinessConfig({ authToken: json.authToken, vin: json.vin, amapApiKey: json.amapApiKey, nickName: json.nickName, coordConvert: json.coordConvert });
   if (!business.ok) return { ok: false };
   return { ok: true, value: business.value };
 }
@@ -286,7 +289,9 @@ function validateICloudConfigEnvelope(json) {
 function businessConfigsEqual(left, right) {
   return left.authToken === right.authToken &&
     left.vin === right.vin &&
-    left.amapApiKey === right.amapApiKey;
+    left.amapApiKey === right.amapApiKey &&
+    left.nickName === right.nickName &&
+    left.coordConvert === right.coordConvert;
 }
 
 /**
@@ -508,7 +513,9 @@ async function presentConfigForm(initialConfig) {
   let formValues = {
     authToken: initialConfig ? initialConfig.authToken : "",
     vin: initialConfig ? initialConfig.vin : "",
-    amapApiKey: initialConfig ? initialConfig.amapApiKey : ""
+    amapApiKey: initialConfig ? initialConfig.amapApiKey : "",
+    nickName: initialConfig ? initialConfig.nickName : "",
+    coordConvert: initialConfig ? initialConfig.coordConvert : ""
   };
   while (true) {
     const form = new Alert();
@@ -517,6 +524,8 @@ async function presentConfigForm(initialConfig) {
     form.addSecureTextField("Authorization Token（抓包获取）", formValues.authToken);
     form.addTextField("VIN（留空自动获取）", formValues.vin);
     form.addTextField("高德 API Key（可选，右侧地图）", formValues.amapApiKey);
+    form.addTextField("爱车昵称（可选，组件标题显示）", formValues.nickName);
+    form.addTextField("坐标转换（填1=WGS84转GCJ02，留空不转换）", formValues.coordConvert);
     form.addAction("保存");
     form.addCancelAction("取消");
 
@@ -529,7 +538,9 @@ async function presentConfigForm(initialConfig) {
     const candidate = {
       authToken: form.textFieldValue(0),
       vin: form.textFieldValue(1),
-      amapApiKey: form.textFieldValue(2)
+      amapApiKey: form.textFieldValue(2),
+      nickName: form.textFieldValue(3),
+      coordConvert: form.textFieldValue(4)
     };
     const validationResult = validateBusinessConfig(candidate);
     if (!validationResult.ok) {
@@ -793,7 +804,9 @@ function wgs2gcj(latitude, longitude) {
  */
 async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, lat, lng) {
   const fm = runtimeContext.fm;
-  const geo = wgs2gcj(lat, lng);
+  // 坐标系处理：雅迪 TSP 坐标实测可能已是 GCJ02，默认不做转换；
+  // 若地图/位置明显偏移，可在配置"坐标转换"填 1 启用 WGS84→GCJ02
+  const geo = runtimeConfig.coordConvert === "1" ? wgs2gcj(lat, lng) : { latitude: lat, longitude: lng };
   const moved = hasCarMoved({ lat: lat, lng: lng }, prevCoord);
 
   // 地理文字缓存：车辆未移动时直接复用
@@ -805,12 +818,27 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
     } catch (e) {
       json = null;
     }
+    // 坏缓存校验：空数组或仅含"未知位置"占位的历史缓存视为无效，重新请求
+    if (Array.isArray(json)) {
+      const first = json[0] || {};
+      if (!json.length || first.name === "未知位置") {
+        console.log("地理缓存内容无效，重新请求");
+        json = null;
+      }
+    }
   }
   if (json == null || moved) {
     try {
-      const location = await Location.reverseGeocode(geo.latitude, geo.longitude, "zh-CN");
-      json = location;
-      fm.writeString(geoFile, JSON.stringify(location));
+      // Scriptable 签名为两参，多传语言参数会导致部分版本抛异常
+      const location = await Location.reverseGeocode(geo.latitude, geo.longitude);
+      // 空结果不写缓存，避免"未知位置"被固化
+      if (Array.isArray(location) && location.length) {
+        json = location;
+        fm.writeString(geoFile, JSON.stringify(location));
+      } else {
+        console.log("逆地理结果为空");
+        if (json == null) json = [{ name: "未知位置" }];
+      }
     } catch (e) {
       console.log("地理编码失败");
       if (json == null) {
@@ -820,8 +848,12 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
   }
   // iOS reverseGeocode 返回数组；兼容对象形态的高德缓存
   let geofence = "未知位置";
-  if (Array.isArray(json)) {
-    geofence = (json[0] && (json[0].name || json[0].thoroughfare)) || geofence;
+  if (Array.isArray(json) && json.length) {
+    const p = json[0] || {};
+    geofence = p.name || p.thoroughfare || p.locality || p.administrativeArea || geofence;
+    if (geofence === "未知位置") {
+      console.log("逆地理字段:" + Object.keys(p).join(","));
+    }
   } else if (json && json.regeocode) {
     geofence = (json.regeocode.addressComponent && json.regeocode.addressComponent.township) || geofence;
   }
@@ -1242,7 +1274,11 @@ async function loadCarContext(runtimeContext, runtimeConfig, data, vin) {
   } catch (e) {
     nameCache = null;
   }
-  if (nameCache && (nameCache.bikeNickName || nameCache.modelName)) {
+  if (runtimeConfig.nickName) {
+    // 配置昵称优先（H5 网关无绑定列表接口，昵称只能来自配置）
+    data.bikeNickName = runtimeConfig.nickName;
+    fm.writeString(nameFile, JSON.stringify({ bikeNickName: data.bikeNickName, modelName: "" }));
+  } else if (nameCache && (nameCache.bikeNickName || nameCache.modelName)) {
     data.bikeNickName = nameCache.bikeNickName || "";
     data.modelName = nameCache.modelName || "";
   } else {
