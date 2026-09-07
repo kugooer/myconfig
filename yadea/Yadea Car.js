@@ -23,12 +23,13 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.5 显示名仅用昵称(无昵称显示"没有昵称")；VIN 非必填(配置>Widget参数>绑定列表>本地缓存)
 // v2.4 诊断日志(vin/token长度)+错误提示检查VIN与Token
 // v2.3 错误提示覆盖VIN场景
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.4";
+const SCRIPT_VERSION = "v2.5";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -993,7 +994,8 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
     stack.size = new Size(150, 20);
 
     // 显示名：爱车昵称优先，其次车型名
-    const displayName = vehicle.bikeNickName || vehicle.modelName || ("雅迪 " + (status.vin || vin).slice(-6));
+    // 显示名：仅用爱车昵称，无昵称显示"没有昵称"（不再用车型名兜底）
+    const displayName = vehicle.bikeNickName || "没有昵称";
     const name = stack.addText(displayName + "           ");
     name.font = Font.mediumSystemFont(16);
     name.lineLimit = 1;
@@ -1184,7 +1186,7 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
     image.applyFillingContentMode();
     image.cornerRadius = 0;
     image.url = `http://maps.apple.com/?ll=${vehicle.car_geo.latitude},${vehicle.car_geo.longitude}&q=` +
-      encodeURI(vehicle.bikeNickName || vehicle.modelName || "车辆位置");
+      encodeURI(vehicle.bikeNickName || "车辆位置");
   }
 
   renderCarInfo();
@@ -1398,12 +1400,12 @@ async function main() {
   const data = await loadVehicleDataWithCache(runtimeConfig, runtimeContext.fm, dataFile);
   const soc = data.status.totalSoc != null ? data.status.totalSoc : (data.status.soc1 || 0);
   console.log(JSON.stringify(data, null, 2));
-  // 显示名从本地昵称缓存读取，避免额外请求
-  let displayName = "雅迪电动车";
+  // 显示名从本地昵称缓存读取，避免额外请求；仅用昵称，无昵称显示"没有昵称"
+  let displayName = "没有昵称";
   try {
     const nameFile = runtimeContext.fm.joinPath(runtimeContext.fileRoot, `car_name_${vin}.json`);
     const nc = JSON.parse(runtimeContext.fm.readString(nameFile));
-    displayName = nc.bikeNickName || nc.modelName || displayName;
+    displayName = nc.bikeNickName || "没有昵称";
   } catch (e) {}
   const alert = new Alert();
   alert.title = displayName;
