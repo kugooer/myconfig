@@ -7,11 +7,13 @@
  * 搭配使用：Scriptable「Yadea Car」组件的 Token 配置（有效约 1 年，
  *           App 重新登录后可能轮换，以捕获到的新 token 为准）。
  *
- * 数据流：雅迪 App H5 请求 → QX 重写拦截 → 本脚本 → $persistentStore + $notify
+ * 数据流：雅迪 App H5 请求 → QX 重写拦截（响应阶段） → 本脚本 → $persistentStore + $notify
+ * 注意：使用 script-response-header 类型（NE v1.7.0 实测 script-request-header
+ *       不注入 $request，响应阶段两种对象都可用）。
  *
  * @author WorkBuddy
  * @updated 2026-09-07
- * @version 1.0
+ * @version 1.1
  */
 
 const STORE_KEY = "yadea_h5_token";
@@ -28,22 +30,28 @@ function captureToken(headers) {
 }
 
 try {
-  const token = captureToken($request.headers);
-  if (!token || token.length < 100) {
-    // 非预期形态，静默跳过，避免误存
-    console.log("[YadeaToken] 未捕获到有效 token（长度不足）");
+  // 防御：个别 QX 版本/类型下 $request 可能未注入
+  const req = typeof $request === "undefined" ? null : $request;
+  if (!req || !req.headers) {
+    console.log("[YadeaToken] $request 不可用(类型=" + typeof $request + ", url=" + (req && req.url ? "有" : "无") + ")");
   } else {
-    const old = $persistentStore.read(STORE_KEY);
-    if (old === token) {
-      console.log("[YadeaToken] token 未变化，不打扰");
+    const token = captureToken(req.headers);
+    if (!token || token.length < 100) {
+      // 非预期形态，静默跳过，避免误存
+      console.log("[YadeaToken] 未捕获到有效 token（长度不足）");
     } else {
-      $persistentStore.write(token, STORE_KEY);
-      // 变化才弹通知；通知点开后详情页可全选复制完整 token
-      $notify(
-        "雅迪 Token 已捕获" + (old ? "（有更新）" : ""),
-        "长度 " + token.length + " · 请复制后填入 Scriptable 配置",
-        token
-      );
+      const old = $persistentStore.read(STORE_KEY);
+      if (old === token) {
+        console.log("[YadeaToken] token 未变化，不打扰");
+      } else {
+        $persistentStore.write(token, STORE_KEY);
+        // 变化才弹通知；通知点开后详情页可全选复制完整 token
+        $notify(
+          "雅迪 Token 已捕获" + (old ? "（有更新）" : ""),
+          "长度 " + token.length + " · 请复制后填入 Scriptable 配置",
+          token
+        );
+      }
     }
   }
 } catch (e) {
