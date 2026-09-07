@@ -13,7 +13,7 @@
  *
  * @author WorkBuddy
  * @updated 2026-09-07
- * @version 1.1
+ * @version 1.3
  */
 
 const STORE_KEY = "yadea_h5_token";
@@ -30,10 +30,10 @@ function captureToken(headers) {
 }
 
 try {
-  // 防御：个别 QX 版本/类型下 $request 可能未注入
+  // 手动在 QX「脚本」页运行时没有 $request，属正常——本脚本只能由重写规则触发
   const req = typeof $request === "undefined" ? null : $request;
   if (!req || !req.headers) {
-    console.log("[YadeaToken] $request 不可用(类型=" + typeof $request + ", url=" + (req && req.url ? "有" : "无") + ")");
+    console.log("[YadeaToken] 本次运行无 $request（手动执行属正常；若由重写触发仍出现此行，说明该 QX 版本未注入，需换捕获类型）");
   } else {
     const token = captureToken(req.headers);
     if (!token || token.length < 100) {
