@@ -671,8 +671,9 @@ async function loadVehicleDataWithCache(runtimeConfig, fm, file, retried = false
   try {
     const status = await getVehRealStatus(runtimeConfig, runtimeConfig.vin);
     // 契约校验：空 data 视为请求失败，进入缓存回退
+    // 诊断：附带 vin 与 token 长度（网关 000000+空 data 对应 VIN 异常，100995=token 失效，405=时间偏差）
     if (!isValidVehicleStatus(status)) {
-      console.log("车辆状态响应无效，尝试读取缓存");
+      console.log("车辆状态响应无效(vin=" + String(runtimeConfig.vin || "") + ",token长度=" + String(runtimeConfig.authToken || "").length + ")，尝试读取缓存");
       throw new Error("车辆状态响应无效");
     }
     let batt = null;
