@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.9 移除胎压告警图标(leftXxxPressureWarning 实测正常胎压时=7，非告警语义，误报)
 // v2.8 修复：保存 envelope 漏写 nickName 导致填昵称后"pending 配置校验失败"→iCloud 保存失败
 // v2.7 配置新增昵称(显示优先级最高)；修复 reverseGeocode 三参异常与空结果固化缓存；坐标维持固定 WGS84→GCJ02
 // v2.5 显示名仅用昵称(无昵称显示"没有昵称")；VIN 非必填(配置>Widget参数>绑定列表>本地缓存)
@@ -31,7 +32,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.8";
+const SCRIPT_VERSION = "v2.9";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -1031,8 +1032,10 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
 
     stack.addSpacer(3);
 
-    // 胎压告警：任一 warning 字段非零即显示黄色图标
-    if ((status.leftFrontPressureWarning || 0) > 0 || (status.leftRearPressureWarning || 0) > 0) {
+    // 胎压告警：leftXxxPressureWarning 实测正常胎压(157kPa)时值也为 7，非告警语义，误报已移除。
+    // 若后续需要真实胎压告警，需在低压事件时抓包确认正确字段（如 tireStatus）再启用
+    const tireWarning = false;
+    if (tireWarning) {
       const tire = safeSymbol("exclamationmark.tirepressure");
       if (tire) {
         const img = stack.addImage(tire);
