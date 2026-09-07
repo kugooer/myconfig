@@ -37,8 +37,8 @@ try {
   } else {
     const token = captureToken(req.headers);
     if (!token || token.length < 100) {
-      // 非预期形态，静默跳过，避免误存
-      console.log("[YadeaToken] 未捕获到有效 token（长度不足）");
+      // 非预期形态：记录 URL 证明重写已触发（诊断规则靠这行定位 MITM 是否工作）
+      console.log("[YadeaToken] 重写已触发但未捕获到 token（长度不足）url=" + (req.url || "?"));
     } else {
       const old = $persistentStore.read(STORE_KEY);
       if (old === token) {
