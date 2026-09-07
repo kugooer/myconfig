@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.10 修复"未知位置"：iOS 逆地理在 Widget 上下文持续失败时增加高德 regeo API 兜底(复用 amapApiKey)；异常内容写入日志
 // v2.9 移除胎压告警图标(leftXxxPressureWarning 实测正常胎压时=7，非告警语义，误报)
 // v2.8 修复：保存 envelope 漏写 nickName 导致填昵称后"pending 配置校验失败"→iCloud 保存失败
 // v2.7 配置新增昵称(显示优先级最高)；修复 reverseGeocode 三参异常与空结果固化缓存；坐标维持固定 WGS84→GCJ02
@@ -32,7 +33,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.9";
+const SCRIPT_VERSION = "v2.10";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -825,23 +826,45 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
     }
   }
   if (json == null || moved) {
+    // 主路径：iOS 系统逆地理。Widget 后台刷新上下文中 CLGeocoder 可能限流或返回空，
+    // 失败时不直接落"未知位置"，改走高德 regeo 兜底（复用已验证可用的 Key 与网络）
     try {
       // Scriptable 签名为两参，多传语言参数会导致部分版本抛异常
       const location = await Location.reverseGeocode(geo.latitude, geo.longitude);
       // 空结果不写缓存，避免"未知位置"被固化
       if (Array.isArray(location) && location.length) {
         json = location;
-        fm.writeString(geoFile, JSON.stringify(location));
+        console.log("逆地理来源: iOS");
       } else {
-        console.log("逆地理结果为空");
-        if (json == null) json = [{ name: "未知位置" }];
+        console.log("逆地理结果为空，尝试高德兜底");
       }
     } catch (e) {
-      console.log("地理编码失败");
-      if (json == null) {
-        json = [{ name: "未知位置" }];
+      // 输出异常内容便于定位（不含敏感信息）
+      console.log("地理编码失败: " + (e && e.message ? e.message : String(e)));
+    }
+    // 兜底路径：高德逆地理 API，返回 formatted_address（如"XX市临河路XX号附近"）
+    if (json == null && runtimeConfig.amapApiKey) {
+      try {
+        const regeoUrl = `https://restapi.amap.com/v3/geocode/regeo?key=${runtimeConfig.amapApiKey}` +
+          `&location=${geo.longitude},${geo.latitude}&radius=200&extensions=base`;
+        const regeoReq = new Request(regeoUrl);
+        const regeoJson = JSON.parse(await regeoReq.loadString());
+        const regeo = regeoJson && regeoJson.regeocode;
+        const addr = regeo && (regeo.formatted_address || "");
+        if (regeoJson && regeoJson.status === "1" && addr) {
+          // 归一化为 iOS 数组形态 [{name}]，供下方字段提取与缓存复用
+          json = [{ name: addr }];
+          fm.writeString(geoFile, JSON.stringify(json));
+          console.log("逆地理来源: 高德");
+        } else {
+          console.log("高德逆地理响应无效: status=" + (regeoJson ? regeoJson.status : "null"));
+        }
+      } catch (e2) {
+        console.log("高德逆地理请求失败: " + (e2 && e2.message ? e2.message : String(e2)));
       }
     }
+    // 两条路径都失败才落占位（不写缓存，下次仍会重试）
+    if (json == null) json = [{ name: "未知位置" }];
   }
   // iOS reverseGeocode 返回数组；兼容对象形态的高德缓存
   let geofence = "未知位置";
