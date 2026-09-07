@@ -712,8 +712,9 @@ async function loadVehicleDataWithCache(runtimeConfig, fm, file, retried = false
   if (!retried) {
     return loadVehicleDataWithCache(runtimeConfig, fm, file, true);
   }
-  // 两次请求均无效：多为 Token 失效（网关以 000000+空 data 软失败）或持续抖动
-  throw new Error("车辆状态加载失败，请更新 Token");
+  // 两次请求均无效：网关故障矩阵实测，code=000000+空 data 对应 VIN 为空/不存在
+  // （token 失效为 100995、无鉴权为 100996、时间偏差为 405，均会走显式错误分支）
+  throw new Error("车辆状态加载失败，请检查 VIN 与 Token");
 }
 
 /** 判断车辆坐标相对上次缓存是否变化。入参为当前与上一坐标对象；返回布尔值 */
