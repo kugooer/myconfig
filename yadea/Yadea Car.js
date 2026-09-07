@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.11 坐标系修正：TSP 下发坐标实测为 GCJ02，移除 WGS84→GCJ02 转换(偏移约600m跨浏阳河)；缓存文件名加 c2 后缀强制刷新
 // v2.10 修复"未知位置"：iOS 逆地理在 Widget 上下文持续失败时增加高德 regeo API 兜底(复用 amapApiKey)；异常内容写入日志
 // v2.9 移除胎压告警图标(leftXxxPressureWarning 实测正常胎压时=7，非告警语义，误报)
 // v2.8 修复：保存 envelope 漏写 nickName 导致填昵称后"pending 配置校验失败"→iCloud 保存失败
@@ -33,7 +34,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.10";
+const SCRIPT_VERSION = "v2.11";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -751,50 +752,10 @@ function humanizeAge(ms) {
   return Math.floor(sec / 86400) + "d";
 }
 
-// ============================ 坐标转换（WGS84 -> GCJ02） ============================
-
-/** 判断是否在中国境外（境外不做 GCJ02 纠偏） */
-function isLocationOutOfChina(latitude, longitude) {
-  if (longitude < 72.004 || longitude > 137.8347 || latitude < 0.8293 || latitude > 55.8271)
-    return true;
-  return false;
-}
-
-function transformLatWithXY(x, y) {
-  const pi = 3.14159265358979324;
-  let lat = -100.0 + 2.0*x + 3.0*y + 0.2*y*y + 0.1*x*y + 0.2*Math.sqrt(Math.abs(x));
-  lat += (20.0*Math.sin(6.0*x*pi) + 20.0*Math.sin(2.0*x*pi)) * 2.0 / 3.0;
-  lat += (20.0*Math.sin(y*pi) + 40.0*Math.sin(y/3.0*pi)) * 2.0 / 3.0;
-  lat += (160.0*Math.sin(y/12.0*pi) + 320*Math.sin(y*pi/30.0)) * 2.0 / 3.0;
-  return lat;
-}
-function transformLonWithXY(x, y) {
-  const pi = 3.14159265358979324;
-  let lon = 300.0 + x + 2.0*y + 0.1*x*x + 0.1*x*y + 0.1*Math.sqrt(Math.abs(x));
-  lon += (20.0*Math.sin(6.0*x*pi) + 20.0*Math.sin(2.0*x*pi)) * 2.0 / 3.0;
-  lon += (20.0*Math.sin(x*pi) + 40.0*Math.sin(x/3.0*pi)) * 2.0 / 3.0;
-  lon += (150.0*Math.sin(x/12.0*pi) + 300.0*Math.sin(x/30.0*pi)) * 2.0 / 3.0;
-  return lon;
-}
-
-/** WGS84 -> GCJ02 火星坐标（雅迪 TSP 坐标按 WGS84 处理） */
-function wgs2gcj(latitude, longitude) {
-  const ee = 0.00669342162296594323;
-  const a = 6378245.0;
-  const pi = 3.14159265358979324;
-  if (isLocationOutOfChina(latitude, longitude)) {
-    return { latitude: latitude, longitude: longitude };
-  }
-  let adjustLat = transformLatWithXY(longitude - 105.0, latitude - 35.0);
-  let adjustLon = transformLonWithXY(longitude - 105.0, latitude - 35.0);
-  const radLat = latitude / 180.0 * pi;
-  let magic = Math.sin(radLat);
-  magic = 1 - ee * magic * magic;
-  const sqrtMagic = Math.sqrt(magic);
-  adjustLat = (adjustLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * pi);
-  adjustLon = (adjustLon * 180.0) / (a / sqrtMagic * Math.cos(radLat) * pi);
-  return { latitude: latitude + adjustLat, longitude: longitude + adjustLon };
-}
+// ============================ 坐标处理 ============================
+// v2.11 实测结论：雅迪 TSP 下发的 lat/lon 已是 GCJ02（高德系）坐标——
+// 雅迪 App 即透传原始坐标给高德（ssr/regeo 链接可证），逆地理结果与实际位置一致；
+// 之前多做 WGS84→GCJ02 转换导致偏移约 600m（实测跨浏阳河落到对岸会展中心），已移除转换。
 
 /**
  * 加载车辆位置描述与高德静态地图，并维护按 VIN 隔离的缓存。
@@ -803,13 +764,13 @@ function wgs2gcj(latitude, longitude) {
  */
 async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, lat, lng) {
   const fm = runtimeContext.fm;
-  // 坐标系处理：维持原有逻辑，固定 WGS84→GCJ02（用户实测坐标无偏移，保持不变）
-  const geo = wgs2gcj(lat, lng);
+  // 坐标处理：雅迪 TSP 下发坐标已是 GCJ02，直接透传给高德（不做 WGS84 转换，v2.11 实测修正）
+  const geo = { latitude: lat, longitude: lng };
   const moved = hasCarMoved({ lat: lat, lng: lng }, prevCoord);
 
-  // 地理文字缓存：车辆未移动时直接复用
+  // 地理文字缓存：车辆未移动时直接复用（文件名带 c2 后缀，v2.11 因坐标系修正强制废弃旧缓存）
   let json = null;
-  const geoFile = fm.joinPath(runtimeContext.fileRoot, `car_geo_${vin}.json`);
+  const geoFile = fm.joinPath(runtimeContext.fileRoot, `car_geo_c2_${vin}.json`);
   if (fm.fileExists(geoFile)) {
     try {
       json = JSON.parse(fm.readString(geoFile));
@@ -878,9 +839,9 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
     geofence = (json.regeocode.addressComponent && json.regeocode.addressComponent.township) || geofence;
   }
 
-  // 静态地图缓存：车辆未移动且已有图片时直接复用
+  // 静态地图缓存：车辆未移动且已有图片时直接复用（文件名带 c2 后缀，强制按修正坐标重新拉图）
   let image = null;
-  const mapFile = fm.joinPath(runtimeContext.fileRoot, `car_map_${vin}.png`);
+  const mapFile = fm.joinPath(runtimeContext.fileRoot, `car_map_c2_${vin}.png`);
   if (fm.fileExists(mapFile)) {
     try {
       image = fm.readImage(mapFile);
