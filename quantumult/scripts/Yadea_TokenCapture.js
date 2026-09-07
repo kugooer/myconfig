@@ -13,10 +13,22 @@
  *
  * @author WorkBuddy
  * @updated 2026-09-07
- * @version 1.3
+ * @version 1.5
  */
 
 const STORE_KEY = "yadea_h5_token";
+
+// QX 用 $prefs，Loon/Surge 用 $persistentStore（对齐 CMCC_DailyBonus.js 的兼容写法）
+function storeWrite(value, key) {
+  if (typeof $prefs !== "undefined") return $prefs.setValueForKey(value, key);
+  if (typeof $persistentStore !== "undefined") return $persistentStore.write(value, key);
+  return false;
+}
+function storeRead(key) {
+  if (typeof $prefs !== "undefined") return $prefs.valueForKey(key);
+  if (typeof $persistentStore !== "undefined") return $persistentStore.read(key);
+  return null;
+}
 
 function captureToken(headers) {
   if (!headers) return "";
@@ -40,11 +52,11 @@ try {
       // 非预期形态：记录 URL 证明重写已触发（诊断规则靠这行定位 MITM 是否工作）
       console.log("[YadeaToken] 重写已触发但未捕获到 token（长度不足）url=" + (req.url || "?"));
     } else {
-      const old = $persistentStore.read(STORE_KEY);
+      const old = storeRead(STORE_KEY);
       if (old === token) {
         console.log("[YadeaToken] token 未变化，不打扰");
       } else {
-        $persistentStore.write(token, STORE_KEY);
+        storeWrite(token, STORE_KEY);
         // 变化才弹通知；通知点开后详情页可全选复制完整 token
         $notify(
           "雅迪 Token 已捕获" + (old ? "（有更新）" : ""),
