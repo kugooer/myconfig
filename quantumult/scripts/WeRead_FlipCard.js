@@ -2,7 +2,7 @@
 
   微信读书(WeRead) 每周翻一翻脚本
 
-  更新时间: 2026-09-08 (capture-v1.3)
+  更新时间: 2026-09-08 (capture-v1.4)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -24,6 +24,10 @@
                 errcode=-2676(本期 6 次已翻完)→归入「额度已用完」提示，其他
                 errcode 透出到通知；③ 翻牌计数修正：remainingCount=0 的那次
                 翻牌也计入(先计数后 break)，通知「翻了 N 张」与实际一致。
+  capture-v1.4: 奖品识别修正(对照 App 截图实证)。① describeCard 补 money 类型
+                (接口实际返回 money 面额×100，原只认 coin 导致翻币漏报)；
+                ② 过滤 cardIndex=-1/status=4 牌背幽灵条目(原被误报为体验卡)；
+                ③ 同名奖品聚合计数，通知与 App 展示一致。
 
   流量结论（抓包 2026-08-24-094839）:
   - 翻牌: GET https://weread.qq.com/flip-card-game/api/flipCardFlip
@@ -34,7 +38,8 @@
     ?cardIndex=N&giftIndex=N&pf=ios&platform=ios_html
     → 响应: { cardList: [...] }（每张卡的 status: 0=未领 3=已领）
   - 认证: 仅 Cookie (wr_skey=...; wr_vid=...)，无独立 vid/skey header
-  - 注意: cardType 有 infinite(1 天体验卡) / book(赠书) / coin(翻币)
+  - 注意: cardType 实测为 money(翻币, money=面额×100) / book(赠书) / infinite(1 天体验卡)；
+    cardList 另含 cardIndex=-1 & status=4 的牌背幽灵条目(非奖品，需过滤)
     status=3+autoReceive=1 的卡已自动领, 无需再 receive
 
   用法:
@@ -234,6 +239,8 @@ async function doFlip(item) {
     for (let i = 0; i < cardList.length; i++) {
       const card = cardList[i];
       if (!card || typeof card.cardIndex !== "number") continue;
+      // 幽灵条目: cardIndex=-1/status=4 是未翻开的牌背(非真实奖品，App 显示 GOOD LUCK 牌背)
+      if (card.cardIndex < 0 || card.status === 4) continue;
       const gift = describeCard(card);
       if (gift) rewards.push(gift);
       // status=3 表示已领取（自动或手动）；其余调 receive
@@ -264,7 +271,19 @@ async function doFlip(item) {
     }
 
     merge.Flip.success = 1;
-    const rewardText = rewards.length ? rewards.map((g) => "• " + g).join("\n") : "（已翻完，详见 App）";
+    // 同名奖品聚合计数，与 App 展示一致（如 1 翻币 ×2 / 1 天体验卡 ×2）
+    const counts = {};
+    const order = [];
+    for (const g of rewards) {
+      if (!counts[g]) {
+        counts[g] = 0;
+        order.push(g);
+      }
+      counts[g]++;
+    }
+    const rewardText = order.length
+      ? order.map((g) => "• " + g + (counts[g] > 1 ? " ×" + counts[g] : "")).join("\n")
+      : "（已翻完，详见 App）";
     const remainText = typeof lastRemaining === "number" ? "，剩余次数 " + lastRemaining : "";
     merge.Flip.notify =
       "微信读书翻一翻: 成功 ✅\n" +
@@ -279,20 +298,20 @@ async function doFlip(item) {
 
 function describeCard(card) {
   if (!card) return null;
-  // cardType: infinite(1 天体验卡) / book(赠书) / coin(翻币)
+  // cardType 实测(抓包 2026-09-08-102619): money(翻币, money=面额×100) / book(赠书) / infinite(1 天体验卡)
+  if (card.cardType === "money" || typeof card.money === "number") {
+    const n = Math.round((card.money || 0) / 100);
+    return n + " 翻币";
+  }
   if (card.cardType === "infinite" || card.infinite) {
-    return "1 天体验卡 × 1";
+    return "1 天体验卡";
   }
   if (card.cardType === "book" && card.bookInfo) {
     const title = card.bookInfo.title || "未知书目";
-    return "赠书 《" + title + "》";
-  }
-  if (card.cardType === "coin" || card.coin || card.flipCoin) {
-    const n = card.coin || card.flipCoin || 0;
-    return "翻币 × " + n;
+    return "赠书《" + title + "》";
   }
   if (card.bookInfo && card.bookInfo.title) {
-    return "赠书 《" + card.bookInfo.title + "》";
+    return "赠书《" + card.bookInfo.title + "》";
   }
   if (card.name) return card.name;
   if (card.desc) return card.desc;

@@ -331,7 +331,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_D
 - **capture-v1.2 根因修复**：原 `weReadHeaders` 只发 `vid`/`skey` header，翻牌接口不认 → 空响应误报「无卡可翻」。现改发 `Cookie: wr_skey/wr_vid`；并由 `WeRead_DailyBonus.js` 把翻一翻专用 Cookie 独立存为 `item.wrSkey/wrVid`，**避免被每日签到的 i.weread 登录 skey（同 vid 不同值）覆盖**
 - 翻牌循环：cardIndex 1~6 + giftIndex 0~5；响应 `remainingCount` 驱动循环终止
 - 接收：对 `status != 3 && autoReceive != 1` 的卡调 `flipCardReceive` 领取
-- 奖励类型：`infinite`（1 天体验卡）/ `book`（赠书）/ `coin`（翻币）；状态 `status: 0=未领 3=已领 autoReceive=1=自动领`
+- 奖励类型（capture-v1.4 实测）：`money`（翻币，`money`=面额×100）/ `book`（赠书）/ `infinite`（1 天体验卡）；状态 `status: 0=未领 3=已领 autoReceive=1=自动领 4=牌背幽灵条目(cardIndex=-1，非奖品)`；同名奖品聚合计数展示
 - **复用 `WeRead_Cookies` / `WeRead_LoginBody`**（同 conf 同 prefs），无独立 capture 脚本；翻一翻专用 Cookie 作为 `wrSkey/wrVid` 字段附在同一条目上
 - capture-v1.1 诊断增强：空响应分三类提示 —「凭证过期(Cookie 失效)」/「本期额度已用完(remainingCount≤0)」/「本期无卡可翻」；成功通知附带真实 `remainingCount`，便于定位根因
 - 缺 `wrSkey` 时会告警并退回 i.weread 登录 skey（翻牌接口不认，大概率失败）→ 需重新打开翻一翻页抓 Cookie
