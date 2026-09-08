@@ -12,8 +12,8 @@
  *       不注入 $request，响应阶段两种对象都可用）。
  *
  * @author WorkBuddy
- * @updated 2026-09-07
- * @version 1.7
+ * @updated 2026-09-08
+ * @version 1.8
  */
 
 const STORE_KEY = "yadea_h5_token";
@@ -49,19 +49,23 @@ try {
   } else {
     const token = captureToken(req.headers);
     if (!token || token.length < 100) {
-      // 非预期形态：记录 URL 证明重写已触发（诊断规则靠这行定位 MITM 是否工作）
-      console.log("[YadeaToken] 重写已触发但未捕获到 token（长度不足）url=" + (req.url || "?"));
+      // 非预期形态：记录 URL 证明重写已触发（诊断规则靠这行定位 MITM 是否工作）。
+      // 静态资源(css/js/json/manifest 等)必无 token，直接跳过不打印，避免刷屏；
+      // 仅对 API 类请求保留这行诊断日志。
+      const url = req.url || "?";
+      if (!/\.(css|js|json|png|jpg|ico|woff2?|map)(\?|$)/i.test(url) && !/\/(index|manifest)\.(json|html)?$/.test(url)) {
+        console.log("[YadeaToken] 重写已触发但未捕获到 token（长度不足）url=" + url);
+      }
     } else {
       const old = storeRead(STORE_KEY);
       if (old === token) {
-        // token 未变化：每小时最多把完整 token 重新输出一次到日志，方便随时从日志复制
+        // token 未变化：静默跳过，不打印任何日志；
+        // 每小时仍把完整 token 输出一次到日志，方便随时从日志复制
         const now = Date.now();
         const lastLog = Number(storeRead(STORE_KEY + "_log_at") || 0);
         if (!lastLog || now - lastLog > 3600e3) {
           console.log("[YadeaToken] 当前token(" + token.length + "字符，每小时刷一次):\n" + token);
           storeWrite(String(now), STORE_KEY + "_log_at");
-        } else {
-          console.log("[YadeaToken] token 未变化，不打扰");
         }
       } else {
         storeWrite(token, STORE_KEY);
