@@ -379,11 +379,11 @@ function GetCookie() {
       return;
     }
     const headers = req.headers || {};
+    const rawCookie = String(headers.Cookie || headers.cookie || "");
     // 双源凭证：header 中的 vid/skey（启动接口用），Cookie 中的 wr_vid/wr_skey（翻一翻页仅用 Cookie 认证）
     let vid = String(headers.vid || headers.Vid || "").trim();
     let skey = String(headers.skey || headers.Skey || "").trim();
     if (!vid || !skey) {
-      const rawCookie = String(headers.Cookie || headers.cookie || "");
       const cookieVid = (rawCookie.match(/(?:^|[;\s])wr_vid=([^;]+)/i) || [])[1];
       const cookieSkey = (rawCookie.match(/(?:^|[;\s])wr_skey=([^;]+)/i) || [])[1];
       if (cookieVid) vid = String(cookieVid).trim();
@@ -439,6 +439,12 @@ function GetCookie() {
       update: new Date().toISOString(),
       lastUrl: url.slice(0, 200)
     };
+    // 翻一翻专用 Cookie 凭证：仅当本次请求 Cookie 含 wr_vid/wr_skey 时写入独立字段。
+    // 与每日签到的 i.weread 登录 skey（同 vid 不同值）区分，避免被覆盖后翻一翻 Cookie 认证失败。
+    const fVid = (rawCookie.match(/(?:^|[;\s])wr_vid=([^;]+)/i) || [])[1];
+    const fSkey = (rawCookie.match(/(?:^|[;\s])wr_skey=([^;]+)/i) || [])[1];
+    if (fVid) item.wrVid = String(fVid).trim();
+    if (fSkey) item.wrSkey = String(fSkey).trim();
 
     const saved = saveCookie(item);
     if (saved === "new") {

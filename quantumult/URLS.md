@@ -322,17 +322,19 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_D
 
 ## 微信读书 翻一翻（每周二）
 
-更新说明（2026-08-25 / capture-v1.1）：
+更新说明（2026-09-08 / capture-v1.2）：
 - 每周二 8:00 刷新 6 次翻卡次数，定时任务每周二 8:10 跑
 - API 明文 GET，明文路径：
   - 翻牌：`https://weread.qq.com/flip-card-game/api/flipCardFlip?cardIndex=N&giftIndex=N&pf=ios&platform=ios_html`
   - 接收：`https://weread.qq.com/flip-card-game/api/flipCardReceive?cardIndex=N&giftIndex=N&pf=ios&platform=ios_html`
 - 认证：仅 Cookie（`wr_skey=...; wr_vid=...`），无独立 `vid`/`skey` header —— 需 capture-v1.3+ 的 conf 才能从翻一翻页抓到凭证
+- **capture-v1.2 根因修复**：原 `weReadHeaders` 只发 `vid`/`skey` header，翻牌接口不认 → 空响应误报「无卡可翻」。现改发 `Cookie: wr_skey/wr_vid`；并由 `WeRead_DailyBonus.js` 把翻一翻专用 Cookie 独立存为 `item.wrSkey/wrVid`，**避免被每日签到的 i.weread 登录 skey（同 vid 不同值）覆盖**
 - 翻牌循环：cardIndex 1~6 + giftIndex 0~5；响应 `remainingCount` 驱动循环终止
 - 接收：对 `status != 3 && autoReceive != 1` 的卡调 `flipCardReceive` 领取
 - 奖励类型：`infinite`（1 天体验卡）/ `book`（赠书）/ `coin`（翻币）；状态 `status: 0=未领 3=已领 autoReceive=1=自动领`
-- **复用 `WeRead_Cookies` / `WeRead_LoginBody`**（同 conf 同 prefs），无独立 capture 脚本
+- **复用 `WeRead_Cookies` / `WeRead_LoginBody`**（同 conf 同 prefs），无独立 capture 脚本；翻一翻专用 Cookie 作为 `wrSkey/wrVid` 字段附在同一条目上
 - capture-v1.1 诊断增强：空响应分三类提示 —「凭证过期(Cookie 失效)」/「本期额度已用完(remainingCount≤0)」/「本期无卡可翻」；成功通知附带真实 `remainingCount`，便于定位根因
+- 缺 `wrSkey` 时会告警并退回 i.weread 登录 skey（翻牌接口不认，大概率失败）→ 需重新打开翻一翻页抓 Cookie
 
 ### 脚本本体
 
@@ -356,6 +358,7 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/WeRead_F
 
 1. 复用微信读书签到的 conf（capture-v1.3+ 已含 `flip-card-game/api`），无需额外 rewrite
 2. 打开微信读书 App → **「翻一翻」** 页面（Cookie 凭证抓取 + 卡片状态可视化）
+   ⚠️ 升级到 capture-v1.2 后，务必**重新打开一次翻一翻页**让 conf 重新抓 Cookie，否则 `WeRead_Cookies` 仍缺 `wrSkey` 字段，翻牌会退回到无效的 i.weread 登录 skey
 3. 通知「凭证已保存」后即跑定时任务（每周二 8:10 自动）
 4. skey 失效：复用签到脚本的 `WeRead_LoginBody` 整套重放 login 续期
 

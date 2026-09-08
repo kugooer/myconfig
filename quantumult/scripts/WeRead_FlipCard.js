@@ -2,7 +2,7 @@
 
   微信读书(WeRead) 每周翻一翻脚本
 
-  更新时间: 2026-08-25 (capture-v1.1)
+  更新时间: 2026-09-08 (capture-v1.2)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -13,6 +13,12 @@
   capture-v1.1: 诊断增强。区分「额度用完(remainingCount<=0)」与「凭证过期
                 (Cookie 失效)」两种"无卡可翻"成因，并暴露真实 remainingCount
                 便于下周二运行直接定位根因。
+  capture-v1.2: 【根因修复】翻一翻接口 flip-card-game/api 仅认
+                Cookie(wr_skey/wr_vid)，不认 vid/skey header。原 weReadHeaders
+                只发 header 导致请求空响应→误报"无卡可翻"。
+                现 weReadHeaders 改发 Cookie: wr_skey/wr_vid；并由
+                WeRead_DailyBonus.js 把翻一翻专用 Cookie 独立存为 item.wrSkey/
+                wrVid，避免被每日签到的 i.weread 登录 skey(同 vid 不同值)覆盖。
 
   流量结论（抓包 2026-08-24-094839）:
   - 翻牌: GET https://weread.qq.com/flip-card-game/api/flipCardFlip
@@ -116,6 +122,9 @@ async function doFlip(item) {
   let lastResp = null;
   let lastRemaining = null;   // 最近一次翻卡响应的剩余次数
   let authSuspected = false;  // Cookie(wr_skey/wr_vid)疑似失效
+  if (!item.wrSkey) {
+    console.log("[WeRead flip] WARN: 未捕获翻一翻专用 Cookie(wr_skey)，将退回 i.weread 登录 skey（翻牌接口不认，大概率失败）。请打开微信读书「翻一翻」页重新抓取凭证");
+  }
   try {
     // 取一次 featuredBook（让服务端感知 + 探查当前周期）
     try {
@@ -404,6 +413,9 @@ function persistSkey(item) {
 /* ========================= HTTP ========================= */
 
 function weReadHeaders(item, isPost) {
+  // 翻一翻接口 flip-card-game/api 仅认 Cookie(wr_skey/wr_vid) 认证，vid/skey header 无效。
+  // 优先用翻一翻专用 Cookie(wrSkey/wrVid)，缺失时退回 i.weread 登录 skey（通常无效，仅作兼容）。
+  const cookie = "wr_skey=" + (item.wrSkey || item.skey || "") + "; wr_vid=" + (item.wrVid || item.vid || "");
   const h = {
     Accept: "*/*",
     "Accept-Language": "zh-Hans-CN;q=1, en-CN;q=0.9, zh-Hant-CN;q=0.8",
@@ -413,6 +425,7 @@ function weReadHeaders(item, isPost) {
     v: BASEVER,
     vid: item.vid,
     skey: item.skey,
+    "Cookie": cookie,
     "User-Agent": DefaultUA,
     Connection: "keep-alive"
   };
