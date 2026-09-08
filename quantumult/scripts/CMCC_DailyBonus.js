@@ -813,33 +813,48 @@ function readAppDayMap() {
   }
 }
 
-function isAppDoneToday(phone) {
-  if (!isValidPhone(phone)) return false;
+// 每日锁键：优先明文手机号；指纹登录账号无明文手机号时回退 uid / ticketId，
+// 否则锁永远不生效，导致同一天反复触发签到并重复提示「今日已签到」。
+function appLockKey(acc) {
+  if (!acc) return "";
+  if (isValidPhone(acc.phone)) return "p:" + sanitizePhone(acc.phone);
+  const uid = String(acc.uid || "").trim();
+  if (uid) return "u:" + uid;
+  const tk = String(acc.ticketId || "").trim();
+  if (tk) return "t:" + tk;
+  return "";
+}
+
+function isAppDoneToday(key) {
+  if (!key) return false;
   try {
     const map = readAppDayMap();
-    if (map[phone] === appYmd()) return true;
+    if (map[key] === appYmd()) return true;
   } catch (e) {}
   return false;
 }
 
-function markAppDoneToday(phone, parsed) {
-  if (!isValidPhone(phone)) return;
+function markAppDoneToday(key, parsed) {
+  if (!key) return;
   try {
     const ymd = appYmd();
     const map = readAppDayMap();
-    map[phone] = ymd;
+    map[key] = ymd;
     // 只保留近 30 个号，防键膨胀
     const keys = Object.keys(map);
     if (keys.length > 30) {
       keys.slice(0, keys.length - 30).forEach(k => { delete map[k]; });
     }
     $nobyda.write(JSON.stringify(map), "CMCC_AppSignedDayMap");
-    upsertAccount({
-      phone: phone,
-      appLastSignYmd: ymd,
-      updatedAt: Date.now(),
-      source: "app-day-mark"
-    }, true);
+    // 仅明文手机号键可回写账号字段（uid/ticketId 键无对应明文手机号）
+    if (/^p:/.test(key)) {
+      upsertAccount({
+        phone: key.slice(2),
+        appLastSignYmd: ymd,
+        updatedAt: Date.now(),
+        source: "app-day-mark"
+      }, true);
+    }
   } catch (e) {}
 }
 
@@ -1583,10 +1598,12 @@ function LiveQwhdSign(s) {
 
         const headers = buildQwhdApiHeaders(pageUrl);
 
-        // 1.5) 每日锁：已签到过的号当天不再打接口（与定时任务 / 多次登录触发共享）
-        if (AppDailyOnce && isValidPhone(ACCOUNT.phone) && isAppDoneToday(ACCOUNT.phone)) {
+        // 1.5) 每日锁：已签到过的号当天不再打接口、不推送（与定时任务 / 多次登录触发共享）
+        const lockKey = appLockKey(ACCOUNT);
+        if (AppDailyOnce && isAppDoneToday(lockKey)) {
           merge.QwhdSign.success = 1;
-          merge.QwhdSign.notify = "签到领奖: 今日已签到（本地每日锁）";
+          merge.QwhdSign.silentSkip = true; // 今日已签：静默跳过，不推送
+          console.log(`账号 ${maskPhone(ACCOUNT.phone || ACCOUNT.uid || "未知")} 今日已签（本地每日锁），跳过签到`);
           return resolve();
         }
 
@@ -1612,9 +1629,10 @@ function LiveQwhdSign(s) {
         const already = isTodayMarked(st2 && st2.body, day);
         if (already) {
           merge.QwhdSign.success = 1;
-          merge.QwhdSign.notify = "签到领奖: 今日已签到";
-          if (AppDailyOnce && isValidPhone(ACCOUNT.phone)) markAppDoneToday(ACCOUNT.phone, { ok: true });
-          // 仍可尝试领取可领任务奖
+          merge.QwhdSign.silentSkip = true; // 今日已签：静默跳过，不推送（服务端口径）
+          console.log(`账号 ${maskPhone(ACCOUNT.phone || ACCOUNT.uid || "未知")} 服务端返回今日已签，跳过并落每日锁`);
+          if (AppDailyOnce && lockKey) markAppDoneToday(lockKey, { ok: true });
+          // 仍可尝试领取可领任务奖（有奖励时会正常推送）
           if (AutoClaimTaskAward) {
             const award = await claimTaskAwardsFromStatus(st2 && st2.body, headers);
             if (award) merge.QwhdSign.bean = award;
@@ -1634,7 +1652,7 @@ function LiveQwhdSign(s) {
           merge.QwhdSign.success = 1;
           const alreadyMsg = /已签|重复|ALREADY|SIGNED/i.test(text);
           merge.QwhdSign.notify = alreadyMsg ? "签到领奖: 今日已签" : "签到领奖: 签到成功";
-          if (AppDailyOnce && isValidPhone(ACCOUNT.phone)) markAppDoneToday(ACCOUNT.phone, { ok: true, points: null });
+          if (AppDailyOnce && lockKey) markAppDoneToday(lockKey, { ok: true, points: null });
           // 抓包成功样例: status=PRIZE_NO_CONFIG, msg=未配置对应奖品, success=true
           if (/PRIZE_NO_CONFIG|未配置对应奖品/i.test(text)) {
             merge.QwhdSign.notify += "（当日奖品未配置，任务进度已记）";
@@ -1666,7 +1684,9 @@ function LiveQwhdSign(s) {
           merge.QwhdSign.notify = "签到领奖: H5 会话无效（返回登录页/404）。请打开一次「签到领奖」后再登录触发";
         } else if (/已签|重复/i.test(text)) {
           merge.QwhdSign.success = 1;
-          merge.QwhdSign.notify = "签到领奖: 今日已签";
+          merge.QwhdSign.silentSkip = true; // domark 返回已签：静默跳过，不推送
+          console.log(`账号 ${maskPhone(ACCOUNT.phone || ACCOUNT.uid || "未知")} domark 返回已签，跳过并落每日锁`);
+          if (AppDailyOnce && lockKey) markAppDoneToday(lockKey, { ok: true });
         } else {
           merge.QwhdSign.error = 1;
           merge.QwhdSign.notify = "签到领奖: 未成功 · " + (mr && mr.error ? mr.error : shortBody(text) || ("HTTP " + (mr && mr.status)));
@@ -2392,6 +2412,11 @@ function notify(tag) {
         if (it.notify) lines.push(it.notify);
         if (it.bean) lines.push(`奖励: ${it.bean}`);
       });
+      // 全静默：今日已签跳过且无奖励、无失败 → 不推送，仅控制台记录（避免重复提示已签到）
+      if (!lines.length && !fail) {
+        console.log(`\n[静默跳过] ${tag || "签到"}：今日已签且无奖励/异常，不推送通知`);
+        return resolve();
+      }
       const t = String(tag || "");
       // 双任务拆分：纯云盘标题用「移动云盘」，避免和 App 任务混在一起
       const isCloudOnly = /·云盘$/.test(t) && !(merge.QwhdSign && merge.QwhdSign.notify);
