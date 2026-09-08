@@ -2,7 +2,7 @@
 
   微信读书(WeRead) 每周翻一翻脚本
 
-  更新时间: 2026-09-08 (capture-v1.2)
+  更新时间: 2026-09-08 (capture-v1.3)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -19,6 +19,11 @@
                 现 weReadHeaders 改发 Cookie: wr_skey/wr_vid；并由
                 WeRead_DailyBonus.js 把翻一翻专用 Cookie 独立存为 item.wrSkey/
                 wrVid，避免被每日签到的 i.weread 登录 skey(同 vid 不同值)覆盖。
+  capture-v1.3: 实跑修正(抓包 2026-09-08-102619)。① ReadCookies 按 vid 去重，
+                修复 WeRead_Cookie 镜像条目导致同账号跑两遍；② 识别业务错误码
+                errcode=-2676(本期 6 次已翻完)→归入「额度已用完」提示，其他
+                errcode 透出到通知；③ 翻牌计数修正：remainingCount=0 的那次
+                翻牌也计入(先计数后 break)，通知「翻了 N 张」与实际一致。
 
   流量结论（抓包 2026-08-24-094839）:
   - 翻牌: GET https://weread.qq.com/flip-card-game/api/flipCardFlip
@@ -122,6 +127,7 @@ async function doFlip(item) {
   let lastResp = null;
   let lastRemaining = null;   // 最近一次翻卡响应的剩余次数
   let authSuspected = false;  // Cookie(wr_skey/wr_vid)疑似失效
+  let lastErrcode = null;     // 最近一次翻牌响应的业务错误码（-2676=本期次数已翻完）
   if (!item.wrSkey) {
     console.log("[WeRead flip] WARN: 未捕获翻一翻专用 Cookie(wr_skey)，将退回 i.weread 登录 skey（翻牌接口不认，大概率失败）。请打开微信读书「翻一翻」页重新抓取凭证");
   }
@@ -153,6 +159,13 @@ async function doFlip(item) {
         authSuspected = true;
         break;
       }
+      if (resp.errcode) {
+        // 业务错误码：-2676=本期翻卡次数已用完（同账号重复执行/已翻完时服务端返回）
+        // 其他错误码仅记录，最终通知里透出，便于定位
+        lastErrcode = Number(resp.errcode);
+        console.log("[WeRead flip] flip #" + i + " errcode=" + resp.errcode + (lastErrcode === -2676 ? "（本期次数已翻完）" : ""));
+        break;
+      }
       if (typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
       // 会话过期: 尝试续期一次后重试
       if (isSessionExpired(resp)) {
@@ -172,13 +185,14 @@ async function doFlip(item) {
           return;
         }
       }
-      // 额度已用完：不再计数，直接停止
+      // 本次翻牌已实际执行（即使 remainingCount=0，这一次翻牌也真实发生）
+      totalFlipped++;
+      lastResp = resp;
+      // 额度用完则不再发起下一次
       if (typeof lastRemaining === "number" && lastRemaining <= 0) {
         console.log("[WeRead flip] remainingCount=" + lastRemaining + " → 额度已用完，停止翻卡");
         break;
       }
-      totalFlipped++;
-      lastResp = resp;
       const remain = resp.remainingCount;
       if (LogDetails) console.log("[WeRead flip] #" + i + " remaining=" + remain + " cards=" + (resp.cardList || []).length);
     }
@@ -195,18 +209,23 @@ async function doFlip(item) {
           "请打开微信读书 App → 「翻一翻」页面重新抓取凭证后再跑";
         return;
       }
-      if (typeof lastRemaining === "number" && lastRemaining <= 0) {
+      if ((typeof lastRemaining === "number" && lastRemaining <= 0) || lastErrcode === -2676) {
         merge.Flip.success = 1;
         merge.Flip.notify =
           "微信读书翻一翻: 本期额度已用完 ✅\n" +
-          "remainingCount=" + lastRemaining + "（每周二 8:00 刷新 6 次）";
+          (lastErrcode === -2676 && typeof lastRemaining !== "number"
+            ? "errcode=-2676（本期 6 次已翻完，多为同账号重复执行）"
+            : "remainingCount=" + lastRemaining) +
+          "（每周二 8:00 刷新 6 次）";
         return;
       }
       // 未知空响应（非周二刷新前 / 接口异常）
       merge.Flip.success = 1;
       merge.Flip.notify =
-        "微信读书翻一翻: 本期无卡可翻（remainingCount=" +
-        (typeof lastRemaining === "number" ? lastRemaining : "未知") +
+        "微信读书翻一翻: 本期无卡可翻（" +
+        (lastErrcode
+          ? "errcode=" + lastErrcode
+          : "remainingCount=" + (typeof lastRemaining === "number" ? lastRemaining : "未知")) +
         "，每周二 8:00 刷新 6 次）";
       return;
     }
@@ -321,7 +340,14 @@ function ReadCookies() {
       if (isValidCookie(o)) list.unshift(o);
     } catch (e) {}
   }
-  return list.filter(isValidCookie);
+  // 按 vid 去重：WeRead_Cookie 是 WeRead_Cookies[0] 的镜像，不去重会同账号跑两遍
+  const seen = {};
+  return list.filter(isValidCookie).filter((x) => {
+    const k = String(x.vid).toLowerCase();
+    if (seen[k]) return false;
+    seen[k] = 1;
+    return true;
+  });
 }
 
 function shortVid(v) {
