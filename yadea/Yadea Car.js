@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.12 充电状态修正：实测充电中 chgStatus=2(旧值1永不命中致充电UI失效)；remainChgTime1 单位为分钟(原按毫秒换算恒为空)
 // v2.11 坐标系修正：TSP 下发坐标实测为 GCJ02，移除 WGS84→GCJ02 转换(偏移约600m跨浏阳河)；缓存文件名加 c2 后缀强制刷新
 // v2.10 修复"未知位置"：iOS 逆地理在 Widget 上下文持续失败时增加高德 regeo API 兜底(复用 amapApiKey)；异常内容写入日志
 // v2.9 移除胎压告警图标(leftXxxPressureWarning 实测正常胎压时=7，非告警语义，误报)
@@ -34,7 +35,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.11";
+const SCRIPT_VERSION = "v2.12";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -931,7 +932,7 @@ function renderAccessoryWidget(data, vin) {
 
   // 中央状态图标：充电用闪电，其他用车辆图形
   let iconName = "bicycle";
-  if (status.chgStatus === 1) iconName = "bolt.fill";
+  if (status.chgStatus === 2) iconName = "bolt.fill";
   const icon = safeSymbol(iconName);
   if (icon) {
     circle.drawImageAtPoint(icon, new Point(30, 34));
@@ -957,7 +958,9 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
   const vehicle = await loadCarContext(runtimeContext, runtimeConfig, data, vin);
   const status = vehicle.status;
   const soc = status.totalSoc != null ? status.totalSoc : (status.soc1 || 0);
-  const charging = status.chgStatus === 1;
+  // v2.12 实测修正：充电中 chgStatus=2（2026-09-08 抓包解密：chgStatus=2 且 realTimeChargeWatt=234W、cur=-3.0），
+  // 旧值 1 永远不命中，导致充电 UI 全部失效
+  const charging = status.chgStatus === 2;
   const riding = status.rideStatus === 1;
 
   // 刷新策略：骑行 10 秒 / 充电 30 秒 / 其他 60 秒（refreshAfterDate 只是最早刷新时间）
@@ -1118,16 +1121,16 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
 
   /**
    * 仅充电中显示充电信息行（对齐 Telsa renderChargingStatus）。
-   * realTimeChargeWatt 单位未确认，只显示原始值 + W；剩余时间由 remainChgTime1 换算。
+   * v2.12 实测：remainChgTime1 单位为分钟（充电中实测 314，若为毫秒/秒换算结果均不合理），
+   * 旧代码按毫秒 ÷60000 换算导致剩余时间恒为空；realTimeChargeWatt 单位未确认，只显示原始值 + W。
    */
   function renderChargingStatus() {
     if (!charging) return;
     let timeText = "";
-    const remainMs = status.remainChgTime1 || 0;
-    if (remainMs > 0) {
-      const totalMin = Math.floor(remainMs / 60000);
-      const hour = Math.floor(totalMin / 60);
-      const min = totalMin - hour * 60;
+    const remainMin = status.remainChgTime1 || 0;
+    if (remainMin > 0) {
+      const hour = Math.floor(remainMin / 60);
+      const min = remainMin - hour * 60;
       if (hour > 0) timeText = hour + "h";
       if (min > 0) timeText = timeText + min + "m";
     }
