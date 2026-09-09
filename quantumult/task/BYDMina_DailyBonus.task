@@ -1,4 +1,5 @@
-## 比亚迪小程序 每日签到（BYDMina_DailyBonus capture-v1）
+## 比亚迪小程序 每日签到（BYDMina_DailyBonus capture-v3, jsDelivr 镜像）
 ## 前置：挂载 rewrite/BYDMina_DailyBonus.conf，手机微信打开小程序抓一次 session
+## 注：raw.githubusercontent.com 直连/代理均不稳（曾连续返回空），全链路走 jsDelivr
 
-30 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYDMina_DailyBonus.js, tag=比亚迪小程序签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
+30 8 * * * https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/scripts/BYDMina_DailyBonus.js, tag=比亚迪小程序签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
