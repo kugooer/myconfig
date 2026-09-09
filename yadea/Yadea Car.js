@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.13 修复v2.10回归：iOS逆地理路径漏写缓存致地址每次重请求；静态地图失败时输出具体异常+高德info错误码（定位Key/配额问题）
 // v2.12 充电状态修正：实测充电中 chgStatus=2(旧值1永不命中致充电UI失效)；remainChgTime1 单位为分钟(原按毫秒换算恒为空)
 // v2.11 坐标系修正：TSP 下发坐标实测为 GCJ02，移除 WGS84→GCJ02 转换(偏移约600m跨浏阳河)；缓存文件名加 c2 后缀强制刷新
 // v2.10 修复"未知位置"：iOS 逆地理在 Widget 上下文持续失败时增加高德 regeo API 兜底(复用 amapApiKey)；异常内容写入日志
@@ -35,7 +36,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.12";
+const SCRIPT_VERSION = "v2.13";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -796,7 +797,9 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
       // 空结果不写缓存，避免"未知位置"被固化
       if (Array.isArray(location) && location.length) {
         json = location;
-        console.log("逆地理来源: iOS");
+        // v2.13 修复回归：v2.10 起此路径漏写缓存，导致地址每次刷新都重新请求（现象：地址总是"最新的"）
+        fm.writeString(geoFile, JSON.stringify(location));
+        console.log("逆地理来源: iOS(已写缓存)");
       } else {
         console.log("逆地理结果为空，尝试高德兜底");
       }
@@ -850,6 +853,10 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
       image = null;
     }
   }
+  if (!runtimeConfig.amapApiKey) {
+    // v2.13 诊断：Key 为空时地图分支整体跳过，只能永远显示旧缓存图——日志明确提示
+    console.log("未配置高德Key，静态地图仅用缓存" + (moved ? "（车辆已移动但无法刷新地图）" : ""));
+  }
   if ((image == null || moved) && runtimeConfig.amapApiKey) {
     try {
       const url = `https://restapi.amap.com/v3/staticmap?scale=2` +
@@ -859,9 +866,21 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
       const req = new Request(url);
       image = await req.loadImage();
       fm.writeImage(mapFile, image);
+      // v2.13 诊断：成功输出标记，确认地图分支确实执行并写入
+      console.log("静态地图已更新");
     } catch (e) {
-      // 异常对象可能包含带高德 Key 的完整 URL，仅输出固定文案
-      console.log("静态地图加载失败");
+      // v2.13 诊断：输出具体异常，并尝试读取高德错误 JSON 的 info 字段（如配额超限/Key无效）
+      let amapInfo = "";
+      try {
+        const probe = new Request(url);
+        const errText = await probe.loadString();
+        if (errText && errText.indexOf("{") >= 0) {
+          const errJson = JSON.parse(errText);
+          amapInfo = " info=" + (errJson ? errJson.info || errJson.infocode || "?" : "?");
+        }
+      } catch (e2) {}
+      console.log("静态地图加载失败: " + (e && e.message ? e.message : String(e)) + amapInfo +
+        (image != null ? "（沿用旧缓存图）" : ""));
       if (image == null && fm.fileExists(mapFile)) {
         try { image = fm.readImage(mapFile); } catch (e2) {}
       }
