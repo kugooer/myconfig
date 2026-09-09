@@ -2,7 +2,7 @@
 
   微信读书(WeRead) 我的阅读奖励领取脚本
 
-  更新时间: 2026-08-25 (capture-v1.0)
+  更新时间: 2026-09-09 (capture-v1.1)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -11,6 +11,9 @@
                 flip-card-game/api 路径；本端点用 header vid/skey，与
                 每日签到同源，无需额外 conf)。
                 每周三、周五定时领取「我的阅读」时长/天数奖励。
+  capture-v1.1: ReadCookies 按 vid 去重。原把 WeRead_Cookie(镜像条目)也
+                读入且不去重 → 同账号跑两遍，第二遍全部"已领取"，
+                误报「暂无可领奖励」(实跑 2026-09-09 08:10 实证)。
 
   流量结论（抓包 2026-08-25-102006）:
   - 端点: POST https://i.weread.qq.com/weekly/exchange
@@ -275,7 +278,15 @@ function ReadCookies() {
       if (isValidCookie(o)) list.unshift(o);
     } catch (e) {}
   }
-  return list.filter(isValidCookie);
+  // 按 vid 去重：WeRead_Cookie 是 WeRead_Cookies[0] 的镜像，不去重会同账号跑两遍
+  // (第二遍全部"已领取"→误报「暂无可领奖励」，与 FlipCard capture-v1.3 同款修复)
+  const seen = {};
+  return list.filter(isValidCookie).filter((x) => {
+    const k = String(x.vid).toLowerCase();
+    if (seen[k]) return false;
+    seen[k] = 1;
+    return true;
+  });
 }
 
 function shortVid(v) {
