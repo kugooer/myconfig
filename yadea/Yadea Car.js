@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.17 骑行状态修正：实测骑行中 rideStatus=3(旧假设1永不命中→图标恒P)；联动实测 powerState 1=上电、enterPark 2=骑行
 // v2.16 "查看当前数据"补跑 car_geo 链路并输出 GeoSummary(坐标/prevStatus/moved/地址/地图缓存存在性)
 // v2.15 地图缓存文件名 c2→c3：强制补拉当前位置图，纠正 v2.13 时代固化在缓存里的旧位置地图
 // v2.14 关键修复"地图不随移动更新"：car_data 缓存在读取上次坐标前已被本次数据覆盖，hasCarMoved 恒 false；
@@ -40,7 +41,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.16";
+const SCRIPT_VERSION = "v2.17";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -996,7 +997,9 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
   // v2.12 实测修正：充电中 chgStatus=2（2026-09-08 抓包解密：chgStatus=2 且 realTimeChargeWatt=234W、cur=-3.0），
   // 旧值 1 永远不命中，导致充电 UI 全部失效
   const charging = status.chgStatus === 2;
-  const riding = status.rideStatus === 1;
+  // v2.17 实测修正：骑行中 rideStatus=3（2026-09-09 骑行抓包两条响应均为 3，且 powerState=1/enterPark=2 联动），
+  // 旧假设值 1 永不命中 → 图标恒为 P；0=停驻、3=骑行（枚举实测）
+  const riding = status.rideStatus === 3;
 
   // 刷新策略：骑行 10 秒 / 充电 30 秒 / 其他 60 秒（refreshAfterDate 只是最早刷新时间）
   if (riding) {
