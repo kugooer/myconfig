@@ -1,0 +1,4 @@
+## 比亚迪小程序 每日签到（BYDMina_DailyBonus capture-v1）
+## 前置：挂载 rewrite/BYDMina_DailyBonus.conf，手机微信打开小程序抓一次 session
+
+30 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/BYDMina_DailyBonus.js, tag=比亚迪小程序签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
