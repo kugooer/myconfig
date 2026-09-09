@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.16 "查看当前数据"补跑 car_geo 链路并输出 GeoSummary(坐标/prevStatus/moved/地址/地图缓存存在性)
 // v2.15 地图缓存文件名 c2→c3：强制补拉当前位置图，纠正 v2.13 时代固化在缓存里的旧位置地图
 // v2.14 关键修复"地图不随移动更新"：car_data 缓存在读取上次坐标前已被本次数据覆盖，hasCarMoved 恒 false；
 //        改为覆盖前读出 prevStatus 随数据传递（对齐 Telsa prev_geodata 语义）
@@ -39,7 +40,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.15";
+const SCRIPT_VERSION = "v2.16";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -1448,6 +1449,17 @@ async function main() {
   const data = await loadVehicleDataWithCache(runtimeConfig, runtimeContext.fm, dataFile);
   const soc = data.status.totalSoc != null ? data.status.totalSoc : (data.status.soc1 || 0);
   console.log(JSON.stringify(data, null, 2));
+  // v2.16：补跑 car_geo 链路并输出摘要，让"查看当前数据"同时暴露地图/逆地理的诊断信息
+  await loadCarContext(runtimeContext, runtimeConfig, data, vin);
+  const mapC3File = runtimeContext.fm.joinPath(runtimeContext.fileRoot, `car_map_c3_${vin}.png`);
+  const geoSummary = {
+    curCoord: { lat: data.status.lat, lng: data.status.lon },
+    prevStatus: data.prevStatus,
+    moved: hasCarMoved({ lat: data.status.lat, lng: data.status.lon }, data.prevStatus),
+    geofence: data.car_geo ? data.car_geo.geofence : null,
+    mapCacheExists: runtimeContext.fm.fileExists(mapC3File)
+  };
+  console.log("[GeoSummary] " + JSON.stringify(geoSummary, null, 2));
   // 显示名从本地昵称缓存读取，避免额外请求；仅用昵称，无昵称显示"没有昵称"
   let displayName = "没有昵称";
   try {
