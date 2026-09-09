@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.15 地图缓存文件名 c2→c3：强制补拉当前位置图，纠正 v2.13 时代固化在缓存里的旧位置地图
 // v2.14 关键修复"地图不随移动更新"：car_data 缓存在读取上次坐标前已被本次数据覆盖，hasCarMoved 恒 false；
 //        改为覆盖前读出 prevStatus 随数据传递（对齐 Telsa prev_geodata 语义）
 // v2.13 修复v2.10回归：iOS逆地理路径漏写缓存致地址每次重请求；静态地图失败时输出具体异常+高德info错误码（定位Key/配额问题）
@@ -38,7 +39,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.14";
+const SCRIPT_VERSION = "v2.15";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -856,9 +857,10 @@ async function getCarGeo(runtimeContext, runtimeConfig, vin, status, prevCoord, 
     geofence = (json.regeocode.addressComponent && json.regeocode.addressComponent.township) || geofence;
   }
 
-  // 静态地图缓存：车辆未移动且已有图片时直接复用（文件名带 c2 后缀，强制按修正坐标重新拉图）
+  // 静态地图缓存：车辆未移动且已有图片时直接复用（文件名带 c3 后缀，v2.15 强制补拉一张当前位置的图，
+  // 纠正 v2.13 时代 moved 恒 false 期间固化的旧位置地图；此后随 prevStatus 移动判断正常增量刷新）
   let image = null;
-  const mapFile = fm.joinPath(runtimeContext.fileRoot, `car_map_c2_${vin}.png`);
+  const mapFile = fm.joinPath(runtimeContext.fileRoot, `car_map_c3_${vin}.png`);
   if (fm.fileExists(mapFile)) {
     try {
       image = fm.readImage(mapFile);
