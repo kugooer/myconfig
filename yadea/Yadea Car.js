@@ -23,6 +23,8 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.14 关键修复"地图不随移动更新"：car_data 缓存在读取上次坐标前已被本次数据覆盖，hasCarMoved 恒 false；
+//        改为覆盖前读出 prevStatus 随数据传递（对齐 Telsa prev_geodata 语义）
 // v2.13 修复v2.10回归：iOS逆地理路径漏写缓存致地址每次重请求；静态地图失败时输出具体异常+高德info错误码（定位Key/配额问题）
 // v2.12 充电状态修正：实测充电中 chgStatus=2(旧值1永不命中致充电UI失效)；remainChgTime1 单位为分钟(原按毫秒换算恒为空)
 // v2.11 坐标系修正：TSP 下发坐标实测为 GCJ02，移除 WGS84→GCJ02 转换(偏移约600m跨浏阳河)；缓存文件名加 c2 后缀强制刷新
@@ -36,7 +38,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.13";
+const SCRIPT_VERSION = "v2.14";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -709,7 +711,18 @@ async function loadVehicleDataWithCache(runtimeConfig, fm, file, retried = false
     } catch (e) {
       console.log("电池摘要请求失败，忽略");
     }
-    const combined = { status: status, batt: batt, fetchedAt: Date.now() };
+    // v2.14 关键修复：在覆盖写缓存前读出"上次坐标"，随数据返回。
+    // 旧逻辑先写后读导致 loadCarContext 拿到的 prevCoord 恒等于当前坐标 → hasCarMoved 恒 false → 地图永不刷新
+    let prevStatus = null;
+    try {
+      const old = JSON.parse(fm.readString(file));
+      if (old && old.status) {
+        prevStatus = { lat: old.status.lat, lng: old.status.lon };
+      }
+    } catch (e) {
+      prevStatus = null;
+    }
+    const combined = { status: status, batt: batt, fetchedAt: Date.now(), prevStatus: prevStatus };
     // 仅在通过契约校验后写缓存，防止空数据毒化缓存（v2.0 缺陷）
     fm.writeString(file, JSON.stringify(combined));
     return combined;
@@ -1247,19 +1260,11 @@ async function renderMediumWidget(runtimeContext, runtimeConfig, data, vin) {
 async function loadCarContext(runtimeContext, runtimeConfig, data, vin) {
   const fm = runtimeContext.fm;
   const status = data.status;
-  const file = fm.joinPath(runtimeContext.fileRoot, `car_data_${vin}.json`);
 
-  // 上一坐标：来自上次写回的缓存；首次以当前坐标初始化
-  let prevCoord = null;
-  try {
-    const prevRaw = fm.readString(file);
-    const prevData = JSON.parse(prevRaw);
-    if (prevData && prevData.status) {
-      prevCoord = { lat: prevData.status.lat, lng: prevData.status.lon };
-    }
-  } catch (e) {
-    prevCoord = null;
-  }
+  // v2.14 关键修复：上一坐标改用 loadVehicleDataWithCache 在覆盖缓存前读出的 prevStatus。
+  // 旧逻辑从 car_data 文件读"上次坐标"，但该文件在本刷新内已被当前数据覆盖，
+  // prevCoord 恒等于当前坐标 → hasCarMoved 恒 false → 地图/逆地理的移动判断永远不触发。
+  let prevCoord = data.prevStatus || null;
 
   const curCoord = { lat: status.lat, lng: status.lon };
   data.prev_coord = prevCoord || curCoord;
