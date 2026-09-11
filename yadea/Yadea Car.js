@@ -23,6 +23,7 @@
  */
 
 // 脚本版本号：每次变更递增，便于真机日志定位
+// v2.18 新增积分签到：手动(App菜单"积分签到")+自动(Widget刷新每日一次,guard防重复)；接口契约来自2026-09-10抓包解密；yadeaRequest 错误携带服务端 msg
 // v2.17 骑行状态修正：实测骑行中 rideStatus=3(旧假设1永不命中→图标恒P)；联动实测 powerState 1=上电、enterPark 2=骑行
 // v2.16 "查看当前数据"补跑 car_geo 链路并输出 GeoSummary(坐标/prevStatus/moved/地址/地图缓存存在性)
 // v2.15 地图缓存文件名 c2→c3：强制补拉当前位置图，纠正 v2.13 时代固化在缓存里的旧位置地图
@@ -41,7 +42,7 @@
 // v2.2 缓存自愈(毒化缓存删除+重试)
 // v2.1 网关空data契约校验
 // v2.0 按 teslamate-widget 规范重构
-const SCRIPT_VERSION = "v2.17";
+const SCRIPT_VERSION = "v2.18";
 
 const MEDIUM_WIDGET_HEIGHT = 176;
 const MAP_PANEL_SIZE = 176;
@@ -639,7 +640,8 @@ async function yadeaRequest(runtimeConfig, path, params, retry = true) {
     return yadeaRequest(runtimeConfig, path, params, false);
   }
   if (json.code !== "000000") {
-    throw new Error("网关错误 " + json.code);
+    // v2.18：携带服务端 msg（如签到接口的"今日已签到"），供调用方展示/判断
+    throw new Error("网关错误 " + json.code + (json.msg ? "：" + json.msg : ""));
   }
   return json.data;
 }
@@ -657,6 +659,88 @@ function getVehRealStatus(runtimeConfig, vin) {
 /** 查询电池摘要（soc、soh、循环次数等） */
 function getBattInfo(runtimeConfig, vin) {
   return yadeaRequest(runtimeConfig, "/api/app/battSummary/queryBattInfo", { vin: vin, type: 0 });
+}
+
+// ============================ 积分签到 ============================
+// v2.18 新增：接口契约来自 2026-09-10 07:30 抓包解密（/Downloads/2026-09-10-200506）
+//   - GET /api/app/userappruleinfo/addsigninbyuseridNew        执行签到 → data:1
+//   - GET /api/app/userappruleinfo/queryuserappruleinfobyuserid 规则/状态 → {integral 总积分, signinDay 连续天数, isSignin, nickName}
+//   - 两个接口均无业务参数，鉴权与签名复用 yadeaRequest
+
+/** 查询签到信息：{ integral 总积分, signinDay 连续签到天数, isSignin, nickName } */
+function getSigninRuleInfo(runtimeConfig) {
+  return yadeaRequest(runtimeConfig, "/api/app/userappruleinfo/queryuserappruleinfobyuserid", {});
+}
+
+/** 执行签到动作。成功返回 data（1）；已签到等业务错误抛 Error（含服务端 msg） */
+function doSignin(runtimeConfig) {
+  return yadeaRequest(runtimeConfig, "/api/app/userappruleinfo/addsigninbyuseridNew", {});
+}
+
+/** 本地日期字符串 YYYY-MM-DD（自动签到的每日 guard 用） */
+function localDateStr(d) {
+  const p = function (n) { return n < 10 ? "0" + n : "" + n; };
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+/**
+ * 每日自动签到（Widget 刷新时静默执行）：
+ * 当天未签过才调用；成功或确认"已签"后写入 guard 文件防止重复调用；
+ * 网络类失败不写 guard，下次刷新重试。结果通过系统通知反馈，失败不打扰。
+ */
+async function autoSigninDaily(runtimeConfig, fm, fileRoot) {
+  const guardFile = fm.joinPath(fileRoot, "signin_guard.json");
+  const today = localDateStr(new Date());
+  let guardDate = "";
+  try {
+    guardDate = JSON.parse(fm.readString(guardFile)).date || "";
+  } catch (e) {
+    guardDate = "";
+  }
+  if (guardDate === today) return;
+  try {
+    await doSignin(runtimeConfig);
+    let info = null;
+    try { info = await getSigninRuleInfo(runtimeConfig); } catch (e) {}
+    notifySignin("雅迪自动签到成功",
+      "连续 " + (info ? info.signinDay : "?") + " 天 · 总积分 " + (info ? info.integral : "?"));
+  } catch (e) {
+    console.log("自动签到: " + e.message);
+    // 服务端明确表示已签到时写 guard，避免当日重复调用；其他失败留给下次刷新重试
+    if (e.message.indexOf("已签") >= 0) {
+      try { fm.writeString(guardFile, JSON.stringify({ date: today })); } catch (e2) {}
+    }
+    return;
+  }
+  try { fm.writeString(guardFile, JSON.stringify({ date: today })); } catch (e) {}
+}
+
+/** 签到结果系统通知（Scriptable Notification；失败静默） */
+function notifySignin(title, body) {
+  try {
+    const n = new Notification();
+    n.title = title;
+    n.body = body;
+    n.sound = "default";
+    n.schedule();
+  } catch (e) {}
+}
+
+/** 手动签到流程（App 菜单触发）：执行签到 → 查询最新积分 → Alert 展示结果 */
+async function manualSigninFlow(runtimeConfig) {
+  const alert = new Alert();
+  try {
+    await doSignin(runtimeConfig);
+    let info = null;
+    try { info = await getSigninRuleInfo(runtimeConfig); } catch (e) {}
+    alert.title = "签到成功";
+    alert.message = "连续签到 " + (info ? info.signinDay : "?") + " 天 · 总积分 " + (info ? info.integral : "?");
+  } catch (e) {
+    alert.title = "签到未完成";
+    alert.message = e.message;
+  }
+  alert.addAction("好");
+  await alert.presentAlert();
 }
 
 // ============================ 缓存与车辆上下文 ============================
@@ -1396,6 +1480,13 @@ async function main() {
     const runtimeConfig = configState.value;
     runtimeConfig.vin = runtimeConfig.vin || (args.widgetParameter || "").trim();
 
+    // v2.18：每日自动签到（guard 文件防重复；失败静默重试，不影响主流程）
+    try {
+      await autoSigninDaily(runtimeConfig, runtimeContext.fm, runtimeContext.fileRoot);
+    } catch (e) {
+      console.log("自动签到异常: " + e.message);
+    }
+
     let vin = runtimeConfig.vin;
     if (!vin) {
       // 无 VIN 配置：从本地 auto 记录读取上次 VIN，避免 Widget 额外请求
@@ -1436,11 +1527,16 @@ async function main() {
   menu.title = "雅迪电动车组件";
   menu.message = "配置已就绪";
   menu.addAction("查看当前数据");
+  menu.addAction("积分签到");
   menu.addAction("管理配置");
   menu.addCancelAction("取消");
   const choice = await menu.presentSheet();
-  if (choice === 1) {
+  if (choice === 2) {
     await presentConfigForm(runtimeConfig);
+    return;
+  }
+  if (choice === 1) {
+    await manualSigninFlow(runtimeConfig);
     return;
   }
   if (choice !== 0) return;
