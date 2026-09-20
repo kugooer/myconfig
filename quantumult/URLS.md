@@ -94,10 +94,20 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_
 
 活动页：`https://dev.coc.10086.cn/coc/web6/dailyLoginEvent/index?pageId=2090341662452445184&channelId=P00000005743`
 
+**优先用 jsDelivr 镜像**（raw.githubusercontent 对 conf/task 实测超时返回空，与 BYDMina capture-v3 同一问题）：
+
 ```text
-重写：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
-任务：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_SevenDayClockIn.task
-脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js
+重写：https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
+任务：https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/task/CMCC_SevenDayClockIn.task
+脚本：https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/scripts/CMCC_SevenDayClockIn.js
+```
+
+raw 备选：
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_SevenDayClockIn.task
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js
 ```
 
 ```text
