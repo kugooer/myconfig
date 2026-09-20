@@ -92,18 +92,12 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_
 
 ### ③ 中国移动 · 7日打卡分百万（新活动，独立脚本）
 
-活动页：`https://dev.coc.10086.cn/coc/web6/dailyLoginEvent/index?pageId=2090341662452445184&channelId=P00000005743`
+活动页：`https://dev.coc.10086.cn/coc/web6/dailyLoginEvent/?pageId=2090341662452445184&channelId=P00000005743`
 
 **重写**
 
 ```text
 https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
-```
-
-**任务**
-
-```text
-https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_SevenDayClockIn.task
 ```
 
 **脚本**
@@ -112,23 +106,57 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_Sev
 https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js
 ```
 
+**任务（可选 · 默认已停用）**
+
 ```text
-40 8 * * * .../scripts/CMCC_SevenDayClockIn.js, tag=移动7日打卡, argument=sign, enabled=true
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_SevenDayClockIn.task
 ```
 
 MITM 仅需 **`dev.coc.10086.cn`**（单主机，勿扩域）。
+
+#### 怎么用（capture-v2 · 打开活动页即打卡）
+
+1. 挂载「重写 + 脚本」两个资源 → 重写资源右上角更新 → MITM 勾选 `dev.coc.10086.cn`
+2. App 里打开**任意一个 dev.coc 活动页**（含「7日打卡分百万」）→ 重写层从 `loginCheck` 响应读到新 `User-Token` → 立即查状态 → 未签则自动打卡
+3. 已签则全程静默；打卡成功推送「打开活动页即完成打卡」
+4. 首次建议先开一次「7日打卡分百万」页抓加密载荷（此后换任意活动页都能顺带打卡）
+
+#### ⚠️ 为什么没做成定时任务（2026-09-20 实测）
+
+| 事实 | 证据 |
+|------|------|
+| `User-Token` 只活 **30 分钟** | 响应头 `Set-Cookie: User-Token=…; Max-Age=1800`；抓包 1.5 小时后重放 4 个 token → 全部 `code 40 无权限` |
+| 发令牌的 `loginCheck` **只有活动 WebView 页会调** | 全抓包 10/10 次 UA 均为 `wkwebview`、Referer 均为活动 H5 页；原生 `fingerprintLogin` 不碰 `dev.coc.10086.cn` |
+| `loginCheck` 依赖 **JSBridge 注入的一次性票根** | 明文 body `{"verifyType":18,"ext":"YZsidssolg<32hex>"}`，该 ext 无任何响应发放；重放旧票 → `0130104201 登录失败` |
+
+⇒ **做不到「打开 App 登录即签到」**：dev.coc 活动只能「开页驱动」。隔夜 cron 必然失败，故 `.task` 默认 `enabled=false`，仅作「刚开过页面时」的手动兜底：
+
+```text
+40 8 * * * .../scripts/CMCC_SevenDayClockIn.js, tag=移动7日打卡, argument=sign, enabled=false
+```
 
 #### 机制（2026-09-20 抓包逆向结论）
 
 | 接口 | 方法 | 加密 | 说明 |
 |------|------|------|------|
+| `/coc/user/loginCheck` | POST | 请求加密 / 响应**明文** | 下发 `User-Token`；响应 `data.token` 可直接读 → 脚本**主触发点** |
 | `/coc/activities/prize/consecutiveClockInQuery` | POST | **明文** | body `{"activityId":"2095709942208745472"}`；返回 `clockInDateList`（含当日=已签） |
 | `/coc/activities/prize/clockIn` | POST | **加密** | body `{"cocEnContent":"<AES-GCM>"}` + 头 `coc-aurora:<RSA 包裹的 AES 密钥>`、`coc-en-version` |
 
 - 加密由 **WASM 模块 Wheel**（`wheel_bg.wasm`，`roto()`）完成，QX JavaScriptCore 内**无法重算** → 走「冻结载荷重放」
 - `gDT` 接口只下发一次性 UUID 设备令牌；`coc-aurora` = RSA 加密的 AES 密钥，`cocEnContent` = 该密钥下的 AES-GCM 密文
-- **载荷是设备级、非账号级**：同一份载荷配任意有效 `User-Token` 均可通过解密校验（实测 8 小时后仍可解密）；账号维度只由 `Cookie: User-Token=000_<32hex>` 决定
-- 鉴权仅需 `User-Token`；缺失返回 `code 40 无权限`
+- **载荷是设备级、非账号级**：同一份载荷配任意有效 `User-Token` 均可通过解密校验；账号维度只由 `Cookie: User-Token=000_<32hex>` 决定
+- 7 日页打开后页面**自己会在 1 秒内自动打卡**（无需点按钮），故该页默认不重复注入
+
+#### 可调开关（脚本头部）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `SevenDayInjectOnOtherPage` | true | 在非 7 日页的活动页上注入补打卡 |
+| `SevenDayInjectOnOwnPage` | false | 在 7 日页注入（页面自己会签，开启可能抢跑） |
+| `SevenDayInjectTimeoutMs` | 6000 | 注入硬超时；超时立即放行响应，不拖死活动页 |
+| `SevenDayEnable` / `SevenDayAutoSign` | true | 总开关 / 自动补打卡 |
+| `SevenDayTokenLabels` | `{}` | 给 Token 配可读名字，便于通知区分账号 |
 
 #### 错误码字典（实测）
 
@@ -142,11 +170,18 @@ MITM 仅需 **`dev.coc.10086.cn`**（单主机，勿扩域）。
 
 #### 挂载后操作
 
-1. App 内打开一次「7日打卡分百万」页 → 重写层自动抓取 `User-Token`（每次打开刷新）+ 冻结载荷
-2. 定时任务 `argument=sign`：逐个 Token 查状态；**未签才重放打卡**，已签整轮静默不推送
-3. 若通知出现「解密失败/无权限/未签但无冻结载荷」→ 再打开一次活动页刷新凭证
+1. App 内打开任意 dev.coc 活动页 → 自动抓取 `User-Token`（每次开页刷新）并顺带补打卡
+2. 首次建议先开一次「7日打卡分百万」页：页面自己会打卡，同时把加密载荷抓下来
+3. 若通知出现「解密失败/无权限/未签但无冻结载荷」→ 再打开一次 7 日页刷新凭证与载荷
 4. 清空凭证重抓：任务参数改 `DeleteCookie=true` 跑一次，再改回 `sign`
-5. 账号数超出预期时，可在脚本 `SevenDayTokenLabels` 里给 Token 配可读名字，便于通知区分
+
+#### 行为对照（capture-v2）
+
+| 触发 | 是否查状态 | 是否打卡 |
+|------|-----------|---------|
+| 打开**非** 7 日页活动页（如 ageFeedbackV2） | 是 | 未签才打卡（注入） |
+| 打开 **7 日页** | 否（页面自己会跑） | 页面自动打卡 |
+| 定时任务 `argument=sign`（默认停用） | 是 | 未签才打卡（需令牌仍有效） |
 
 ---
 
