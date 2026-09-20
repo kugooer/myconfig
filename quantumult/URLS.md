@@ -87,6 +87,54 @@ https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_
 
 - **每日锁 `AppDailyOnce`（默认开）**：明文手机号当天只成功签到一次；已签返回「今日已签到（本地每日锁）」不打 `domark`；锁键 `CMCC_AppSignedDayMap`（DeleteCookie 时一并清）
 - **登录后延迟 `SignDelayMs`（默认 3500ms，上限 5000）**：`fingerprintLogin` 成功后等 3-5 秒再签到；若日志 `Exception timeout` 请下调；定时 `argument=app` 独立运行兜底，每日锁保证不重复
+- **已签静默（2026-09-08 起）**：三处「已签」路径（本地锁命中 / markstatus 服务端已签 / domark 返回已签）改为只打控制台、**不推送**；`notify()` 在无结果且无失败时整轮静默（`[静默跳过]`），领到奖励或失败仍正常推送
+- **指纹账号锁键修复（2026-09-08）**：锁键新增 `appLockKey()`，优先 `p:<明文手机号>`，无手机号时回退 `u:<uid>` / `t:<ticketId>`（原先仅认明文手机号，导致 `mhrz***` 指纹账号锁不生效、反复提示已签）
+
+### ③ 中国移动 · 7日打卡分百万（新活动，独立脚本）
+
+活动页：`https://dev.coc.10086.cn/coc/web6/dailyLoginEvent/index?pageId=2090341662452445184&channelId=P00000005743`
+
+```text
+重写：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
+任务：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/CMCC_SevenDayClockIn.task
+脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js
+```
+
+```text
+40 8 * * * .../scripts/CMCC_SevenDayClockIn.js, tag=移动7日打卡, argument=sign, enabled=true
+```
+
+MITM 仅需 **`dev.coc.10086.cn`**（单主机，勿扩域）。
+
+#### 机制（2026-09-20 抓包逆向结论）
+
+| 接口 | 方法 | 加密 | 说明 |
+|------|------|------|------|
+| `/coc/activities/prize/consecutiveClockInQuery` | POST | **明文** | body `{"activityId":"2095709942208745472"}`；返回 `clockInDateList`（含当日=已签） |
+| `/coc/activities/prize/clockIn` | POST | **加密** | body `{"cocEnContent":"<AES-GCM>"}` + 头 `coc-aurora:<RSA 包裹的 AES 密钥>`、`coc-en-version` |
+
+- 加密由 **WASM 模块 Wheel**（`wheel_bg.wasm`，`roto()`）完成，QX JavaScriptCore 内**无法重算** → 走「冻结载荷重放」
+- `gDT` 接口只下发一次性 UUID 设备令牌；`coc-aurora` = RSA 加密的 AES 密钥，`cocEnContent` = 该密钥下的 AES-GCM 密文
+- **载荷是设备级、非账号级**：同一份载荷配任意有效 `User-Token` 均可通过解密校验（实测 8 小时后仍可解密）；账号维度只由 `Cookie: User-Token=000_<32hex>` 决定
+- 鉴权仅需 `User-Token`；缺失返回 `code 40 无权限`
+
+#### 错误码字典（实测）
+
+| code | 含义 | 处理 |
+|------|------|------|
+| 0 | 打卡成功 | 通知 |
+| 10 | 领取失败（业务态，通常=今日已领） | 静默 |
+| 40 | 无权限（User-Token 失效） | 提示重开活动页；该 Token 出库 |
+| 50 | 参数不合法（缺 coc-aurora 头） | 提示重开活动页 |
+| 300 | AES-GCM/RSA 解密失败（载荷失效） | 提示重开活动页刷新载荷 |
+
+#### 挂载后操作
+
+1. App 内打开一次「7日打卡分百万」页 → 重写层自动抓取 `User-Token`（每次打开刷新）+ 冻结载荷
+2. 定时任务 `argument=sign`：逐个 Token 查状态；**未签才重放打卡**，已签整轮静默不推送
+3. 若通知出现「解密失败/无权限/未签但无冻结载荷」→ 再打开一次活动页刷新凭证
+4. 清空凭证重抓：任务参数改 `DeleteCookie=true` 跑一次，再改回 `sign`
+5. 账号数超出预期时，可在脚本 `SevenDayTokenLabels` 里给 Token 配可读名字，便于通知区分
 
 ---
 
