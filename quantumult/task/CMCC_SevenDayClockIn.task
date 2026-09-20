@@ -1,7 +1,7 @@
 # 中国移动 · 7日打卡分百万（自动补打卡）
 # Quantumult X → 任务 → 添加资源 / 粘贴下一行
-# 脚本（jsDelivr 镜像，raw 不稳）：https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/scripts/CMCC_SevenDayClockIn.js
-# 配套 rewrite：https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
+# 脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js
+# 配套 rewrite：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
 # 前置：先在 App 打开一次「7日打卡分百万」活动页，让重写层抓到 User-Token 与打卡载荷
 
-40 8 * * * https://cdn.jsdelivr.net/gh/kugooer/myconfig@main/quantumult/scripts/CMCC_SevenDayClockIn.js, tag=移动7日打卡, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=sign, enabled=true
+40 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js, tag=移动7日打卡, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=sign, enabled=true
