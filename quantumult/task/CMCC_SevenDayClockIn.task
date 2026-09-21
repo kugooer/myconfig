@@ -1,17 +1,17 @@
-# 中国移动 · 7日打卡分百万（兜底补打卡 · 默认关闭）
+# 中国移动 · 7日打卡分百万（漏签检查 · 默认关闭）
 # Quantumult X → 任务 → 添加资源 / 粘贴下一行
 # 脚本：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js
 # 配套 rewrite：https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/CMCC_SevenDayClockIn.conf
 #
-# ⚠️ 为什么默认 enabled=false：
-#   User-Token 只有 30 分钟寿命（响应头 Max-Age=1800；实测抓包后 1.5 小时
-#   再查状态即返回 code 40 无权限）。定时任务隔夜运行必然拿不到有效令牌，
-#   而「刚开过活动页」的时间窗内活动页本身已经自动打卡完毕，此任务纯冗余。
+# ⚠️ capture-v3（2026-09-21）：实测冻结载荷是一次性的（页面真实打卡时被消费），
+#   脚本无法替任何账号完成打卡。打卡本体只有「打开 7 日页」这一个动作。
+#   本任务的角色收窄为「漏签检查」：逐个有效 Token 查状态，
+#   发现「今日未签」才推送提醒；全部已签 / 凭证过期一律静默。
 #
-# 主路径已改为 rewrite 注入：打开任意 dev.coc 活动页 → 重写层从 loginCheck
-# 响应抓到新 User-Token → 立即查状态并补打卡。日常无需本定时任务。
+# ⚠️ 时间窗：User-Token 仅 30 分钟有效（响应头 Max-Age=1800）。
+#   任务时间必须落在你每天开完 App 后的 30 分钟内（当前设为 08:40）。
+#   隔夜跑必然全部 code 40 过期 → 静默 + 清理死 Token，不会骚扰。
 #
-# 如需临时启用（例如刚开过活动页想手动补签一次），把末尾 enabled 改为 true，
-# 并在 QX 任务里手动「运行一次」；否则保持 false。
+# 如无需漏签提醒可保持 enabled=false；仅抓凭证（rewrite 通道）不受本开关影响。
 
 40 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/CMCC_SevenDayClockIn.js, tag=移动7日打卡, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/China_Mobile.png, argument=sign, enabled=false

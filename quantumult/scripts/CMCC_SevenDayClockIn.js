@@ -25,39 +25,42 @@
  *   4) 对比「签到领奖」之所以能登录即签：wx.10086.cn/qwhdsso/appTokenLogin 这条链
  *      可用抓到的 App 会话程序化走完（见 CMCC_DailyBonus.js 的 ensureQwhdSession），
  *      而 dev.coc.10086.cn 侧没有等价的、可由 App 会话驱动的换票入口。
- *   ⇒ 结论：dev.coc 活动只能「开页驱动」。故本脚本把触发点放在 loginCheck 响应上：
- *     任何活动页开一次，拿到新令牌后立即补打卡（见 SevenDayInjectOnOtherPage）。
+ *   ⇒ 结论：dev.coc 活动只能「开页驱动」。
  *
  * 加密链路（逆向实测结论）:
  *   - 加密由 WASM 模块 Wheel 完成（roto 返回 [coc-aurora, cocEnContent]），
  *     无法在 QX JavaScriptCore 内重算 → 采用「冻结载荷重放」(路线 B)。
  *   - coc-aurora 是 RSA 加密的 AES 密钥，cocEnContent 是该密钥下的 AES-GCM 密文；
  *     改坏任一者服务端分别报 "RSA解密AES密钥失败" / "AES-GCM解密失败: Tag mismatch"。
- *   - 冻结载荷为「设备级」而非账号级：同一份载荷配不同账号的 User-Token 均可通过解密校验。
- *     账号维度只由 Cookie: User-Token 决定 ⇒ 只需 1 份载荷 + 每账号 1 个 User-Token。
+ *   - ⚠️ 2026-09-21 实测修正「载荷设备级可跨账号共用」的早期判断：
+ *     换任意账号的 Token 重放，服务端**都能正常解密**（不会报 300），
+ *     但业务层统一返回 code 10 —— 载荷是**一次性**的（或与生成它的那次打卡绑定），
+ *     被页面消费过一次后即不可再用。
+ *     2026-09-21 早晨 4 个未签账号在各自 7 日页打开前注入，全部 code 10；
+ *     最终 5 个号全部由用户手工完成 ⇒ 「1 份载荷代打 N 个号」不成立。
+ *   ⇒ 因此能完成打卡的只有「打开 7 日页由页面自己打卡」这一个动作；
+ *     本脚本的价值收窄为：抓凭证（诊断）+ 定时「漏签检查」（见 main）。
  *
  * 鉴权: Cookie: User-Token=000_<32hex>（缺失/过期返回 code 40 无权限）
  *
  * 用法:
- *   1) 主路径（推荐）：打开任意 dev.coc 活动页 → 重写层从 loginCheck 响应抓到
- *      新 User-Token → 立即查状态 → 未签则重放打卡。7 日页自身会自动打卡，
- *      默认不在该页重复注入（见 SevenDayInjectOnOwnPage）。
- *   2) 兜底定时任务：受 30 分钟令牌限制，只有刚开过活动页后 30 分钟内跑才有意义，
- *      因此 .task 默认 enabled=false。
+ *   1) 打卡本体：打开「7日打卡分百万」页 → 页面加载后约 1 秒自动打卡（无需点按钮）。
+ *      重写层只顺带抓 User-Token / 冻结载荷做诊断，不参与打卡本身。
+ *   2) 漏签检查（定时任务）：在你每天开完 App 之后跑一次，逐个有效 Token 查状态，
+ *      发现「今日未签」才通知提醒；全部已签或凭证过期一律静默。
+ *      注意：Token 仅 30 分钟有效，任务时间必须落在你开完 App 后的 30 分钟窗口内。
  *
  * $argument 支持: mode=capture|sign & DeleteCookie=true
  ******************************************/
 
 var SevenDayEnable = true;          // 总开关
-var SevenDayAutoSign = true;        // 查状态后自动补打卡
-var SevenDayNotifyAlready = false;  // 全部已签时是否通知（默认静默，避免刷屏）
 var SevenDayMaxTokens = 20;         // 最多保留的账号 Token 数
 
-// —— 注入式补打卡（capture-v2 主触发路径）——
-// 从 loginCheck 响应抓到新 Token 后，立即查状态 + 重放打卡。
-// 活动页本身会自动打卡，注入是为了「打开任意活动页都顺带完成 7 日打卡」。
-var SevenDayInjectOnOtherPage = true;   // 在「非 7 日页」的活动页上注入（推荐开启）
-var SevenDayInjectOnOwnPage = false;    // 在 7 日页本身注入（页面自己会签；默认关，避免抢跑）
+// —— 注入式代打卡（默认关闭，2026-09-21 实测不可行）——
+// 载荷是一次性的：页面真实打卡时被消费，之后复用一律返回 code 10（见头部说明）。
+// 保留开关仅为将来若发现可复用场景再试；日常无需开启。
+var SevenDayInjectOnOtherPage = false;  // 在「非 7 日页」的活动页上尝试代打
+var SevenDayInjectOnOwnPage = false;    // 在 7 日页本身注入（页面自己会签，开启会抢跑）
 var SevenDayInjectTimeoutMs = 6000;     // 注入流程硬超时；超时立即放行响应，不拖死活动页
 var SevenDayActivityId = "2095709942208745472";
 var SevenDayPageId = "2090341662452445184";
@@ -81,7 +84,7 @@ var API_CLOCKIN = HOST + "/coc/activities/prize/clockIn";
 // 服务端错误码字典（实测）
 var CODE_MAP = {
   "0": { ok: true, kind: "success", text: "打卡成功" },
-  "10": { ok: true, kind: "done", text: "领取失败（业务态，通常为今日已领取）" },
+  "10": { ok: true, kind: "done", text: "领取失败（业务态：今日已领取，或冻结载荷已被占用/不可复用——需结合查状态区分）" },
   "40": { ok: false, kind: "token", text: "无权限：User-Token 失效，请重开一次活动页" },
   "50": { ok: false, kind: "payload", text: "参数不合法：coc-aurora 头缺失，请重开一次活动页" },
   "300": { ok: false, kind: "payload", text: "解密失败：冻结载荷已失效，请重开一次活动页刷新" }
@@ -260,7 +263,7 @@ function onLoginCheck(h) {
     console.log(`[7日打卡] loginCheck 下发令牌 ${label}${isNew ? "（新入库）" : ""} 页面=${onOwnPage ? "7日页" : "其它页"}`);
   }
 
-  if (!SevenDayEnable || !SevenDayAutoSign) { $nobyda.done({}); return; }
+  if (!SevenDayEnable) { $nobyda.done({}); return; }
   if (onOwnPage && !SevenDayInjectOnOwnPage) {
     // 7 日页自身会在页面加载后自动打卡，不重复注入以免抢跑
     $nobyda.done({});
@@ -304,7 +307,11 @@ async function injectSign(token, up, label) {
       console.log(`[7日打卡] ${label} 注入打卡成功（累计${days}天）`);
       $nobyda.notify("中国移动 · 7日打卡分百万", "打开活动页即完成打卡", `${label} 打卡成功（累计${days}天）`);
     } else if (ci.ok && ci.kind === "done") {
-      console.log(`[7日打卡] ${label} ${ci.text}`);
+      // 此处必为「已确认今日未签」后打卡 ⇒ code 10 = 载荷被占用/不可复用，
+      // 不是「今日已领」（2026-09-21 实测：复用任何已消费载荷统一返回 10）。
+      // 静默处理：代打本就走不通，是否漏签交给定时任务的漏签检查汇总提醒，
+      // 避免每开一页推一条。
+      console.log(`[7日打卡] ${label} 载荷不可复用（code 10，非今日已领），跳过代打`);
     } else {
       console.log(`[7日打卡] ${label} 注入打卡失败：${ci.text}`);
       $nobyda.notify("中国移动 · 7日打卡分百万", "打卡失败", `${label} ${ci.text}`);
@@ -314,12 +321,15 @@ async function injectSign(token, up, label) {
   }
 }
 
-/********************* 兜底入口（定时任务 / 手动） *********************/
+/********************* 漏签检查（定时任务 / 手动） *********************/
 /**
- * ⚠️ User-Token 只有 30 分钟寿命，所以定时任务不能独立完成补签：
- *    隔夜跑必然全部 code 40。本入口仅在「刚开过活动页」的时间窗内有效，
- *    定位为手动触发 / 兜底，.task 默认 enabled=false。
- *    主路径是 loginCheck 响应注入（见 onLoginCheck / injectSign）。
+ * 定位（2026-09-21 修订）：打卡本体只能由「打开 7 日页」完成（载荷一次性、
+ * 令牌 30 分钟），脚本无法代打。本入口因此收窄为「漏签检查」：
+ *   - 逐个**仍有效**的 Token 查状态；发现今日未签才通知提醒
+ *   - code 40（凭证过期）不算漏签，清理即可，不触发通知
+ *   - 全部已签 / 全部过期 → 静默
+ * ⚠️ Token 仅 30 分钟有效：任务时间必须落在你每天开完 App 后的 30 分钟窗口内，
+ *    否则所有 Token 已过期，检查无从谈起（此时静默）。
  */
 
 function statusHeaders(token) {
@@ -380,7 +390,7 @@ async function main() {
     return;
   }
 
-  const mode = String(args.mode || (SevenDayAutoSign ? "sign" : "sign"));
+  const mode = String(args.mode || "sign");
   const tokens = loadTokens();
   const up = loadUplink();
 
@@ -389,17 +399,22 @@ async function main() {
     return;
   }
 
-  console.log(`\n==== 7日打卡 / mode=sign / 账号数 ${tokens.length} / 载荷 ${up ? "有" : "无"} ====`);
+  console.log(`\n==== 7日打卡 / 漏签检查 / 账号数 ${tokens.length} / 载荷 ${up ? "有" : "无"} ====`);
 
   if (!tokens.length) {
-    $nobyda.notify("中国移动 · 7日打卡", "缺少凭证", "尚未抓到 User-Token：请在 App 打开任意一个活动页（含「7日打卡分百万」）");
+    // 失效 Token 会在每次运行末尾清理；列表为空 = 当前没有可用凭证，属预期态，
+    // 静默即可（打开任意 dev.coc 活动页即自动抓取新 Token）。
+    console.log("[7日打卡] 无可用 Token：打开任意 dev.coc 活动页即自动抓取（过期的已自动清理）");
     $nobyda.time();
     $nobyda.done({});
     return;
   }
 
-  const rows = [];
-  let okCount = 0, doneCount = 0, failCount = 0, needRefresh = false, signedNow = 0;
+  // 复核语义（2026-09-21 修订）：
+  //   - code 40（Token 过期）不算漏签：只标记清理，不进通知（隔夜必然全过期）
+  //   - 只有「Token 仍有效且该号今日未签」才需要提醒；打卡成功也提醒
+  const misses = [];
+  let doneCount = 0, deadTokenCount = 0, signedNow = 0;
 
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i].token;
@@ -412,26 +427,24 @@ async function main() {
     }
 
     if (!st.ok) {
-      failCount++;
       if (st.kind === "token") {
-        needRefresh = true;
-        tokens[i].dead = true;
+        deadTokenCount++;
+        tokens[i].dead = true;   // 标记，循环结束后出库
+      } else {
+        misses.push(`${label} 查询失败：${st.text}`);
       }
-      rows.push(`${label} 查询失败：${st.text}`);
       continue;
     }
 
     if (st.hasToday) {
-      // 今日已签：静默跳过，不推送（避免重复提示已签到）
       doneCount++;
-      if (LogDetails) console.log(`${label} 今日已签（${st.list.length}天），跳过`);
+      if (LogDetails) console.log(`${label} 今日已签（${st.list.length}天）`);
       continue;
     }
 
+    // —— 该号今日确实未签 ——
     if (!up) {
-      needRefresh = true;
-      failCount++;
-      rows.push(`${label} 未签但无冻结载荷：请打开一次活动页抓取`);
+      misses.push(`${label} 今日未打卡（无冻结载荷，无法代打）：请打开一次「7日打卡分百万」页`);
       continue;
     }
 
@@ -443,36 +456,35 @@ async function main() {
     }
 
     if (ci.ok && ci.kind === "success") {
-      okCount++; signedNow++;
-      rows.push(`${label} 打卡成功（累计${st.list.length + 1}天）`);
+      signedNow++;
+      misses.push(`${label} 打卡成功（累计${st.list.length + 1}天）`);
     } else if (ci.ok && ci.kind === "done") {
-      // 业务态：本次未新增（可能已领/并发已签）
-      doneCount++;
-      if (LogDetails) console.log(`${label} ${ci.text}`);
+      // 已确认未签仍返回 code 10 ⇒ 载荷被占用/不可复用（2026-09-21 实测：
+      // 复用任何已消费载荷统一返回 10），不是「今日已领」
+      misses.push(`${label} 今日未打卡（载荷不可复用，无法代打）：请打开一次「7日打卡分百万」页`);
     } else {
-      failCount++;
-      if (ci.kind === "payload" || ci.kind === "token") needRefresh = true;
-      rows.push(`${label} 打卡失败：${ci.text}`);
+      misses.push(`${label} 打卡失败：${ci.text}`);
     }
   }
 
-  // 清理已失效 Token
-  const dead = tokens.filter(t => t.dead);
-  if (dead.length) saveTokens(tokens.filter(t => !t.dead));
+  // User-Token 只有 30 分钟寿命，失效 Token 永远不会再可用 → 出库，
+  // 避免列表越积越多、下次运行多打 N 次注定失败的查询。
+  const alive = tokens.filter(t => !t.dead);
+  if (alive.length !== tokens.length) saveTokens(alive);
 
-  $nobyda.write(JSON.stringify({ at: nowStr(), ok: okCount, done: doneCount, fail: failCount, needRefresh: needRefresh }), K_LAST);
+  $nobyda.write(JSON.stringify({
+    at: nowStr(), signed: signedNow, done: doneCount,
+    dead: deadTokenCount, miss: misses.length, hasUplink: !!up
+  }), K_LAST);
 
-  const subtitle = signedNow > 0
-    ? `打卡成功 ${signedNow} 个`
-    : (failCount ? `成功0 / 已签${doneCount} / 失败${failCount}` : `全部已打卡（${doneCount}）`);
-
-  const allSilent = signedNow === 0 && failCount === 0;
-  if (allSilent && !SevenDayNotifyAlready) {
-    console.log(`[静默跳过] 7日打卡：${doneCount} 个号今日已签，未产生新打卡，不推送通知`);
+  // 只在「确有漏签 / 补签成功 / 其它异常」时通知；全部已签或凭证过期 → 静默
+  if (misses.length) {
+    const subtitle = signedNow > 0 ? `补签成功 ${signedNow} 个` : `漏签 ${misses.length} 个`;
+    let msg = misses.join("\n");
+    if (!up) msg += "\n提示：冻结载荷只在页面真实打卡时产生，请先开一次 7 日页";
+    $nobyda.notify("中国移动 · 7日打卡分百万", subtitle, msg);
   } else {
-    let msg = rows.join("\n");
-    if (needRefresh) msg += "\n提示：请在 App 打开任意活动页刷新凭证（令牌仅 30 分钟有效）";
-    $nobyda.notify("中国移动 · 7日打卡分百万", subtitle, msg || "无明细");
+    console.log(`[静默跳过] 7日打卡复核：${doneCount} 个号已签，${deadTokenCount} 个过期凭证已清理，无漏签`);
   }
 
   $nobyda.time();
