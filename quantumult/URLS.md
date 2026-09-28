@@ -711,3 +711,40 @@ v9.2 改动：
 仍存在的业务边界：
 - 缓存包可能被防重放拒绝（HTTP 200 但积分不变）→ 再进签到页刷新 dynasty
 - 服务端积分以 App 为准；mina 响应常为二进制，脚本只能给「已送达」级判定
+
+---
+
+## 中国联通 App 签到（capture-v1, 2026-09-28）
+
+接口定性（抓包实证）：
+- 主机 `activity.10010.com`，H5 WebView，纯 Cookie 认证（`c_id` + `ecs_acc`），明文 JSON 无加密
+- Cookie 由 `m.client.10010.com/mobileService/onLine.htm` 每次启动刷新；旧会话短期仍有效（实测跨重启重放成功）
+- 已验证业务码：`0000`=成功 / `0002`=今日已签到
+- 今日实测：日签 +0.01 元；月签有礼 0.05 / 0.66 元（`getMonthSign` taskStatus=1 自动领取）
+
+### 挂载
+
+**重写**（打开联通 App 首页即自动抓取，签到页 channel=shouye 随启动加载，无需手动进页面）：
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/rewrite/Unicom_DailyBonus.conf
+```
+
+**任务**（每天 08:10 签到 + 领月签）：
+
+```text
+https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/task/Unicom_DailyBonus.task
+```
+
+### 操作步骤
+
+1. 重写引用上方 conf → 强制更新 → 确认已信任 MitM 证书
+2. 打开一次联通 App（首页自动触发抓取，首次抓取有通知）
+3. 任务引用上方 task，次日早上看通知验证
+4. 通知格式：签到结果（✅/☑️/❌）+ 月签领取 + 积分余额
+
+### 边界说明
+
+- MitM 仅 `activity.10010.com` 单主机，不影响 App 其他网络
+- 凭证失效时通知会提示「打开一次联通 App 刷新凭证」
+- 浏览类任务（如话费自动充 0.01）需真实跳转页面，脚本 v1 不代做；月签有礼（金额较大）已自动领取

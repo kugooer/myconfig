@@ -1,0 +1,3 @@
+# 中国联通 每日签到 + 月签有礼领取
+# 前置: 挂载 rewrite/Unicom_DailyBonus.conf 并打开一次联通 App 抓取 Cookie
+10 8 * * * https://raw.githubusercontent.com/kugooer/myconfig/main/quantumult/scripts/Unicom_DailyBonus.js, tag=联通App签到, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Calendar.png, enabled=true
