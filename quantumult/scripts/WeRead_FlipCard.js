@@ -2,7 +2,7 @@
 
   微信读书(WeRead) 每周翻一翻脚本
 
-  更新时间: 2026-09-08 (capture-v1.4)
+  更新时间: 2026-09-29 (capture-v1.5)
   脚本兼容: QuantumultX, Surge, Loon, Node.js
   语法参考: NobyDa/JD_DailyBonus.js
 
@@ -28,6 +28,15 @@
                 (接口实际返回 money 面额×100，原只认 coin 导致翻币漏报)；
                 ② 过滤 cardIndex=-1/status=4 牌背幽灵条目(原被误报为体验卡)；
                 ③ 同名奖品聚合计数，通知与 App 展示一致。
+  capture-v1.5: 【会话过期自愈】实跑 2026-09-29 实证：wr_skey 过期返回
+                errcode=-2012，但 v1.3 把 errcode 检查排在 isSessionExpired
+                之前 → 续期逻辑永不触发，误报「无卡可翻(errcode=-2012)」，
+                只能手动打开翻一翻页刷新 Cookie。修正：① -2012/-2013 优先走
+                续期+重试；② 续期后用新 skey 同步作为 wr_skey 候选值重试
+                (wr_skey 与登录 skey 疑似同源令牌，旧值已失效无损失)并持久化；
+                ③ 续期失败/重试仍过期 → 明确提示打开 App，不再误报无卡可翻。
+                注意：自动续期(重放 login)能否真正刷新 wr_skey 尚未实测验证，
+                最坏情况仍需打开一次翻一翻页。
 
   流量结论（抓包 2026-08-24-094839）:
   - 翻牌: GET https://weread.qq.com/flip-card-game/api/flipCardFlip
@@ -164,31 +173,51 @@ async function doFlip(item) {
         authSuspected = true;
         break;
       }
+      if (typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
+      // 会话过期(-2012/-2013)必须先于通用 errcode 分支处理，否则续期逻辑永远不会被触发
+      // (v1.3 实跑实证: -2012 被 errcode 分支拦截 → 直接 break → 误报「无卡可翻」)
+      if (isSessionExpired(resp)) {
+        console.log("[WeRead flip] flip #" + i + " session expired, try renew");
+        const renewed = await tryRenew(item);
+        if (!renewed) {
+          merge.Flip.fail = 1;
+          merge.Flip.notify =
+            "微信读书翻一翻: wr_skey 已过期且自动续期失败 ‼️\n" +
+            "请打开微信读书 App →「翻一翻」页面刷新登录态后重跑";
+          return;
+        }
+        // 续期拿到新 skey：同步尝试作为翻一翻 Cookie（wr_skey 与登录 skey 疑似同源令牌，
+        // 旧 wrSkey 本已失效，用新值重试无损失；若仍 -2012 则只能打开 App 重抓）
+        item.wrSkey = item.skey;
+        item.wrVid = item.vid;
+        persistSkey(item);
+        try {
+          const raw2 = await httpGet(url, item);
+          resp = safeJSON(raw2);
+        } catch (e) {
+          console.log("[WeRead flip] flip #" + i + " retry err: " + e.message);
+          merge.Flip.fail = 1;
+          merge.Flip.notify =
+            "微信读书翻一翻: 续期后重试失败 ‼️\n" +
+            "请打开微信读书 App →「翻一翻」页面重新抓取凭证后再跑";
+          return;
+        }
+        if (!resp || isSessionExpired(resp)) {
+          console.log("[WeRead flip] flip #" + i + " still -2012 after renew");
+          merge.Flip.fail = 1;
+          merge.Flip.notify =
+            "微信读书翻一翻: 续期后仍会话过期(-2012) ‼️\n" +
+            "自动续期无法刷新翻一翻 Cookie，请打开微信读书 App →「翻一翻」页面后重跑";
+          return;
+        }
+        if (typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
+      }
       if (resp.errcode) {
         // 业务错误码：-2676=本期翻卡次数已用完（同账号重复执行/已翻完时服务端返回）
         // 其他错误码仅记录，最终通知里透出，便于定位
         lastErrcode = Number(resp.errcode);
         console.log("[WeRead flip] flip #" + i + " errcode=" + resp.errcode + (lastErrcode === -2676 ? "（本期次数已翻完）" : ""));
         break;
-      }
-      if (typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
-      // 会话过期: 尝试续期一次后重试
-      if (isSessionExpired(resp)) {
-        const renewed = await tryRenew(item);
-        if (renewed) {
-          try {
-            const raw2 = await httpGet(url, item);
-            resp = safeJSON(raw2);
-            if (resp && typeof resp.remainingCount === "number") lastRemaining = resp.remainingCount;
-          } catch (e) {
-            console.log("[WeRead flip] flip #" + i + " retry err: " + e.message);
-            break;
-          }
-        } else {
-          merge.Flip.fail = 1;
-          merge.Flip.notify = "微信读书翻一翻: skey 已过期且自动续期失败 ‼️\n请重新打开 App 抓取凭证";
-          return;
-        }
       }
       // 本次翻牌已实际执行（即使 remainingCount=0，这一次翻牌也真实发生）
       totalFlipped++;
@@ -447,7 +476,13 @@ function persistSkey(item) {
     const key = String(item.vid).toLowerCase();
     list = list.map((x) => {
       if (x && String(x.vid || "").toLowerCase() === key) {
-        return Object.assign({}, x, { skey: item.skey, update: new Date().toISOString() });
+        const upd = { skey: item.skey, update: new Date().toISOString() };
+        // 续期后同步持久化翻一翻 Cookie 候选值（wr_skey 过期时用新 skey 重试）
+        if (item.wrSkey) {
+          upd.wrSkey = item.wrSkey;
+          upd.wrVid = item.wrVid || item.vid;
+        }
+        return Object.assign({}, x, upd);
       }
       return x;
     });
